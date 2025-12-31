@@ -38,6 +38,9 @@ pub struct CliArgs {
 
     #[arg(long)]
     pub run_name: Option<String>,
+
+    #[arg(long)]
+    pub activation: Option<String>,
 }
 
 /// Number of parallel environments - either auto-detected or explicit
@@ -109,6 +112,8 @@ pub struct Config {
     pub hidden_size: usize,
     #[serde(default = "default_num_hidden")]
     pub num_hidden: usize,
+    #[serde(default = "default_activation")]
+    pub activation: String,
 
     // Checkpointing
     #[serde(default = "default_run_dir")]
@@ -178,6 +183,9 @@ fn default_hidden_size() -> usize {
 fn default_num_hidden() -> usize {
     2
 }
+fn default_activation() -> String {
+    "tanh".to_string()
+}
 fn default_run_dir() -> PathBuf {
     PathBuf::from("runs")
 }
@@ -212,6 +220,7 @@ impl Default for Config {
             adam_epsilon: default_adam_epsilon(),
             hidden_size: default_hidden_size(),
             num_hidden: default_num_hidden(),
+            activation: default_activation(),
             run_dir: default_run_dir(),
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
@@ -284,6 +293,9 @@ impl Config {
         if let Some(name) = &args.run_name {
             self.run_name = Some(name.clone());
         }
+        if let Some(activation) = &args.activation {
+            self.activation = activation.clone();
+        }
     }
 
     /// Apply limited CLI overrides for resume mode
@@ -354,6 +366,14 @@ impl Config {
             bail!(
                 "minibatch_size {} too small, increase num_steps or num_envs",
                 minibatch_size
+            );
+        }
+
+        // Validate activation function
+        if !["tanh", "relu"].contains(&self.activation.as_str()) {
+            bail!(
+                "Unknown activation '{}'. Supported: tanh, relu",
+                self.activation
             );
         }
 

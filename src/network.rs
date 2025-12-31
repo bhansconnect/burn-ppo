@@ -3,59 +3,84 @@ use burn::prelude::*;
 
 use crate::config::Config;
 
+/// Create a Linear layer with orthogonal weight initialization and zero biases
+///
+/// This is necessary because Burn's LinearConfig.with_initializer() applies
+/// the same initializer to both weights and biases, but Orthogonal requires
+/// 2D tensors (weights are 2D, biases are 1D).
+///
+/// Per ICLR blog "37 Implementation Details of PPO":
+/// - Weights: Orthogonal initialization with specified gain
+/// - Biases: Zeros
+fn create_linear_orthogonal<B: Backend>(
+    d_input: usize,
+    d_output: usize,
+    gain: f64,
+    device: &B::Device,
+) -> nn::Linear<B> {
+    // Orthogonal initialization for weights (2D tensor)
+    // init_with returns Param<Tensor<B, D>> directly
+    let weight = Initializer::Orthogonal { gain }
+        .init_with([d_input, d_output], Some(d_input), Some(d_output), device);
+
+    // Zero initialization for biases (1D tensor)
+    let bias = Initializer::Zeros
+        .init_with([d_output], Some(d_input), Some(d_output), device);
+
+    nn::Linear {
+        weight,
+        bias: Some(bias),
+    }
+}
+
 /// Actor-Critic network with shared backbone and separate heads
 #[derive(Module, Debug)]
 pub struct ActorCritic<B: Backend> {
     layers: Vec<nn::Linear<B>>,
     policy_head: nn::Linear<B>,
     value_head: nn::Linear<B>,
+    /// Use ReLU activation (true) or tanh (false)
+    #[module(skip)]
+    use_relu: bool,
 }
 
 impl<B: Backend> ActorCritic<B> {
     /// Create a new ActorCritic network
     ///
     /// Uses orthogonal initialization with specific gains (per ICLR blog):
-    /// - Hidden layers: sqrt(2) (optimal for ReLU)
+    /// - Hidden layers: sqrt(2) for ReLU, 1.0 for tanh
     /// - Policy head: 0.01 (small for stable initial policy)
     /// - Value head: 1.0
+    /// - All biases: 0
     pub fn new(obs_dim: usize, action_count: usize, config: &Config, device: &B::Device) -> Self {
         let hidden_size = config.hidden_size;
         let num_hidden = config.num_hidden;
+        let use_relu = config.activation == "relu";
 
-        // Hidden layer initializer: orthogonal with gain sqrt(2) for ReLU
-        let hidden_init = Initializer::Orthogonal {
-            gain: 2.0_f64.sqrt(),
-        };
+        // Hidden layer gain depends on activation
+        // sqrt(2) for ReLU (He et al.), 1.0 for tanh (ICLR blog)
+        let hidden_gain = if use_relu { 2.0_f64.sqrt() } else { 1.0 };
 
-        // Build hidden layers
+        // Build hidden layers with orthogonal initialization
         let mut layers = Vec::with_capacity(num_hidden);
         let mut in_size = obs_dim;
 
         for _ in 0..num_hidden {
-            layers.push(
-                nn::LinearConfig::new(in_size, hidden_size)
-                    .with_initializer(hidden_init.clone())
-                    .init(device),
-            );
+            layers.push(create_linear_orthogonal(in_size, hidden_size, hidden_gain, device));
             in_size = hidden_size;
         }
 
-        // Policy head: small init for stable initial policy
-        let policy_init = Initializer::Orthogonal { gain: 0.01 };
-        let policy_head = nn::LinearConfig::new(hidden_size, action_count)
-            .with_initializer(policy_init)
-            .init(device);
+        // Policy head: small init (0.01) for stable initial policy
+        let policy_head = create_linear_orthogonal(hidden_size, action_count, 0.01, device);
 
         // Value head: gain 1.0
-        let value_init = Initializer::Orthogonal { gain: 1.0 };
-        let value_head = nn::LinearConfig::new(hidden_size, 1)
-            .with_initializer(value_init)
-            .init(device);
+        let value_head = create_linear_orthogonal(hidden_size, 1, 1.0, device);
 
         Self {
             layers,
             policy_head,
             value_head,
+            use_relu,
         }
     }
 
@@ -66,10 +91,14 @@ impl<B: Backend> ActorCritic<B> {
     pub fn forward(&self, obs: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 1>) {
         let mut x = obs;
 
-        // Shared backbone with tanh activation
+        // Shared backbone with configured activation
         for layer in &self.layers {
             x = layer.forward(x);
-            x = x.tanh();
+            x = if self.use_relu {
+                burn::tensor::activation::relu(x)
+            } else {
+                x.tanh()
+            };
         }
 
         // Separate heads
