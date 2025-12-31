@@ -20,7 +20,16 @@ See [docs/DESIGN.md](docs/DESIGN.md) for:
 cargo build --release
 cargo run --release -- --config configs/cartpole.toml
 cargo run --release -- --config configs/cartpole.toml --num-envs 64 --seed 123
+
+# Peak performance build (slower compile, for benchmarks/distribution)
+cargo build --profile release-lto
+./target/release-lto/burn-ppo --config configs/cartpole.toml
 ```
+
+| Profile | Build Time | Use Case |
+|---------|------------|----------|
+| `release` | ~2m15s clean, ~3-5s incremental | Daily development |
+| `release-lto` | ~6min | Benchmarks, distribution |
 
 ### Resume Training
 ```bash

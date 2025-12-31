@@ -38,6 +38,17 @@ tracy-client = { version = "0.18", optional = true }
 [dev-dependencies]
 tempfile = "3"
 
+# Fast release builds for development iteration
 [profile.release]
-lto = true
-codegen-units = 1
+lto = false            # No LTO = fast builds
+incremental = true     # Fast rebuilds
+debug = 1              # Line tables for profiling
+
+# Peak performance builds (slow compilation, for benchmarks/distribution)
+[profile.release-lto]
+inherits = "release"
+lto = "fat"            # Full cross-crate optimization
+codegen-units = 1      # Maximum optimization opportunity
+incremental = false    # Incompatible with fat LTO
+strip = true           # Smaller binary
+panic = "abort"        # No unwinding overhead
