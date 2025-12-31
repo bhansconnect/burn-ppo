@@ -26,7 +26,7 @@ from typing import Callable
 
 from aim import Run
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, DirCreatedEvent
+from watchdog.events import FileSystemEventHandler
 
 
 class MetricsHandler(FileSystemEventHandler):
@@ -120,12 +120,22 @@ class RunTracker:
         self.run_name = run_dir.name
         self.metrics_path = run_dir / "metrics.jsonl"
         self.offset_path = run_dir / ".aim_offset"
+        self.hash_path = run_dir / ".aim_run_hash"
 
-        # Create Aim run
+        # Try to resume existing Aim run, or create new one
+        run_hash = None
+        if self.hash_path.exists():
+            run_hash = self.hash_path.read_text().strip()
+
         self.aim_run = Run(
+            run_hash=run_hash,
             repo=str(aim_repo),
             experiment=self.run_name,
         )
+
+        # Save hash for future resumption (if new run)
+        if run_hash is None:
+            self.hash_path.write_text(self.aim_run.hash)
 
         # Create metrics handler
         self.handler = MetricsHandler(
@@ -138,7 +148,7 @@ class RunTracker:
         # Process any existing metrics
         self.handler.process_new_lines()
 
-        print(f"Tracking run: {self.run_name}")
+        print(f">>> Tracking run: {self.run_name}")
 
     def poll(self):
         """Poll for new metrics (backup for missed fsevents)"""
@@ -156,8 +166,8 @@ class RunsDirectoryHandler(FileSystemEventHandler):
         self.on_new_run = on_new_run
 
     def on_created(self, event):
-        """Called when a new directory is created"""
-        if isinstance(event, DirCreatedEvent):
+        """Called when a new file/directory is created"""
+        if event.is_directory:
             run_dir = Path(event.src_path)
             # Small delay to let the directory be fully created
             time.sleep(0.1)
