@@ -15,3 +15,4 @@ scripts/.aim/
 .venv/
 __pycache__/
 *.pyc
+uv.lock
