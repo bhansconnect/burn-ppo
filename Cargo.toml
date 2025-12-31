@@ -17,6 +17,7 @@ serde_json = "1"
 rand = "0.8"
 num_cpus = "1.16"
 anyhow = "1"
+ctrlc = "3"
 
 [dev-dependencies]
 tempfile = "3"

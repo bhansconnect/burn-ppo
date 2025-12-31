@@ -1,0 +1,13 @@
+[project]
+name = "burn-ppo-scripts"
+version = "0.1.0"
+description = "Aim watcher for burn-ppo training metrics"
+requires-python = ">=3.10"
+dependencies = [
+    "aim>=3.17",
+    "watchdog>=3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
