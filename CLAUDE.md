@@ -45,7 +45,7 @@ cd scripts
 uv sync
 uv run aim init    # Once
 uv run aim up      # Start server at localhost:43800
-uv run aim_watcher.py ../runs/<run_name>  # Stream metrics
+uv run aim_watcher.py ../runs  # Stream metrics from all runs
 ```
 
 ## Key Files

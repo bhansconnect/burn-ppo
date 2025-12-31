@@ -2,11 +2,12 @@
 """
 Aim Watcher - Streaming metrics uploader for burn-ppo
 
-Watches metrics.jsonl and streams new metrics to Aim in real-time.
-Tracks file offset in .aim_offset to resume without duplicating logs.
+Watches the runs directory and streams metrics from all runs to Aim in real-time.
+Automatically detects new runs as they are created.
+Tracks file offset per run in .aim_offset to resume without duplicating logs.
 
 Usage:
-    uv run aim_watcher.py ../runs/<run_name>
+    uv run aim_watcher.py ../runs
 
 Setup:
     cd scripts
@@ -17,24 +18,25 @@ Setup:
 
 import argparse
 import json
-import os
 import signal
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 from aim import Run
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+from watchdog.events import FileSystemEventHandler, DirCreatedEvent
 
 
 class MetricsHandler(FileSystemEventHandler):
     """Handler for metrics.jsonl file changes"""
 
-    def __init__(self, run: Run, metrics_path: Path, offset_path: Path):
+    def __init__(self, run: Run, metrics_path: Path, offset_path: Path, run_name: str):
         self.run = run
         self.metrics_path = metrics_path
         self.offset_path = offset_path
+        self.run_name = run_name
         self.offset = self._load_offset()
 
     def _load_offset(self) -> int:
@@ -94,7 +96,7 @@ class MetricsHandler(FileSystemEventHandler):
             data = metric.get("data", {})
             for key, value in data.items():
                 self.run[key] = value
-            print(f"Logged hyperparameters: {list(data.keys())}")
+            print(f"[{self.run_name}] Logged hyperparameters: {list(data.keys())}")
 
         elif metric_type == "scalar":
             name = metric.get("name", "unknown")
@@ -102,7 +104,7 @@ class MetricsHandler(FileSystemEventHandler):
             self.run.track(value, name=name, step=step)
             # Only print occasionally to avoid spam
             if step % 1000 == 0:
-                print(f"Step {step}: {name} = {value:.4f}")
+                print(f"[{self.run_name}] Step {step}: {name} = {value:.4f}")
 
     def on_modified(self, event):
         """Called when the metrics file is modified"""
@@ -110,14 +112,67 @@ class MetricsHandler(FileSystemEventHandler):
             self.process_new_lines()
 
 
+class RunTracker:
+    """Manages Aim Run and MetricsHandler for a single training run"""
+
+    def __init__(self, run_dir: Path, aim_repo: Path, observer: Observer):
+        self.run_dir = run_dir
+        self.run_name = run_dir.name
+        self.metrics_path = run_dir / "metrics.jsonl"
+        self.offset_path = run_dir / ".aim_offset"
+
+        # Create Aim run
+        self.aim_run = Run(
+            repo=str(aim_repo),
+            experiment=self.run_name,
+        )
+
+        # Create metrics handler
+        self.handler = MetricsHandler(
+            self.aim_run, self.metrics_path, self.offset_path, self.run_name
+        )
+
+        # Schedule with observer
+        observer.schedule(self.handler, str(run_dir), recursive=False)
+
+        # Process any existing metrics
+        self.handler.process_new_lines()
+
+        print(f"Tracking run: {self.run_name}")
+
+    def poll(self):
+        """Poll for new metrics (backup for missed fsevents)"""
+        self.handler.process_new_lines()
+
+    def close(self):
+        """Close the Aim run"""
+        self.aim_run.close()
+
+
+class RunsDirectoryHandler(FileSystemEventHandler):
+    """Handler for detecting new run directories"""
+
+    def __init__(self, on_new_run: Callable[[Path], None]):
+        self.on_new_run = on_new_run
+
+    def on_created(self, event):
+        """Called when a new directory is created"""
+        if isinstance(event, DirCreatedEvent):
+            run_dir = Path(event.src_path)
+            # Small delay to let the directory be fully created
+            time.sleep(0.1)
+            if run_dir.is_dir():
+                self.on_new_run(run_dir)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Watch metrics.jsonl and stream to Aim"
+        description="Watch all runs and stream metrics to Aim"
     )
     parser.add_argument(
-        "run_dir",
+        "runs_dir",
         type=Path,
-        help="Path to run directory containing metrics.jsonl",
+        help="Path to runs directory (parent of individual run folders)",
     )
     parser.add_argument(
         "--poll-interval",
@@ -127,60 +182,69 @@ def main():
     )
     args = parser.parse_args()
 
-    run_dir = args.run_dir.resolve()
-    metrics_path = run_dir / "metrics.jsonl"
-    offset_path = run_dir / ".aim_offset"
+    runs_dir = args.runs_dir.resolve()
 
-    if not run_dir.exists():
-        print(f"Error: Run directory does not exist: {run_dir}", file=sys.stderr)
+    if not runs_dir.exists():
+        print(f"Error: Runs directory does not exist: {runs_dir}", file=sys.stderr)
         sys.exit(1)
 
-    # Get run name from directory
-    run_name = run_dir.name
+    print(f"Starting Aim watcher for runs directory: {runs_dir}")
 
-    print(f"Starting Aim watcher for run: {run_name}")
-    print(f"Metrics file: {metrics_path}")
-    print(f"Offset file: {offset_path}")
-
-    # Initialize Aim run
     # Use scripts directory as Aim repo location
     aim_repo = Path(__file__).parent
-    run = Run(
-        run_hash=run_name,
-        repo=str(aim_repo),
-        experiment=run_name,
-    )
 
-    # Set up file watcher
-    handler = MetricsHandler(run, metrics_path, offset_path)
-
-    # Process any existing lines first
-    handler.process_new_lines()
+    # Dictionary of active run trackers
+    trackers: dict[str, RunTracker] = {}
 
     # Set up observer
     observer = Observer()
-    observer.schedule(handler, str(run_dir), recursive=False)
+
+    def register_run(run_dir: Path):
+        """Register a new run for tracking"""
+        run_name = run_dir.name
+        if run_name in trackers:
+            return  # Already tracking
+        if run_name.startswith("."):
+            return  # Skip hidden directories
+        try:
+            trackers[run_name] = RunTracker(run_dir, aim_repo, observer)
+        except Exception as e:
+            print(f"Warning: Could not track run {run_name}: {e}", file=sys.stderr)
+
+    # Scan for existing runs
+    for subdir in sorted(runs_dir.iterdir()):
+        if subdir.is_dir() and not subdir.name.startswith("."):
+            register_run(subdir)
+
+    if not trackers:
+        print("No existing runs found. Waiting for new runs...")
+
+    # Watch for new run directories
+    runs_handler = RunsDirectoryHandler(register_run)
+    observer.schedule(runs_handler, str(runs_dir), recursive=False)
     observer.start()
 
-    print("Watching for new metrics... (Ctrl+C to stop)")
+    print(f"Watching for new runs... (Ctrl+C to stop)")
 
     # Handle graceful shutdown
     def signal_handler(sig, frame):
         print("\nShutting down...")
         observer.stop()
         observer.join()
-        run.close()
+        for tracker in trackers.values():
+            tracker.close()
         print("Done.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Keep running and poll periodically (in case fsevents misses something)
+    # Keep running and poll periodically
     try:
         while True:
             time.sleep(args.poll_interval)
-            handler.process_new_lines()
+            for tracker in list(trackers.values()):
+                tracker.poll()
     except KeyboardInterrupt:
         signal_handler(None, None)
 
