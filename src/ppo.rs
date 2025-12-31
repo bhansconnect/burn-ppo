@@ -112,7 +112,15 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         let log_probs = log_prob_categorical(logits, actions.clone());
 
         // Convert to CPU data
-        let actions_data: Vec<i64> = actions.into_data().to_vec().expect("actions to vec");
+        // Note: Convert Int tensor through float to avoid WGPU backend type mismatch
+        let actions_data: Vec<i64> = actions
+            .float()
+            .into_data()
+            .to_vec::<f32>()
+            .expect("actions to vec")
+            .into_iter()
+            .map(|x| x as i64)
+            .collect();
         let values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
         let log_probs_data: Vec<f32> = log_probs.into_data().to_vec().expect("log_probs to vec");
 
@@ -253,6 +261,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     buffer: &RolloutBuffer<B>,
     optimizer: &mut impl burn::optim::Optimizer<ActorCritic<B>, B>,
     config: &Config,
+    learning_rate: f64,
     rng: &mut impl Rng,
 ) -> (ActorCritic<B>, UpdateMetrics) {
     let device = model.devices()[0].clone();
@@ -363,7 +372,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             // Gradient clipping by global L2 norm
             // Note: Burn's optimizers handle this internally with proper config
 
-            model = optimizer.step(config.learning_rate.into(), model, grads);
+            model = optimizer.step(learning_rate.into(), model, grads);
         }
     }
 

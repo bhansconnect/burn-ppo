@@ -326,7 +326,8 @@ fn main() -> Result<()> {
 
     // Create metrics logger
     let mut logger = MetricsLogger::new(&run_dir)?;
-    if matches!(mode, TrainingMode::Fresh) {
+    // Log hyperparameters for new runs (Fresh and Fork create new run directories)
+    if matches!(mode, TrainingMode::Fresh | TrainingMode::Fork { .. }) {
         logger.log_hparams(&config)?;
     }
     logger.flush()?;
@@ -356,6 +357,8 @@ fn main() -> Result<()> {
 
     // Timing for SPS calculation
     let training_start = std::time::Instant::now();
+    let mut last_log_time = training_start;
+    let mut last_log_step = global_step;
 
     // Training loop
     for update in 0..num_updates {
@@ -408,7 +411,7 @@ fn main() -> Result<()> {
         );
 
         // PPO update
-        let (updated_model, metrics) = ppo_update(model, &buffer, &mut optimizer, &config, &mut rng);
+        let (updated_model, metrics) = ppo_update(model, &buffer, &mut optimizer, &config, lr, &mut rng);
         model = updated_model;
 
         global_step += steps_per_update;
@@ -421,8 +424,9 @@ fn main() -> Result<()> {
         };
         progress.update(global_step as u64, avg_return);
 
-        // Log metrics
-        if global_step % config.log_freq == 0 || update == 0 {
+        // Log metrics (at least once per log_freq steps)
+        let should_log = update == 0 || global_step / config.log_freq > (global_step - steps_per_update) / config.log_freq;
+        if should_log {
             logger.log_scalar("train/policy_loss", metrics.policy_loss, global_step)?;
             logger.log_scalar("train/value_loss", metrics.value_loss, global_step)?;
             logger.log_scalar("train/entropy", metrics.entropy, global_step)?;
@@ -434,10 +438,20 @@ fn main() -> Result<()> {
             logger.log_scalar("train/value_mean", metrics.value_mean, global_step)?;
             logger.log_scalar("train/returns_mean", metrics.returns_mean, global_step)?;
 
-            // Steps per second
-            let elapsed = training_start.elapsed().as_secs_f32();
-            let sps = if elapsed > 0.0 { global_step as f32 / elapsed } else { 0.0 };
-            logger.log_scalar("charts/SPS", sps, global_step)?;
+            // Steps per second - instantaneous (since last log) and cumulative (overall)
+            let now = std::time::Instant::now();
+            let interval_elapsed = now.duration_since(last_log_time).as_secs_f32();
+            let interval_steps = (global_step - last_log_step) as f32;
+            let sps_instant = if interval_elapsed > 0.0 { interval_steps / interval_elapsed } else { 0.0 };
+
+            let total_elapsed = training_start.elapsed().as_secs_f32();
+            let sps_mean = if total_elapsed > 0.0 { global_step as f32 / total_elapsed } else { 0.0 };
+
+            logger.log_scalar("perf/sps_instant", sps_instant, global_step)?;
+            logger.log_scalar("perf/sps_mean", sps_mean, global_step)?;
+
+            last_log_time = now;
+            last_log_step = global_step;
 
             if !recent_returns.is_empty() {
                 let avg_return: f32 =

@@ -243,9 +243,15 @@ impl Config {
         // Store forked_from relationship
         config.forked_from = forked_from.clone();
 
-        // Generate run name if not specified
-        if config.run_name.is_none() {
+        // For fork mode, always generate child name (ignore --run-name if specified)
+        if forked_from.is_some() {
+            if config.run_name.is_some() {
+                eprintln!("Warning: --run-name is ignored when forking; using auto-generated child name");
+            }
             config.run_name = Some(generate_run_name(&config, forked_from.as_deref()));
+        } else if config.run_name.is_none() {
+            // Generate run name if not specified (fresh training)
+            config.run_name = Some(generate_run_name(&config, None));
         }
 
         Ok(config)
