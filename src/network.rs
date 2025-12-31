@@ -14,18 +14,17 @@ pub struct ActorCritic<B: Backend> {
 impl<B: Backend> ActorCritic<B> {
     /// Create a new ActorCritic network
     ///
-    /// Uses orthogonal initialization with specific gains:
-    /// - Hidden layers: sqrt(2)
+    /// Uses orthogonal initialization with specific gains (per ICLR blog):
+    /// - Hidden layers: sqrt(2) (optimal for ReLU)
     /// - Policy head: 0.01 (small for stable initial policy)
     /// - Value head: 1.0
     pub fn new(obs_dim: usize, action_count: usize, config: &Config, device: &B::Device) -> Self {
         let hidden_size = config.hidden_size;
         let num_hidden = config.num_hidden;
 
-        // Hidden layer initializer: orthogonal with gain sqrt(2)
-        let hidden_init = Initializer::KaimingNormal {
+        // Hidden layer initializer: orthogonal with gain sqrt(2) for ReLU
+        let hidden_init = Initializer::Orthogonal {
             gain: 2.0_f64.sqrt(),
-            fan_out_only: false,
         };
 
         // Build hidden layers
@@ -42,19 +41,13 @@ impl<B: Backend> ActorCritic<B> {
         }
 
         // Policy head: small init for stable initial policy
-        let policy_init = Initializer::KaimingNormal {
-            gain: 0.01,
-            fan_out_only: false,
-        };
+        let policy_init = Initializer::Orthogonal { gain: 0.01 };
         let policy_head = nn::LinearConfig::new(hidden_size, action_count)
             .with_initializer(policy_init)
             .init(device);
 
         // Value head: gain 1.0
-        let value_init = Initializer::KaimingNormal {
-            gain: 1.0,
-            fan_out_only: false,
-        };
+        let value_init = Initializer::Orthogonal { gain: 1.0 };
         let value_head = nn::LinearConfig::new(hidden_size, 1)
             .with_initializer(value_init)
             .init(device);
