@@ -3,12 +3,12 @@
 
 # Environment
 env = "cartpole"
-num_envs = "auto"    # "auto" = num_cpus * 2, or explicit number
+num_envs = 4         # 4 is standard for CartPole; use "auto" for larger envs
 num_steps = 128      # Steps per rollout
 
 # PPO hyperparameters (from ICLR blog)
 learning_rate = 2.5e-4
-lr_anneal = true     # Linear decay to 0
+lr_anneal = false    # Set true for longer runs; false recommended for CartPole
 gamma = 0.99
 gae_lambda = 0.95
 clip_epsilon = 0.2

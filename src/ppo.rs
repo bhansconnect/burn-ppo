@@ -345,7 +345,9 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let loss = policy_loss_mean.clone() + value_loss.clone() * config.value_coef + entropy_loss;
 
             // Compute approximate KL divergence for logging
-            let approx_kl = ((ratio.clone() - 1.0) - log_ratio).mean();
+            // KL ≈ (ratio - 1) - log(ratio) is the unbiased low-variance estimator
+            // from "Approximating KL Divergence" (Schulman)
+            let approx_kl = ((ratio.clone() - 1.0) - log_ratio.clone()).mean();
 
             // Compute clip fraction for logging
             let clip_fraction = (ratio.clone() - 1.0)
@@ -354,8 +356,8 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 .float()
                 .mean();
 
-            // Accumulate metrics
-            total_policy_loss += policy_loss_mean.clone().into_scalar().elem::<f32>();
+            // Accumulate metrics (negate policy_loss for display - actual loss is negative)
+            total_policy_loss += -policy_loss_mean.clone().into_scalar().elem::<f32>();
             total_value_loss += value_loss.clone().into_scalar().elem::<f32>();
             total_entropy += entropy.mean().into_scalar().elem::<f32>();
             total_approx_kl += approx_kl.clone().into_scalar().elem::<f32>();

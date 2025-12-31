@@ -360,6 +360,12 @@ fn main() -> Result<()> {
     let mut last_log_time = training_start;
     let mut last_log_step = global_step;
 
+    // Episode tracking for metrics (cleared on each log)
+    let mut episodes_since_log: Vec<(f32, usize)> = Vec::new(); // (return, length)
+
+    // Episode tracking for checkpoint selection (cleared on each checkpoint)
+    let mut episodes_since_checkpoint: Vec<f32> = Vec::new();
+
     // Training loop
     for update in 0..num_updates {
         if !running.load(Ordering::SeqCst) {
@@ -386,8 +392,13 @@ fn main() -> Result<()> {
             &mut rng,
         );
 
-        // Track episode returns
+        // Track episode returns for metrics and checkpointing
         for ep in &completed_episodes {
+            // For logging (cleared each log)
+            episodes_since_log.push((ep.total_reward, ep.length));
+            // For checkpoint best selection (cleared each checkpoint)
+            episodes_since_checkpoint.push(ep.total_reward);
+            // For progress bar and checkpoint metadata (rolling window)
             recent_returns.push(ep.total_reward);
             if recent_returns.len() > 100 {
                 recent_returns.remove(0);
@@ -438,42 +449,55 @@ fn main() -> Result<()> {
             logger.log_scalar("train/value_mean", metrics.value_mean, global_step)?;
             logger.log_scalar("train/returns_mean", metrics.returns_mean, global_step)?;
 
-            // Steps per second - instantaneous (since last log) and cumulative (overall)
+            // Steps per second (since last log)
             let now = std::time::Instant::now();
             let interval_elapsed = now.duration_since(last_log_time).as_secs_f32();
             let interval_steps = (global_step - last_log_step) as f32;
-            let sps_instant = if interval_elapsed > 0.0 { interval_steps / interval_elapsed } else { 0.0 };
-
-            let total_elapsed = training_start.elapsed().as_secs_f32();
-            let sps_mean = if total_elapsed > 0.0 { global_step as f32 / total_elapsed } else { 0.0 };
-
-            logger.log_scalar("perf/sps_instant", sps_instant, global_step)?;
-            logger.log_scalar("perf/sps_mean", sps_mean, global_step)?;
+            let sps = if interval_elapsed > 0.0 { interval_steps / interval_elapsed } else { 0.0 };
+            logger.log_scalar("perf/sps", sps, global_step)?;
 
             last_log_time = now;
             last_log_step = global_step;
 
-            if !recent_returns.is_empty() {
-                let avg_return: f32 =
-                    recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
-                logger.log_scalar("episode/return", avg_return, global_step)?;
+            // Episode return metrics (since last log)
+            if !episodes_since_log.is_empty() {
+                let returns: Vec<f32> = episodes_since_log.iter().map(|(r, _)| *r).collect();
+                let lengths: Vec<usize> = episodes_since_log.iter().map(|(_, l)| *l).collect();
+
+                let return_mean = returns.iter().sum::<f32>() / returns.len() as f32;
+                let return_max = returns.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let return_min = returns.iter().cloned().fold(f32::INFINITY, f32::min);
+
+                let length_mean = lengths.iter().sum::<usize>() as f32 / lengths.len() as f32;
+                let length_max = *lengths.iter().max().unwrap() as f32;
+                let length_min = *lengths.iter().min().unwrap() as f32;
+
+                logger.log_scalar("episode/return_mean", return_mean, global_step)?;
+                logger.log_scalar("episode/return_max", return_max, global_step)?;
+                logger.log_scalar("episode/return_min", return_min, global_step)?;
+                logger.log_scalar("episode/length_mean", length_mean, global_step)?;
+                logger.log_scalar("episode/length_max", length_max, global_step)?;
+                logger.log_scalar("episode/length_min", length_min, global_step)?;
+                logger.log_scalar("episode/count", episodes_since_log.len() as f32, global_step)?;
+
+                episodes_since_log.clear();
             }
 
             logger.flush()?;
         }
 
-        // Log individual episode returns
-        for ep in &completed_episodes {
-            logger.log_scalar("episode/return_single", ep.total_reward, global_step)?;
-            logger.log_scalar("episode/length", ep.length as f32, global_step)?;
-        }
-
         // Checkpointing
         if global_step - last_checkpoint_step >= config.checkpoint_freq {
-            let avg_return = if recent_returns.is_empty() {
-                0.0
+            // Use episodes since last checkpoint for best selection
+            let avg_return = if episodes_since_checkpoint.is_empty() {
+                // Fall back to rolling window if no episodes completed since checkpoint
+                if recent_returns.is_empty() {
+                    0.0
+                } else {
+                    recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
+                }
             } else {
-                recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
+                episodes_since_checkpoint.iter().sum::<f32>() / episodes_since_checkpoint.len() as f32
             };
 
             let metadata = CheckpointMetadata {
@@ -504,6 +528,7 @@ fn main() -> Result<()> {
                 checkpoint_path.file_name().unwrap()
             );
             last_checkpoint_step = global_step;
+            episodes_since_checkpoint.clear();
         }
     }
 

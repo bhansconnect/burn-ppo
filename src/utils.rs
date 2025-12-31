@@ -52,22 +52,18 @@ pub fn entropy_categorical<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 1> {
 
 /// Gather values at indices along dimension 1
 /// Equivalent to: output[i] = input[i, indices[i]]
+///
+/// Uses Burn's `gather` operation which properly supports gradient flow,
+/// unlike the previous boolean-mask approach which blocked gradients.
 fn gather_1d<B: Backend>(input: Tensor<B, 2>, indices: Tensor<B, 1, Int>) -> Tensor<B, 1> {
-    let [batch, _num_actions] = input.dims();
-    let device = input.device();
+    // Expand indices from [batch] to [batch, 1] for gather
+    let indices_2d = indices.unsqueeze_dim(1); // [batch, 1]
 
-    // Create one-hot mask
-    let indices_expanded = indices.clone().unsqueeze_dim(1);
-    let range = Tensor::<B, 1, Int>::arange(0..input.dims()[1] as i64, &device);
-    let range_expanded = range.unsqueeze_dim(0).repeat_dim(0, batch);
+    // Gather along dimension 1: selects input[i, indices[i]] for each batch element
+    let gathered = input.gather(1, indices_2d); // [batch, 1]
 
-    // mask[i,j] = 1 if j == indices[i], else 0
-    let mask = indices_expanded.equal(range_expanded);
-
-    // Use mask to select values
-    // sum_dim(1) returns [batch, 1], squeeze dim 1 to get [batch]
-    let masked = input * mask.float();
-    masked.sum_dim(1).squeeze_dims(&[1])
+    // Squeeze back to [batch]
+    gathered.squeeze_dims(&[1])
 }
 
 /// Normalize advantages to zero mean and unit variance
