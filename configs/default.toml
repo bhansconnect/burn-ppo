@@ -1,32 +1,32 @@
-# Default PPO configuration
-# See docs/DESIGN.md for rationale
+# Default PPO configuration for CartPole
+# Optimized based on ablation experiments (see docs/DESIGN.md)
 
 # Environment
 env = "cartpole"
 num_envs = 4         # 4 is standard for CartPole; use "auto" for larger envs
 num_steps = 128      # Steps per rollout
 
-# PPO hyperparameters (from ICLR blog)
-learning_rate = 2.5e-4
-lr_anneal = false    # Set true for longer runs; false recommended for CartPole
+# PPO hyperparameters
+learning_rate = 0.001    # 4x higher than ICLR default (2.5e-4) - critical for fast learning
+lr_anneal = false        # Set true for longer runs
 gamma = 0.99
 gae_lambda = 0.95
 clip_epsilon = 0.2
-clip_value = true
+clip_value = true        # Value clipping has minimal effect (~1%)
 entropy_coef = 0.01
 value_coef = 0.5
 max_grad_norm = 0.5
 
 # Training
-total_timesteps = 1_000_000
+total_timesteps = 200_000    # Sufficient for CartPole with optimal settings
 num_epochs = 4
 num_minibatches = 4
-adam_epsilon = 1e-5  # Not default 1e-8!
+adam_epsilon = 1e-5      # Not default 1e-8!
 
 # Network
 hidden_size = 64
 num_hidden = 2
-activation = "tanh"  # "tanh" (ICLR standard) or "relu"
+activation = "relu"      # ReLU significantly outperforms tanh for CartPole
 
 # Checkpointing
 run_dir = "runs"
