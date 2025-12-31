@@ -1,3 +1,4 @@
+mod checkpoint;
 mod config;
 mod env;
 mod envs;
@@ -17,6 +18,7 @@ use burn::prelude::*;
 use clap::Parser;
 use rand::SeedableRng;
 
+use crate::checkpoint::{CheckpointManager, CheckpointMetadata};
 use crate::config::{CliArgs, Config};
 use crate::env::VecEnv;
 use crate::envs::CartPole;
@@ -94,6 +96,10 @@ fn main() -> Result<()> {
     let mut logger = MetricsLogger::new(&run_dir)?;
     logger.log_hparams(&config)?;
     logger.flush()?;
+
+    // Create checkpoint manager
+    let mut checkpoint_manager = CheckpointManager::new(&run_dir)?;
+    let mut last_checkpoint_step = 0;
 
     // Training state
     let mut global_step = 0;
@@ -197,6 +203,30 @@ fn main() -> Result<()> {
         for ep in &completed_episodes {
             logger.log_scalar("episode/return_single", ep.total_reward, global_step)?;
             logger.log_scalar("episode/length", ep.length as f32, global_step)?;
+        }
+
+        // Checkpointing
+        if global_step - last_checkpoint_step >= config.checkpoint_freq {
+            let avg_return = if recent_returns.is_empty() {
+                0.0
+            } else {
+                recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
+            };
+
+            let metadata = CheckpointMetadata {
+                step: global_step,
+                avg_return,
+                rng_seed: config.seed,
+            };
+
+            let checkpoint_path = checkpoint_manager.save(&model, &metadata)?;
+            println!(
+                "Saved checkpoint at step {} (avg return: {:.1}) -> {:?}",
+                global_step,
+                avg_return,
+                checkpoint_path.file_name().unwrap()
+            );
+            last_checkpoint_step = global_step;
         }
     }
 
