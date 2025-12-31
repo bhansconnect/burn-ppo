@@ -360,6 +360,11 @@ fn main() -> Result<()> {
     let mut last_log_time = training_start;
     let mut last_log_step = global_step;
 
+    // Phase timing accumulators (reset on log)
+    let mut rollout_time_acc = std::time::Duration::ZERO;
+    let mut gae_time_acc = std::time::Duration::ZERO;
+    let mut update_time_acc = std::time::Duration::ZERO;
+
     // Episode tracking for metrics (cleared on each log)
     let mut episodes_since_log: Vec<(f32, usize)> = Vec::new(); // (return, length)
 
@@ -383,6 +388,7 @@ fn main() -> Result<()> {
         };
 
         // Collect rollouts
+        let rollout_start = std::time::Instant::now();
         let completed_episodes = collect_rollouts(
             &model,
             &mut vec_env,
@@ -391,6 +397,7 @@ fn main() -> Result<()> {
             &device,
             &mut rng,
         );
+        rollout_time_acc += rollout_start.elapsed();
 
         // Track episode returns for metrics and checkpointing
         for ep in &completed_episodes {
@@ -413,6 +420,7 @@ fn main() -> Result<()> {
         let (_, last_values) = model.forward(obs_tensor);
 
         // Compute GAE
+        let gae_start = std::time::Instant::now();
         compute_gae(
             &mut buffer,
             last_values,
@@ -420,9 +428,12 @@ fn main() -> Result<()> {
             config.gae_lambda as f32,
             &device,
         );
+        gae_time_acc += gae_start.elapsed();
 
         // PPO update
+        let update_start = std::time::Instant::now();
         let (updated_model, metrics) = ppo_update(model, &buffer, &mut optimizer, &config, lr, &mut rng);
+        update_time_acc += update_start.elapsed();
         model = updated_model;
 
         global_step += steps_per_update;
@@ -455,6 +466,26 @@ fn main() -> Result<()> {
             let interval_steps = (global_step - last_log_step) as f32;
             let sps = if interval_elapsed > 0.0 { interval_steps / interval_elapsed } else { 0.0 };
             logger.log_scalar("perf/sps", sps, global_step)?;
+
+            // Phase timing
+            let rollout_secs = rollout_time_acc.as_secs_f32();
+            let gae_secs = gae_time_acc.as_secs_f32();
+            let update_secs = update_time_acc.as_secs_f32();
+            let total_secs = rollout_secs + gae_secs + update_secs;
+
+            logger.log_scalar("perf/rollout_time", rollout_secs, global_step)?;
+            logger.log_scalar("perf/gae_time", gae_secs, global_step)?;
+            logger.log_scalar("perf/update_time", update_secs, global_step)?;
+
+            if total_secs > 0.0 {
+                logger.log_scalar("perf/rollout_pct", rollout_secs / total_secs * 100.0, global_step)?;
+                logger.log_scalar("perf/update_pct", update_secs / total_secs * 100.0, global_step)?;
+            }
+
+            // Reset timing accumulators
+            rollout_time_acc = std::time::Duration::ZERO;
+            gae_time_acc = std::time::Duration::ZERO;
+            update_time_acc = std::time::Duration::ZERO;
 
             last_log_time = now;
             last_log_step = global_step;
