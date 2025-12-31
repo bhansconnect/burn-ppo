@@ -24,7 +24,14 @@ cargo run --release -- --config configs/cartpole.toml --num-envs 64 --seed 123
 
 ### Resume Training
 ```bash
+# Continue from last checkpoint (same config)
 cargo run --release -- --resume runs/<run_name>
+
+# Extend training duration
+cargo run --release -- --resume runs/<run_name> --total-timesteps 2000000
+
+# Fork with different config
+cargo run --release -- --fork runs/<run_name>/checkpoints/best --learning-rate 0.0001
 ```
 
 ### Run Tests

@@ -90,6 +90,50 @@ Checkpoints are saved to `runs/<run_name>/checkpoints/`:
 - `latest -> step_00020000/` - Symlink to most recent
 - `best -> step_00015000/` - Symlink to highest average return
 
+Each checkpoint includes model weights, optimizer state, and training metadata (step count, returns history, etc.).
+
+## Resuming Training
+
+### Resume after crash (same config)
+
+Continue training from the last checkpoint in an existing run:
+
+```bash
+cargo run --release -- --resume runs/<run_name>
+```
+
+This loads the config from the run directory and continues where training left off. The global step, optimizer state, and metrics all continue from the checkpoint.
+
+### Extend training duration
+
+To train beyond the original `total_timesteps`:
+
+```bash
+cargo run --release -- --resume runs/<run_name> --total-timesteps 2000000
+```
+
+Note: Only `--total-timesteps` can be overridden when resuming. Other config changes are ignored to preserve training consistency.
+
+### Fork with different config
+
+Create a new run starting from an existing checkpoint with different hyperparameters:
+
+```bash
+# Fork from best checkpoint with new learning rate
+cargo run --release -- --fork runs/<run_name>/checkpoints/best \
+    --learning-rate 0.0001 --total-timesteps 500000
+
+# Fork from a specific step
+cargo run --release -- --fork runs/<run_name>/checkpoints/step_00050000 \
+    --learning-rate 0.0001
+```
+
+Forking:
+- Creates a new run directory
+- Preserves the global step from the checkpoint (graphs continue from that point)
+- Allows any config changes (learning rate, hyperparameters, etc.)
+- Starts fresh metrics but step numbers continue from the checkpoint
+
 ## Run Directory Structure
 
 Each training run creates:

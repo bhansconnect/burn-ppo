@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use burn::module::Module;
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
+use burn::optim::Optimizer;
+use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Record, Recorder};
+use burn::tensor::backend::AutodiffBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -22,6 +24,25 @@ pub struct CheckpointMetadata {
     pub step: usize,
     pub avg_return: f32,
     pub rng_seed: u64,
+    /// Best average return seen during training (for CheckpointManager restoration)
+    #[serde(default = "default_best_avg_return")]
+    pub best_avg_return: f32,
+    /// Last 100 episode returns for smoothed metrics
+    #[serde(default)]
+    pub recent_returns: Vec<f32>,
+    /// Observation dimension (for generic model loading)
+    #[serde(default)]
+    pub obs_dim: usize,
+    /// Action count (for generic model loading)
+    #[serde(default)]
+    pub action_count: usize,
+    /// Parent run name if this run was forked from another
+    #[serde(default)]
+    pub forked_from: Option<String>,
+}
+
+fn default_best_avg_return() -> f32 {
+    f32::NEG_INFINITY
 }
 
 /// Manages checkpointing for a training run
@@ -102,11 +123,9 @@ impl CheckpointManager {
             .context("Failed to read checkpoint metadata")?;
         let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
 
-        // Create default model structure (to be populated with loaded weights)
-        // We need obs_dim and action_count - for now use CartPole defaults
-        // TODO: Save these in metadata for generic loading
-        let obs_dim = 4;
-        let action_count = 2;
+        // Use dimensions from metadata if available, otherwise fall back to CartPole defaults
+        let obs_dim = if metadata.obs_dim > 0 { metadata.obs_dim } else { 4 };
+        let action_count = if metadata.action_count > 0 { metadata.action_count } else { 2 };
         let default_model: ActorCritic<B> = ActorCritic::new(obs_dim, action_count, config, device);
 
         // Load model using Burn's recorder
@@ -139,6 +158,16 @@ impl CheckpointManager {
         }
     }
 
+    /// Get the current best average return
+    pub fn best_avg_return(&self) -> f32 {
+        self.best_avg_return
+    }
+
+    /// Set the best average return (used when resuming)
+    pub fn set_best_avg_return(&mut self, value: f32) {
+        self.best_avg_return = value;
+    }
+
     /// Update a symlink atomically
     fn update_symlink(&self, name: &str, target: &Path) -> Result<()> {
         let link_path = self.checkpoints_dir.join(name);
@@ -161,6 +190,49 @@ impl CheckpointManager {
 
         Ok(())
     }
+}
+
+/// Save optimizer state to a checkpoint directory
+///
+/// The optimizer record is saved alongside the model in the checkpoint directory.
+pub fn save_optimizer<B, O, M>(optimizer: &O, checkpoint_dir: &Path) -> Result<()>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B>,
+    O: Optimizer<M, B>,
+    O::Record: Record<B>,
+{
+    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+    let optimizer_path = checkpoint_dir.join("optimizer");
+    let record = optimizer.to_record();
+    recorder
+        .record(record, optimizer_path)
+        .context("Failed to save optimizer state")?;
+    Ok(())
+}
+
+/// Load optimizer state from a checkpoint directory
+///
+/// Returns the optimizer with restored state if an optimizer checkpoint exists.
+/// If no optimizer checkpoint is found, returns the optimizer unchanged.
+pub fn load_optimizer<B, O, M>(optimizer: O, checkpoint_dir: &Path, device: &B::Device) -> Result<O>
+where
+    B: AutodiffBackend,
+    M: burn::module::AutodiffModule<B>,
+    O: Optimizer<M, B>,
+    O::Record: Record<B>,
+{
+    let optimizer_path = checkpoint_dir.join("optimizer.mpk");
+    if !optimizer_path.exists() {
+        // No optimizer state saved, return as-is
+        return Ok(optimizer);
+    }
+
+    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+    let record: O::Record = recorder
+        .load(optimizer_path, device)
+        .context("Failed to load optimizer state")?;
+    Ok(optimizer.load_record(record))
 }
 
 #[cfg(test)]
@@ -192,6 +264,11 @@ mod tests {
             step: 1000,
             avg_return: 150.0,
             rng_seed: 42,
+            best_avg_return: 150.0,
+            recent_returns: vec![140.0, 150.0, 160.0],
+            obs_dim: 4,
+            action_count: 2,
+            forked_from: None,
         };
 
         let checkpoint_path = manager.save(&model, &metadata).unwrap();
@@ -230,6 +307,11 @@ mod tests {
                     step: 1000,
                     avg_return: 100.0,
                     rng_seed: 42,
+                    best_avg_return: 100.0,
+                    recent_returns: vec![100.0],
+                    obs_dim: 4,
+                    action_count: 2,
+                    forked_from: None,
                 },
             )
             .unwrap();
@@ -242,6 +324,11 @@ mod tests {
                     step: 2000,
                     avg_return: 200.0,
                     rng_seed: 42,
+                    best_avg_return: 200.0,
+                    recent_returns: vec![100.0, 200.0],
+                    obs_dim: 4,
+                    action_count: 2,
+                    forked_from: None,
                 },
             )
             .unwrap();
@@ -254,6 +341,11 @@ mod tests {
                     step: 3000,
                     avg_return: 150.0,
                     rng_seed: 42,
+                    best_avg_return: 200.0,
+                    recent_returns: vec![100.0, 200.0, 150.0],
+                    obs_dim: 4,
+                    action_count: 2,
+                    forked_from: None,
                 },
             )
             .unwrap();
