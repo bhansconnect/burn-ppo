@@ -4,3 +4,23 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# ML framework
+burn = { version = "0.19", features = ["autodiff", "wgpu", "fusion", "ndarray"] }
+
+# CLI and config
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+serde_json = "1"
+
+# Utilities
+rand = "0.8"
+num_cpus = "1.16"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

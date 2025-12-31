@@ -1,0 +1,39 @@
+# Default PPO configuration
+# See docs/DESIGN.md for rationale
+
+# Environment
+env = "cartpole"
+num_envs = "auto"    # "auto" = num_cpus * 2, or explicit number
+num_steps = 128      # Steps per rollout
+
+# PPO hyperparameters (from ICLR blog)
+learning_rate = 2.5e-4
+lr_anneal = true     # Linear decay to 0
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+clip_value = true
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+
+# Training
+total_timesteps = 1_000_000
+num_epochs = 4
+num_minibatches = 4
+adam_epsilon = 1e-5  # Not default 1e-8!
+
+# Network
+hidden_size = 64
+num_hidden = 2
+
+# Checkpointing
+run_dir = "runs"
+checkpoint_freq = 10_000
+
+# Logging
+log_freq = 1_000
+
+# Experiment
+seed = 42
+# run_name = "my_experiment"  # Optional, auto-generated if omitted
