@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[command(name = "burn-ppo", version, about)]
 pub struct CliArgs {
     /// Path to TOML config file
-    #[arg(short, long, default_value = "configs/default.toml")]
+    #[arg(short, long, default_value = "configs/cartpole.toml")]
     pub config: PathBuf,
 
     /// Resume from existing run directory (same config, continue training)
@@ -236,15 +236,11 @@ impl Config {
     ///
     /// The `forked_from` parameter is set when forking from another run
     pub fn load(args: &CliArgs, forked_from: Option<String>) -> Result<Self> {
-        // Load base config
-        let mut config: Config = if args.config.exists() {
-            let content = fs::read_to_string(&args.config)
-                .with_context(|| format!("Failed to read config: {:?}", args.config))?;
-            toml::from_str(&content)
-                .with_context(|| format!("Failed to parse config: {:?}", args.config))?
-        } else {
-            Config::default()
-        };
+        // Load base config - fail if file doesn't exist
+        let content = fs::read_to_string(&args.config)
+            .with_context(|| format!("Config file not found: {:?}", args.config))?;
+        let mut config: Config = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config: {:?}", args.config))?;
 
         // Apply CLI overrides
         config.apply_cli_overrides(args);

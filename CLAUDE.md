@@ -48,6 +48,17 @@ uv run aim up      # Start server at localhost:43800
 uv run aim_watcher.py ../runs  # Stream metrics from all runs
 ```
 
+### Profiling with Tracy
+```bash
+# Build with Tracy instrumentation
+cargo build --release --features tracy
+
+# Run - Tracy GUI will auto-connect
+cargo run --release --features tracy -- --config configs/cartpole.toml
+```
+
+Tracy profiler download: https://github.com/wolfpld/tracy/releases
+
 ## Key Files
 
 | File | Purpose |
@@ -68,7 +79,7 @@ All hyperparameters in TOML. CLI overrides any field:
 - `--num-envs 128`
 - `--seed 42`
 
-See `configs/default.toml` for all options.
+See `configs/cartpole.toml` for all options.
 
 ## Checkpoints
 
