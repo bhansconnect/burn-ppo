@@ -53,7 +53,8 @@ impl Default for NumEnvs {
 impl NumEnvs {
     pub fn resolve(&self) -> usize {
         match self {
-            NumEnvs::Auto(_) => num_cpus::get() * 2,
+            // 1x CPU cores (not 2x) - no async rollout/training overlap
+            NumEnvs::Auto(_) => num_cpus::get(),
             NumEnvs::Explicit(n) => *n,
         }
     }
@@ -263,6 +264,42 @@ impl Config {
     pub fn num_envs(&self) -> usize {
         self.num_envs.resolve()
     }
+
+    /// Validate configuration parameters
+    pub fn validate(&self) -> Result<()> {
+        use anyhow::bail;
+
+        if self.learning_rate <= 0.0 {
+            bail!("learning_rate must be > 0");
+        }
+        if self.gamma < 0.0 || self.gamma > 1.0 {
+            bail!("gamma must be in [0, 1]");
+        }
+        if self.clip_epsilon <= 0.0 {
+            bail!("clip_epsilon must be > 0");
+        }
+        if self.entropy_coef < 0.0 {
+            bail!("entropy_coef must be >= 0");
+        }
+        if self.num_epochs == 0 {
+            bail!("num_epochs must be > 0");
+        }
+        if self.num_minibatches == 0 {
+            bail!("num_minibatches must be > 0");
+        }
+
+        // Check minibatch size is reasonable
+        let batch_size = self.num_steps * self.num_envs();
+        let minibatch_size = batch_size / self.num_minibatches;
+        if minibatch_size < 4 {
+            bail!(
+                "minibatch_size {} too small, increase num_steps or num_envs",
+                minibatch_size
+            );
+        }
+
+        Ok(())
+    }
 }
 
 fn generate_run_name(config: &Config) -> String {
@@ -296,5 +333,25 @@ mod tests {
     fn test_num_envs_explicit() {
         let num_envs = NumEnvs::Explicit(64);
         assert_eq!(num_envs.resolve(), 64);
+    }
+
+    #[test]
+    fn test_config_validate_success() {
+        let config = Config::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_bad_lr() {
+        let mut config = Config::default();
+        config.learning_rate = -0.1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validate_bad_gamma() {
+        let mut config = Config::default();
+        config.gamma = 1.5;
+        assert!(config.validate().is_err());
     }
 }

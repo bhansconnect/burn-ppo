@@ -1,3 +1,4 @@
+mod backend;
 mod checkpoint;
 mod config;
 mod env;
@@ -5,19 +6,20 @@ mod envs;
 mod metrics;
 mod network;
 mod ppo;
+mod progress;
 mod utils;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use burn::backend::wgpu::{Wgpu, WgpuDevice};
-use burn::backend::Autodiff;
+use burn::grad_clipping::GradientClippingConfig;
 use burn::optim::AdamConfig;
 use burn::prelude::*;
 use clap::Parser;
 use rand::SeedableRng;
 
+use crate::backend::{init_device, backend_name, TrainingBackend};
 use crate::checkpoint::{CheckpointManager, CheckpointMetadata};
 use crate::config::{CliArgs, Config};
 use crate::env::VecEnv;
@@ -25,13 +27,12 @@ use crate::envs::CartPole;
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
 use crate::ppo::{collect_rollouts, compute_gae, ppo_update, RolloutBuffer};
-
-/// Backend type for training (WGPU with autodiff)
-type TrainingBackend = Autodiff<Wgpu>;
+use crate::progress::TrainingProgress;
 
 fn main() -> Result<()> {
     let args = CliArgs::parse();
     let config = Config::load(&args)?;
+    config.validate()?;
 
     println!("burn-ppo v{}", env!("CARGO_PKG_VERSION"));
     println!("Environment: {}", config.env);
@@ -52,8 +53,8 @@ fn main() -> Result<()> {
     ctrlc_handler(r);
 
     // Initialize device
-    let device = WgpuDevice::default();
-    println!("Device: {:?}", device);
+    let device = init_device();
+    println!("Backend: {}", backend_name());
 
     // Create run directory
     let run_dir = config.run_path();
@@ -84,8 +85,12 @@ fn main() -> Result<()> {
         ActorCritic::new(obs_dim, action_count, &config, &device);
     println!("Created ActorCritic network");
 
-    // Create optimizer
-    let optimizer_config = AdamConfig::new().with_epsilon(config.adam_epsilon as f32);
+    // Create optimizer with gradient clipping
+    let optimizer_config = AdamConfig::new()
+        .with_epsilon(config.adam_epsilon as f32)
+        .with_grad_clipping(Some(GradientClippingConfig::Norm(
+            config.max_grad_norm as f32,
+        )));
     let mut optimizer = optimizer_config.init();
 
     // Create rollout buffer
@@ -114,6 +119,12 @@ fn main() -> Result<()> {
 
     // Episode tracking
     let mut recent_returns: Vec<f32> = Vec::new();
+
+    // Progress bar
+    let progress = TrainingProgress::new(config.total_timesteps as u64);
+
+    // Timing for SPS calculation
+    let training_start = std::time::Instant::now();
 
     // Training loop
     for update in 0..num_updates {
@@ -170,6 +181,14 @@ fn main() -> Result<()> {
 
         global_step += steps_per_update;
 
+        // Update progress bar
+        let avg_return = if recent_returns.is_empty() {
+            0.0
+        } else {
+            recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
+        };
+        progress.update(global_step as u64, avg_return);
+
         // Log metrics
         if global_step % config.log_freq == 0 || update == 0 {
             logger.log_scalar("train/policy_loss", metrics.policy_loss, global_step)?;
@@ -178,6 +197,15 @@ fn main() -> Result<()> {
             logger.log_scalar("train/approx_kl", metrics.approx_kl, global_step)?;
             logger.log_scalar("train/clip_fraction", metrics.clip_fraction, global_step)?;
             logger.log_scalar("train/learning_rate", lr as f32, global_step)?;
+            logger.log_scalar("train/explained_variance", metrics.explained_variance, global_step)?;
+            logger.log_scalar("train/total_loss", metrics.total_loss, global_step)?;
+            logger.log_scalar("train/value_mean", metrics.value_mean, global_step)?;
+            logger.log_scalar("train/returns_mean", metrics.returns_mean, global_step)?;
+
+            // Steps per second
+            let elapsed = training_start.elapsed().as_secs_f32();
+            let sps = if elapsed > 0.0 { global_step as f32 / elapsed } else { 0.0 };
+            logger.log_scalar("charts/SPS", sps, global_step)?;
 
             if !recent_returns.is_empty() {
                 let avg_return: f32 =
@@ -186,17 +214,6 @@ fn main() -> Result<()> {
             }
 
             logger.flush()?;
-
-            // Console output
-            let avg_return = if recent_returns.is_empty() {
-                0.0
-            } else {
-                recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
-            };
-            println!(
-                "Step {:>7} | Return: {:>6.1} | Policy Loss: {:>7.4} | Entropy: {:>5.3} | KL: {:>6.4}",
-                global_step, avg_return, metrics.policy_loss, metrics.entropy, metrics.approx_kl
-            );
         }
 
         // Log individual episode returns
@@ -230,6 +247,7 @@ fn main() -> Result<()> {
         }
     }
 
+    progress.finish();
     println!("---");
     println!("Training complete!");
 

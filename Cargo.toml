@@ -3,15 +3,24 @@ name = "burn-ppo"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["wgpu"]
+cuda = ["burn/cuda"]
+libtorch = ["burn/tch"]
+wgpu = ["burn/wgpu"]
+
 [dependencies]
-# ML framework
-burn = { version = "0.19", features = ["autodiff", "wgpu", "fusion", "ndarray"] }
+# ML framework - base features, backend selected via features above
+burn = { version = "0.19", features = ["autodiff", "fusion", "ndarray"] }
 
 # CLI and config
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 serde_json = "1"
+
+# Progress bars
+indicatif = "0.17"
 
 # Utilities
 rand = "0.8"

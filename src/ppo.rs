@@ -13,8 +13,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::config::Config;
-use crate::env::{EpisodeStats, VecEnv};
-use crate::envs::CartPole;
+use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
 use crate::utils::{entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical};
 
@@ -75,10 +74,11 @@ impl<B: Backend> RolloutBuffer<B> {
 
 /// Collect rollouts from vectorized environment
 ///
-/// Runs num_steps in each of num_envs environments, storing trajectories
-pub fn collect_rollouts<B: Backend>(
+/// Runs num_steps in each of num_envs environments, storing trajectories.
+/// Uses CPU collection with batch GPU transfer for performance.
+pub fn collect_rollouts<B: Backend, E: Environment>(
     model: &ActorCritic<B>,
-    vec_env: &mut VecEnv<CartPole>,
+    vec_env: &mut VecEnv<E>,
     buffer: &mut RolloutBuffer<B>,
     num_steps: usize,
     device: &B::Device,
@@ -88,14 +88,22 @@ pub fn collect_rollouts<B: Backend>(
     let obs_dim = vec_env.observation_dim();
     let mut all_completed = Vec::new();
 
-    for step in 0..num_steps {
+    // Pre-allocate CPU vectors for batch collection
+    let mut all_obs: Vec<f32> = Vec::with_capacity(num_steps * num_envs * obs_dim);
+    let mut all_actions: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_rewards: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_dones: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_values: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_log_probs: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+
+    for _step in 0..num_steps {
         // Get current observations and convert to tensor
         let obs_flat = vec_env.get_observations();
         let obs_tensor: Tensor<B, 2> =
             Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device).reshape([num_envs, obs_dim]);
 
         // Forward pass to get logits and values
-        let (logits, values) = model.forward(obs_tensor.clone());
+        let (logits, values) = model.forward(obs_tensor);
 
         // Sample actions from categorical distribution
         let actions = sample_categorical(logits.clone(), rng, device);
@@ -103,60 +111,40 @@ pub fn collect_rollouts<B: Backend>(
         // Compute log probs of sampled actions
         let log_probs = log_prob_categorical(logits, actions.clone());
 
+        // Convert to CPU data
+        let actions_data: Vec<i64> = actions.into_data().to_vec().expect("actions to vec");
+        let values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+        let log_probs_data: Vec<f32> = log_probs.into_data().to_vec().expect("log_probs to vec");
+
         // Convert actions to Vec<usize> for environment
-        let actions_data: Vec<i64> = actions.clone().into_data().to_vec().expect("actions to vec");
         let actions_usize: Vec<usize> = actions_data.iter().map(|&a| a as usize).collect();
 
         // Step environment
         let (_next_obs, rewards, dones, completed) = vec_env.step(&actions_usize);
         all_completed.extend(completed);
 
-        // Store in buffer
-        // observations[step] = obs_tensor
-        let obs_expanded = obs_tensor.unsqueeze_dim(0);
-        buffer.observations = buffer.observations.clone().slice_assign(
-            [step..step + 1, 0..num_envs, 0..obs_dim],
-            obs_expanded,
-        );
-
-        // actions[step] = actions
-        let actions_expanded: Tensor<B, 2, Int> = actions.unsqueeze_dim(0);
-        buffer.actions = buffer.actions.clone().slice_assign(
-            [step..step + 1, 0..num_envs],
-            actions_expanded,
-        );
-
-        // rewards[step] = rewards
-        let rewards_tensor: Tensor<B, 2> =
-            Tensor::<B, 1>::from_floats(rewards.as_slice(), device).unsqueeze_dim(0);
-        buffer.rewards = buffer.rewards.clone().slice_assign(
-            [step..step + 1, 0..num_envs],
-            rewards_tensor,
-        );
-
-        // dones[step] = dones
-        let dones_f32: Vec<f32> = dones.iter().map(|&d| if d { 1.0 } else { 0.0 }).collect();
-        let dones_tensor: Tensor<B, 2> =
-            Tensor::<B, 1>::from_floats(dones_f32.as_slice(), device).unsqueeze_dim(0);
-        buffer.dones = buffer.dones.clone().slice_assign(
-            [step..step + 1, 0..num_envs],
-            dones_tensor,
-        );
-
-        // values[step] = values
-        let values_expanded: Tensor<B, 2> = values.unsqueeze_dim(0);
-        buffer.values = buffer.values.clone().slice_assign(
-            [step..step + 1, 0..num_envs],
-            values_expanded,
-        );
-
-        // log_probs[step] = log_probs
-        let log_probs_expanded: Tensor<B, 2> = log_probs.unsqueeze_dim(0);
-        buffer.log_probs = buffer.log_probs.clone().slice_assign(
-            [step..step + 1, 0..num_envs],
-            log_probs_expanded,
-        );
+        // Append to CPU buffers
+        all_obs.extend_from_slice(&obs_flat);
+        all_actions.extend_from_slice(&actions_data);
+        all_rewards.extend_from_slice(&rewards);
+        all_dones.extend(dones.iter().map(|&d| if d { 1.0 } else { 0.0 }));
+        all_values.extend_from_slice(&values_data);
+        all_log_probs.extend_from_slice(&log_probs_data);
     }
+
+    // Batch transfer to GPU
+    buffer.observations =
+        Tensor::<B, 1>::from_floats(all_obs.as_slice(), device).reshape([num_steps, num_envs, obs_dim]);
+    buffer.actions =
+        Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device).reshape([num_steps, num_envs]);
+    buffer.rewards =
+        Tensor::<B, 1>::from_floats(all_rewards.as_slice(), device).reshape([num_steps, num_envs]);
+    buffer.dones =
+        Tensor::<B, 1>::from_floats(all_dones.as_slice(), device).reshape([num_steps, num_envs]);
+    buffer.values =
+        Tensor::<B, 1>::from_floats(all_values.as_slice(), device).reshape([num_steps, num_envs]);
+    buffer.log_probs =
+        Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device).reshape([num_steps, num_envs]);
 
     all_completed
 }
@@ -216,6 +204,32 @@ pub fn compute_gae<B: Backend>(
     buffer.returns = Some(returns_tensor);
 }
 
+/// Compute explained variance: 1 - Var(returns - values) / Var(returns)
+/// Values close to 1 indicate good value function predictions
+pub fn compute_explained_variance(values: &[f32], returns: &[f32]) -> f32 {
+    let n = values.len() as f32;
+    if n < 2.0 {
+        return 0.0;
+    }
+
+    let mean_returns = returns.iter().sum::<f32>() / n;
+    let var_returns = returns.iter().map(|r| (r - mean_returns).powi(2)).sum::<f32>() / n;
+
+    if var_returns < 1e-8 {
+        return 0.0;
+    }
+
+    let residuals: Vec<f32> = values.iter().zip(returns).map(|(v, r)| r - v).collect();
+    let mean_residuals = residuals.iter().sum::<f32>() / n;
+    let var_residuals = residuals
+        .iter()
+        .map(|r| (r - mean_residuals).powi(2))
+        .sum::<f32>()
+        / n;
+
+    1.0 - var_residuals / var_returns
+}
+
 /// Training metrics from a single update
 #[derive(Debug, Clone)]
 pub struct UpdateMetrics {
@@ -224,6 +238,11 @@ pub struct UpdateMetrics {
     pub entropy: f32,
     pub approx_kl: f32,
     pub clip_fraction: f32,
+    // Additional metrics for debugging
+    pub explained_variance: f32,
+    pub total_loss: f32,
+    pub value_mean: f32,
+    pub returns_mean: f32,
 }
 
 /// Perform PPO update on collected rollouts
@@ -247,6 +266,9 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     let mut total_entropy = 0.0;
     let mut total_approx_kl = 0.0;
     let mut total_clip_fraction = 0.0;
+    let mut total_loss_sum = 0.0;
+    let mut total_value_mean = 0.0;
+    let mut total_returns_mean = 0.0;
     let mut num_updates = 0;
 
     let mut model = model;
@@ -304,7 +326,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 let value_loss_2 = (values_clipped - mb_returns.clone()).powf_scalar(2.0);
                 value_loss_1.max_pair(value_loss_2).mean() * 0.5
             } else {
-                (values - mb_returns).powf_scalar(2.0).mean() * 0.5
+                (values.clone() - mb_returns.clone()).powf_scalar(2.0).mean() * 0.5
             };
 
             // Entropy bonus
@@ -329,6 +351,9 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             total_entropy += entropy.mean().into_scalar().elem::<f32>();
             total_approx_kl += approx_kl.clone().into_scalar().elem::<f32>();
             total_clip_fraction += clip_fraction.clone().into_scalar().elem::<f32>();
+            total_loss_sum += loss.clone().into_scalar().elem::<f32>();
+            total_value_mean += values.mean().into_scalar().elem::<f32>();
+            total_returns_mean += mb_returns.mean().into_scalar().elem::<f32>();
             num_updates += 1;
 
             // Backward pass and optimization
@@ -342,6 +367,23 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         }
     }
 
+    // Compute explained variance from full buffer
+    let values_data: Vec<f32> = buffer
+        .values
+        .clone()
+        .into_data()
+        .to_vec()
+        .expect("values to vec");
+    let returns_data: Vec<f32> = buffer
+        .returns
+        .as_ref()
+        .expect("returns computed")
+        .clone()
+        .into_data()
+        .to_vec()
+        .expect("returns to vec");
+    let explained_variance = compute_explained_variance(&values_data, &returns_data);
+
     // Average metrics
     let metrics = UpdateMetrics {
         policy_loss: total_policy_loss / num_updates as f32,
@@ -349,6 +391,10 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         entropy: total_entropy / num_updates as f32,
         approx_kl: total_approx_kl / num_updates as f32,
         clip_fraction: total_clip_fraction / num_updates as f32,
+        explained_variance,
+        total_loss: total_loss_sum / num_updates as f32,
+        value_mean: total_value_mean / num_updates as f32,
+        returns_mean: total_returns_mean / num_updates as f32,
     };
 
     (model, metrics)
