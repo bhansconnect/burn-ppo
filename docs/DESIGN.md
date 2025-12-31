@@ -225,6 +225,67 @@ Config flag to use separate networks instead of shared backbone. Same training l
 ### Async Rollout/Training Overlap
 Move rollout collection to a separate thread, communicate via channel. Allows CPU-bound env stepping to overlap with GPU-bound training. Requires periodic model weight sync.
 
+### Teacher-Student Networks
+
+For complex games, train smaller networks first, then use as teachers:
+
+**Approach:**
+1. Train small network (e.g., 2×64 hidden) to competence
+2. Train larger student network (e.g., 3×256 hidden)
+3. Student loss = PPO_loss + α × KL_divergence(student_policy || teacher_policy)
+4. Anneal α from 1.0 → 0.0 over training
+
+**Training Flow:**
+
+```
+Phase 1: Train Teacher (small network)
+    └─ Train to convergence on task
+    └─ Save best checkpoint
+
+Phase 2: Train Student (large network)
+    └─ Initialize fresh
+    └─ For each batch:
+        ├─ Get teacher logits (frozen)
+        ├─ Get student logits
+        ├─ Compute PPO loss (normal)
+        ├─ Compute distillation loss: α × KL(student || teacher)
+        ├─ Total loss = PPO_loss + distillation_loss
+        └─ Update student only
+    └─ Anneal α: 1.0 → 0.0 over N steps
+
+Phase 3: Pure Student (optional)
+    └─ Continue training without teacher
+    └─ Student may surpass teacher
+```
+
+**Benefits:**
+- Faster initial learning (student benefits from teacher's exploration)
+- More stable training for complex action spaces
+- Knowledge distillation improves sample efficiency
+- Student can eventually exceed teacher (not constrained by teacher's optimum)
+
+**When to Use:**
+- Large action spaces where exploration is expensive
+- Complex games where random initial policy struggles
+- When smaller network achieves reasonable performance but larger network fails to train
+
+**Implementation:**
+
+```rust
+pub struct TeacherStudentConfig {
+    pub teacher_checkpoint: PathBuf,    // Path to trained teacher
+    pub distillation_coef: f64,         // Initial α (default 1.0)
+    pub anneal_steps: usize,            // Steps to anneal α to 0
+    pub temperature: f64,               // Softmax temperature (default 1.0)
+}
+```
+
+- Teacher network frozen, loaded from checkpoint
+- Student receives teacher logits as soft targets
+- Temperature parameter softens distributions (higher = softer)
+- Config flag to enable/disable
+- Optional: Use teacher for action sampling during early training (imitation warmup)
+
 ---
 
 ## Testing Philosophy
