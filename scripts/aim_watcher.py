@@ -22,22 +22,31 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Callable
 
 from aim import Run
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 
-class MetricsHandler(FileSystemEventHandler):
-    """Handler for metrics.jsonl file changes"""
+class RunTracker:
+    """Manages Aim Run and metrics reading for a single training run"""
 
-    def __init__(self, run: Run, metrics_path: Path, offset_path: Path, run_name: str):
-        self.run = run
-        self.metrics_path = metrics_path
-        self.offset_path = offset_path
-        self.run_name = run_name
+    def __init__(self, run_dir: Path, aim_repo: Path, print_interval: int):
+        self.run_dir = run_dir
+        self.run_name = run_dir.name
+        self.metrics_path = run_dir / "metrics.jsonl"
+        self.offset_path = run_dir / ".aim_offset"
+        self.hash_path = run_dir / ".aim_run_hash"
         self.offset = self._load_offset()
+
+        # Store aim_repo for lazy initialization
+        self.aim_repo = aim_repo
+        self.aim_run = None  # Lazy init - only open when new data arrives
+        self.last_activity_time = time.time()
+
+        # Track last printed step per metric to avoid spam
+        self.print_interval = print_interval
+        self.last_printed_step: dict[str, int] = {}
+
+        print(f">>> Tracking run: {self.run_name}")
 
     def _load_offset(self) -> int:
         """Load last processed offset from file"""
@@ -55,10 +64,34 @@ class MetricsHandler(FileSystemEventHandler):
         except OSError as e:
             print(f"Warning: Could not save offset: {e}", file=sys.stderr)
 
-    def process_new_lines(self):
-        """Read and process any new lines in the metrics file"""
+    def _init_aim_run(self):
+        """Initialize the Aim run (lazy, called on first data)"""
+        run_hash = None
+        if self.hash_path.exists():
+            run_hash = self.hash_path.read_text().strip()
+
+        self.aim_run = Run(
+            run_hash=run_hash,
+            repo=str(self.aim_repo),
+            experiment=self.run_name,
+        )
+
+        # Save hash for future resumption (if new run)
+        if run_hash is None:
+            self.hash_path.write_text(self.aim_run.hash)
+
+        self.last_activity_time = time.time()
+        print(f">>> Opened Aim run: {self.run_name}")
+
+    def _ensure_open(self):
+        """Ensure the Aim run is open, initializing if needed"""
+        if self.aim_run is None:
+            self._init_aim_run()
+
+    def poll(self) -> bool:
+        """Read and process any new lines in the metrics file. Returns True if new data found."""
         if not self.metrics_path.exists():
-            return
+            return False
 
         try:
             with open(self.metrics_path, "r") as f:
@@ -67,7 +100,7 @@ class MetricsHandler(FileSystemEventHandler):
                 new_offset = f.tell()
 
             if not lines:
-                return
+                return False
 
             for line in lines:
                 line = line.strip()
@@ -82,12 +115,17 @@ class MetricsHandler(FileSystemEventHandler):
 
             self.offset = new_offset
             self._save_offset()
+            self.last_activity_time = time.time()
+            return True
 
         except OSError as e:
             print(f"Warning: Could not read metrics: {e}", file=sys.stderr)
+            return False
 
     def _log_metric(self, metric: dict):
         """Log a single metric to Aim"""
+        self._ensure_open()
+
         metric_type = metric.get("type")
         step = metric.get("step", 0)
 
@@ -95,84 +133,38 @@ class MetricsHandler(FileSystemEventHandler):
             # Log hyperparameters
             data = metric.get("data", {})
             for key, value in data.items():
-                self.run[key] = value
+                self.aim_run[key] = value
             print(f"[{self.run_name}] Logged hyperparameters: {list(data.keys())}")
 
         elif metric_type == "scalar":
             name = metric.get("name", "unknown")
             value = metric.get("value", 0.0)
-            self.run.track(value, name=name, step=step)
-            # Only print occasionally to avoid spam
-            if step % 1000 == 0:
-                print(f"[{self.run_name}] Step {step}: {name} = {value:.4f}")
+            self.aim_run.track(value, name=name, step=step)
 
-    def on_modified(self, event):
-        """Called when the metrics file is modified"""
-        if event.src_path == str(self.metrics_path):
-            self.process_new_lines()
+            # Print if enabled and: not a _single metric AND N+ steps since last print
+            if self.print_interval > 0 and "_single" not in name:
+                last_step = self.last_printed_step.get(name, -self.print_interval)
+                if step - last_step >= self.print_interval:
+                    print(f"[{self.run_name}] Step {step}: {name} = {value:.4f}")
+                    self.last_printed_step[name] = step
 
+    def check_idle_timeout(self, timeout: float) -> bool:
+        """Close run if idle too long. Returns True if closed."""
+        if self.aim_run is None:
+            return False
 
-class RunTracker:
-    """Manages Aim Run and MetricsHandler for a single training run"""
-
-    def __init__(self, run_dir: Path, aim_repo: Path, observer: Observer):
-        self.run_dir = run_dir
-        self.run_name = run_dir.name
-        self.metrics_path = run_dir / "metrics.jsonl"
-        self.offset_path = run_dir / ".aim_offset"
-        self.hash_path = run_dir / ".aim_run_hash"
-
-        # Try to resume existing Aim run, or create new one
-        run_hash = None
-        if self.hash_path.exists():
-            run_hash = self.hash_path.read_text().strip()
-
-        self.aim_run = Run(
-            run_hash=run_hash,
-            repo=str(aim_repo),
-            experiment=self.run_name,
-        )
-
-        # Save hash for future resumption (if new run)
-        if run_hash is None:
-            self.hash_path.write_text(self.aim_run.hash)
-
-        # Create metrics handler
-        self.handler = MetricsHandler(
-            self.aim_run, self.metrics_path, self.offset_path, self.run_name
-        )
-
-        # Schedule with observer
-        observer.schedule(self.handler, str(run_dir), recursive=False)
-
-        # Process any existing metrics
-        self.handler.process_new_lines()
-
-        print(f">>> Tracking run: {self.run_name}")
-
-    def poll(self):
-        """Poll for new metrics (backup for missed fsevents)"""
-        self.handler.process_new_lines()
+        elapsed = time.time() - self.last_activity_time
+        if elapsed >= timeout:
+            self.close()
+            print(f">>> Closed idle run: {self.run_name} (inactive for {elapsed:.0f}s)")
+            return True
+        return False
 
     def close(self):
         """Close the Aim run"""
-        self.aim_run.close()
-
-
-class RunsDirectoryHandler(FileSystemEventHandler):
-    """Handler for detecting new run directories"""
-
-    def __init__(self, on_new_run: Callable[[Path], None]):
-        self.on_new_run = on_new_run
-
-    def on_created(self, event):
-        """Called when a new file/directory is created"""
-        if event.is_directory:
-            run_dir = Path(event.src_path)
-            # Small delay to let the directory be fully created
-            time.sleep(0.1)
-            if run_dir.is_dir():
-                self.on_new_run(run_dir)
+        if self.aim_run is not None:
+            self.aim_run.close()
+            self.aim_run = None
 
 
 def main():
@@ -190,6 +182,18 @@ def main():
         default=1.0,
         help="Polling interval in seconds (default: 1.0)",
     )
+    parser.add_argument(
+        "--print-interval",
+        type=int,
+        default=0,
+        help="Print metrics every N steps (default: 0 = no printing)",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=60.0,
+        help="Close idle runs after N seconds (default: 60.0, 0 = never)",
+    )
     args = parser.parse_args()
 
     runs_dir = args.runs_dir.resolve()
@@ -206,9 +210,6 @@ def main():
     # Dictionary of active run trackers
     trackers: dict[str, RunTracker] = {}
 
-    # Set up observer
-    observer = Observer()
-
     def register_run(run_dir: Path):
         """Register a new run for tracking"""
         run_name = run_dir.name
@@ -217,7 +218,7 @@ def main():
         if run_name.startswith("."):
             return  # Skip hidden directories
         try:
-            trackers[run_name] = RunTracker(run_dir, aim_repo, observer)
+            trackers[run_name] = RunTracker(run_dir, aim_repo, args.print_interval)
         except Exception as e:
             print(f"Warning: Could not track run {run_name}: {e}", file=sys.stderr)
 
@@ -229,34 +230,44 @@ def main():
     if not trackers:
         print("No existing runs found. Waiting for new runs...")
 
-    # Watch for new run directories
-    runs_handler = RunsDirectoryHandler(register_run)
-    observer.schedule(runs_handler, str(runs_dir), recursive=False)
-    observer.start()
-
     print(f"Watching for new runs... (Ctrl+C to stop)")
 
     # Handle graceful shutdown
+    shutdown_requested = False
+
     def signal_handler(sig, frame):
-        print("\nShutting down...")
-        observer.stop()
-        observer.join()
-        for tracker in trackers.values():
-            tracker.close()
-        print("Done.")
-        sys.exit(0)
+        nonlocal shutdown_requested
+        shutdown_requested = True
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Keep running and poll periodically
-    try:
-        while True:
-            time.sleep(args.poll_interval)
-            for tracker in list(trackers.values()):
-                tracker.poll()
-    except KeyboardInterrupt:
-        signal_handler(None, None)
+    # Main polling loop
+    while not shutdown_requested:
+        time.sleep(args.poll_interval)
+
+        # Scan for new run directories
+        try:
+            for subdir in runs_dir.iterdir():
+                if subdir.is_dir() and not subdir.name.startswith("."):
+                    register_run(subdir)
+        except OSError as e:
+            print(f"Warning: Could not scan runs directory: {e}", file=sys.stderr)
+
+        # Poll all trackers for new metrics
+        for tracker in trackers.values():
+            tracker.poll()
+
+        # Check for idle timeouts
+        if args.idle_timeout > 0:
+            for tracker in trackers.values():
+                tracker.check_idle_timeout(args.idle_timeout)
+
+    # Graceful shutdown
+    print("\nShutting down...")
+    for tracker in trackers.values():
+        tracker.close()
+    print("Done.")
 
 
 if __name__ == "__main__":

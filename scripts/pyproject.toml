@@ -5,5 +5,4 @@ description = "Aim watcher for burn-ppo training metrics"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "aim>=3.17",
-    "watchdog>=3.0",
 ]
