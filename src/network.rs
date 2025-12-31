@@ -98,7 +98,7 @@ impl<B: Backend> ActorCritic<B> {
 
         // Shared backbone with configured activation
         {
-            profile_scope!("backbone");
+            profile_scope!("async_backbone");
             for layer in &self.layers {
                 x = layer.forward(x);
                 x = if self.use_relu {
@@ -111,11 +111,11 @@ impl<B: Backend> ActorCritic<B> {
 
         // Separate heads
         let logits = {
-            profile_scope!("policy_head");
+            profile_scope!("async_policy_head");
             self.policy_head.forward(x.clone())
         };
         let value: Tensor<B, 1> = {
-            profile_scope!("value_head");
+            profile_scope!("async_value_head");
             self.value_head.forward(x).squeeze_dims(&[1])
         };
 

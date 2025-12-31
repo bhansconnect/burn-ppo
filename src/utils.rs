@@ -1,7 +1,7 @@
 use burn::prelude::*;
 use rand::Rng;
 
-use crate::profile::profile_function;
+use crate::profile::profile_scope;
 
 /// Sample actions from categorical distribution defined by logits
 ///
@@ -12,7 +12,7 @@ pub fn sample_categorical<B: Backend>(
     rng: &mut impl Rng,
     device: &B::Device,
 ) -> Tensor<B, 1, Int> {
-    profile_function!();
+    profile_scope!("async_sample_categorical");
     let [batch, num_actions] = logits.dims();
 
     // Generate Gumbel noise: -log(-log(U)) where U ~ Uniform(0,1)
@@ -39,7 +39,7 @@ pub fn log_prob_categorical<B: Backend>(
     logits: Tensor<B, 2>,
     actions: Tensor<B, 1, Int>,
 ) -> Tensor<B, 1> {
-    profile_function!();
+    profile_scope!("async_log_prob_categorical");
     let log_softmax = burn::tensor::activation::log_softmax(logits, 1);
     gather_1d(log_softmax, actions)
 }
@@ -48,7 +48,7 @@ pub fn log_prob_categorical<B: Backend>(
 ///
 /// H = -sum(p * log(p))
 pub fn entropy_categorical<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 1> {
-    profile_function!();
+    profile_scope!("async_entropy_categorical");
     let log_probs = burn::tensor::activation::log_softmax(logits.clone(), 1);
     let probs = burn::tensor::activation::softmax(logits, 1);
     // sum_dim(1) returns [batch, 1], squeeze dim 1 to get [batch]
@@ -73,7 +73,7 @@ fn gather_1d<B: Backend>(input: Tensor<B, 2>, indices: Tensor<B, 1, Int>) -> Ten
 
 /// Normalize advantages to zero mean and unit variance
 pub fn normalize_advantages<B: Backend>(advantages: Tensor<B, 1>) -> Tensor<B, 1> {
-    profile_function!();
+    profile_scope!("async_normalize_advantages");
     let mean = advantages.clone().mean();
     let std = advantages.clone().var(0).sqrt();
     (advantages - mean) / (std + 1e-8)
