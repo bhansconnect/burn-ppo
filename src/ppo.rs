@@ -15,6 +15,7 @@ use rand::Rng;
 use crate::config::Config;
 use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
+use crate::profile::{profile_function, profile_scope};
 use crate::utils::{entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical};
 
 /// Stores trajectory data from environment rollouts
@@ -84,6 +85,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     device: &B::Device,
     rng: &mut impl Rng,
 ) -> Vec<EpisodeStats> {
+    profile_function!();
     let num_envs = vec_env.num_envs();
     let obs_dim = vec_env.observation_dim();
     let mut all_completed = Vec::new();
@@ -97,6 +99,8 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     let mut all_log_probs: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
 
     for _step in 0..num_steps {
+        profile_scope!("rollout_step");
+
         // Get current observations and convert to tensor
         let obs_flat = vec_env.get_observations();
         let obs_tensor: Tensor<B, 2> =
@@ -141,18 +145,21 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     }
 
     // Batch transfer to GPU
-    buffer.observations =
-        Tensor::<B, 1>::from_floats(all_obs.as_slice(), device).reshape([num_steps, num_envs, obs_dim]);
-    buffer.actions =
-        Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device).reshape([num_steps, num_envs]);
-    buffer.rewards =
-        Tensor::<B, 1>::from_floats(all_rewards.as_slice(), device).reshape([num_steps, num_envs]);
-    buffer.dones =
-        Tensor::<B, 1>::from_floats(all_dones.as_slice(), device).reshape([num_steps, num_envs]);
-    buffer.values =
-        Tensor::<B, 1>::from_floats(all_values.as_slice(), device).reshape([num_steps, num_envs]);
-    buffer.log_probs =
-        Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device).reshape([num_steps, num_envs]);
+    {
+        profile_scope!("batch_gpu_transfer");
+        buffer.observations =
+            Tensor::<B, 1>::from_floats(all_obs.as_slice(), device).reshape([num_steps, num_envs, obs_dim]);
+        buffer.actions =
+            Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device).reshape([num_steps, num_envs]);
+        buffer.rewards =
+            Tensor::<B, 1>::from_floats(all_rewards.as_slice(), device).reshape([num_steps, num_envs]);
+        buffer.dones =
+            Tensor::<B, 1>::from_floats(all_dones.as_slice(), device).reshape([num_steps, num_envs]);
+        buffer.values =
+            Tensor::<B, 1>::from_floats(all_values.as_slice(), device).reshape([num_steps, num_envs]);
+        buffer.log_probs =
+            Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device).reshape([num_steps, num_envs]);
+    }
 
     all_completed
 }
@@ -168,6 +175,7 @@ pub fn compute_gae<B: Backend>(
     gae_lambda: f32,
     device: &B::Device,
 ) {
+    profile_function!();
     let [num_steps, num_envs] = buffer.rewards.dims();
 
     // Get tensor data for computation
@@ -264,6 +272,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     learning_rate: f64,
     rng: &mut impl Rng,
 ) -> (ActorCritic<B>, UpdateMetrics) {
+    profile_function!();
     let device = model.devices()[0].clone();
     let (obs, actions, old_log_probs, advantages, returns) = buffer.flatten();
     let batch_size = obs.dims()[0];
@@ -284,12 +293,15 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
 
     // Epoch loop
     for _epoch in 0..config.num_epochs {
+        profile_scope!("ppo_epoch");
+
         // Shuffle indices for minibatches
         let mut indices: Vec<usize> = (0..batch_size).collect();
         indices.shuffle(rng);
 
         // Minibatch loop
         for mb_start in (0..batch_size).step_by(minibatch_size) {
+            profile_scope!("ppo_minibatch");
             let mb_end = (mb_start + minibatch_size).min(batch_size);
             let mb_indices: Vec<i64> = indices[mb_start..mb_end].iter().map(|&i| i as i64).collect();
             let mb_indices_tensor: Tensor<B, 1, Int> = Tensor::from_ints(mb_indices.as_slice(), &device);

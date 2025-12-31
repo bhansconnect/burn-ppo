@@ -2,6 +2,7 @@ use burn::nn::Initializer;
 use burn::prelude::*;
 
 use crate::config::Config;
+use crate::profile::profile_function;
 
 /// Create a Linear layer with orthogonal weight initialization and zero biases
 ///
@@ -89,6 +90,7 @@ impl<B: Backend> ActorCritic<B> {
     /// Input: observations [batch, obs_dim]
     /// Output: (logits [batch, action_count], values [batch])
     pub fn forward(&self, obs: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 1>) {
+        profile_function!();
         let mut x = obs;
 
         // Shared backbone with configured activation

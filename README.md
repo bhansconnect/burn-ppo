@@ -27,6 +27,23 @@ cargo run --release -- --config configs/default.toml --seed 123
 cargo run --release -- --learning-rate 0.0003 --num-envs 64
 ```
 
+## GPU Backends
+
+By default, burn-ppo uses WGPU which auto-detects Metal (macOS), Vulkan (Linux/Windows), or DirectX. Alternative backends are available via feature flags:
+
+```bash
+# Default: WGPU (Metal/Vulkan/DirectX auto-detection)
+cargo build --release
+
+# CUDA backend (requires CUDA toolkit)
+cargo build --release --features cuda
+
+# LibTorch backend (requires libtorch)
+cargo build --release --features libtorch
+```
+
+Backend priority: `cuda` > `libtorch` > `wgpu` (default).
+
 ## Configuration
 
 Default configuration in `configs/default.toml`:
@@ -60,6 +77,26 @@ uv run aim_watcher.py ../runs/<run_name>  # Stream metrics
 ```
 
 The watcher tracks file offsets, so you can restart it without duplicate logs.
+
+## Profiling with Tracy
+
+For detailed performance analysis, build with Tracy instrumentation:
+
+```bash
+# Build with Tracy profiling
+cargo build --release --features tracy
+
+# Run your training - Tracy will auto-connect
+cargo run --release --features tracy -- --config configs/cartpole.toml
+```
+
+Then use the [Tracy profiler GUI](https://github.com/wolfpld/tracy/releases) to connect and analyze:
+- Frame timing for each training update
+- Function-level timing for rollouts, GAE, PPO updates
+- GPU/CPU data transfer costs
+- Neural network forward/backward pass breakdown
+
+Note: Building with Tracy requires a C++ compiler (Xcode Command Line Tools on macOS).
 
 ## Project Structure
 

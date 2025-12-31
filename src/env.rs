@@ -1,5 +1,9 @@
 /// Environment trait and VecEnv parallel wrapper
 
+use rayon::prelude::*;
+
+use crate::profile::{profile_function, profile_scope};
+
 /// Minimal environment interface - just what PPO needs
 pub trait Environment: Send + Sync + 'static {
     /// Reset environment and return initial observation
@@ -84,36 +88,57 @@ impl<E: Environment> VecEnv<E> {
     /// - dones: [num_envs]
     /// - completed_episodes: stats for any episodes that finished this step
     pub fn step(&mut self, actions: &[usize]) -> (Vec<f32>, Vec<f32>, Vec<bool>, Vec<EpisodeStats>) {
+        profile_function!();
         assert_eq!(actions.len(), self.envs.len());
 
+        // Parallel step all environments
+        let results: Vec<_> = {
+            profile_scope!("parallel_env_step");
+
+            self.envs
+                .par_iter_mut()
+                .zip(actions.par_iter())
+                .zip(self.episode_rewards.par_iter_mut())
+                .zip(self.episode_lengths.par_iter_mut())
+                .zip(self.observations.par_iter_mut())
+                .map(|((((env, &action), reward), length), obs)| {
+                    #[cfg(feature = "tracy")]
+                    let _span = tracy_client::span!("env_step");
+
+                    let (new_obs, r, done) = env.step(action);
+                    *reward += r;
+                    *length += 1;
+
+                    let completed = if done {
+                        let stats = EpisodeStats {
+                            total_reward: *reward,
+                            length: *length,
+                        };
+                        *obs = env.reset();
+                        *reward = 0.0;
+                        *length = 0;
+                        Some(stats)
+                    } else {
+                        *obs = new_obs;
+                        None
+                    };
+
+                    (r, done, completed)
+                })
+                .collect()
+        };
+
+        // Collect results (sequential, fast)
         let mut rewards = Vec::with_capacity(self.envs.len());
         let mut dones = Vec::with_capacity(self.envs.len());
         let mut completed_episodes = Vec::new();
 
-        for (i, (env, &action)) in self.envs.iter_mut().zip(actions.iter()).enumerate() {
-            let (obs, reward, done) = env.step(action);
-
-            // Track episode stats
-            self.episode_rewards[i] += reward;
-            self.episode_lengths[i] += 1;
-
-            if done {
-                // Record completed episode
-                completed_episodes.push(EpisodeStats {
-                    total_reward: self.episode_rewards[i],
-                    length: self.episode_lengths[i],
-                });
-
-                // Auto-reset and store new initial observation
-                self.observations[i] = env.reset();
-                self.episode_rewards[i] = 0.0;
-                self.episode_lengths[i] = 0;
-            } else {
-                self.observations[i] = obs;
-            }
-
-            rewards.push(reward);
+        for (r, done, completed) in results {
+            rewards.push(r);
             dones.push(done);
+            if let Some(stats) = completed {
+                completed_episodes.push(stats);
+            }
         }
 
         let flat_obs = self.get_observations();

@@ -8,6 +8,7 @@ mod envs;
 mod metrics;
 mod network;
 mod ppo;
+mod profile;
 mod progress;
 mod utils;
 
@@ -22,7 +23,7 @@ use burn::prelude::*;
 use clap::Parser;
 use rand::SeedableRng;
 
-use crate::backend::{init_device, backend_name, TrainingBackend};
+use crate::backend::{init_device, backend_name, device_name, TrainingBackend};
 use crate::checkpoint::{CheckpointManager, CheckpointMetadata, load_optimizer, save_optimizer};
 use crate::config::{CliArgs, Config};
 use crate::env::VecEnv;
@@ -115,6 +116,16 @@ enum TrainingMode {
 }
 
 fn main() -> Result<()> {
+    // Initialize rayon thread pool with named threads for Tracy
+    rayon::ThreadPoolBuilder::new()
+        .thread_name(|idx| format!("Rayon-{}", idx))
+        .build_global()
+        .expect("Failed to initialize rayon thread pool");
+
+    // Name the main thread for Tracy
+    #[cfg(feature = "tracy")]
+    tracy_client::set_thread_name!("Main");
+
     let args = CliArgs::parse();
 
     // Determine training mode
@@ -228,7 +239,7 @@ fn main() -> Result<()> {
 
     // Initialize device
     let device = init_device();
-    println!("Backend: {}", backend_name());
+    println!("Backend: {} ({})", backend_name(), device_name(&device));
 
     // Create or validate run directory
     match &mode {
@@ -373,6 +384,8 @@ fn main() -> Result<()> {
 
     // Training loop
     for update in 0..num_updates {
+        profile::profile_scope!("training_update");
+
         if !running.load(Ordering::SeqCst) {
             println!("\nInterrupted by user");
             break;
@@ -561,6 +574,8 @@ fn main() -> Result<()> {
             last_checkpoint_step = global_step;
             episodes_since_checkpoint.clear();
         }
+
+        profile::profile_frame!();
     }
 
     progress.finish();

@@ -6,6 +6,7 @@
 use rand::Rng;
 
 use crate::env::Environment;
+use crate::profile::profile_function;
 
 const COLS: usize = 7;
 const ROWS: usize = 6;
@@ -175,6 +176,7 @@ impl ConnectFour {
 
 impl Environment for ConnectFour {
     fn reset(&mut self) -> Vec<f32> {
+        profile_function!();
         self.board = [[Cell::Empty; COLS]; ROWS];
         self.current_player = Cell::Player1;
         self.game_over = false;
@@ -183,6 +185,7 @@ impl Environment for ConnectFour {
     }
 
     fn step(&mut self, action: usize) -> (Vec<f32>, f32, bool) {
+        profile_function!();
         // Invalid action (column full or out of bounds)
         if action >= COLS || self.board[0][action] != Cell::Empty || self.game_over {
             // Penalize invalid moves heavily

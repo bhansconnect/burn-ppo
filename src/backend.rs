@@ -21,6 +21,11 @@ pub fn backend_name() -> &'static str {
     "CUDA"
 }
 
+#[cfg(feature = "cuda")]
+pub fn device_name(device: &<TrainingBackend as burn::tensor::backend::Backend>::Device) -> String {
+    format!("{:?}", device)
+}
+
 // LibTorch backend (second priority)
 #[cfg(all(feature = "libtorch", not(feature = "cuda")))]
 pub type TrainingBackend = Autodiff<burn::backend::LibTorch>;
@@ -35,6 +40,11 @@ pub fn backend_name() -> &'static str {
     "LibTorch"
 }
 
+#[cfg(all(feature = "libtorch", not(feature = "cuda")))]
+pub fn device_name(device: &<TrainingBackend as burn::tensor::backend::Backend>::Device) -> String {
+    format!("{:?}", device)
+}
+
 // WGPU backend (default)
 #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "libtorch")))]
 pub type TrainingBackend = Autodiff<burn::backend::wgpu::Wgpu>;
@@ -47,4 +57,12 @@ pub fn init_device() -> <TrainingBackend as burn::tensor::backend::Backend>::Dev
 #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "libtorch")))]
 pub fn backend_name() -> &'static str {
     "WGPU"
+}
+
+#[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "libtorch")))]
+pub fn device_name(device: &<TrainingBackend as burn::tensor::backend::Backend>::Device) -> String {
+    use burn::backend::wgpu::graphics::AutoGraphicsApi;
+    let setup = burn::backend::wgpu::init_setup::<AutoGraphicsApi>(device, Default::default());
+    let info = setup.adapter.get_info();
+    format!("{} via {:?}", info.name, info.backend)
 }

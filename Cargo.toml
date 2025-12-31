@@ -8,6 +8,7 @@ default = ["wgpu"]
 cuda = ["burn/cuda"]
 libtorch = ["burn/tch"]
 wgpu = ["burn/wgpu"]
+tracy = ["tracy-client"]
 
 [dependencies]
 # ML framework - base features, backend selected via features above
@@ -27,6 +28,12 @@ rand = "0.8"
 num_cpus = "1.16"
 anyhow = "1"
 ctrlc = "3"
+
+# Parallelization
+rayon = "1.10"
+
+# Profiling (Tracy integration, only our code - not dependencies)
+tracy-client = { version = "0.18", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

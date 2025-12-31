@@ -6,6 +6,7 @@
 use rand::Rng;
 
 use crate::env::Environment;
+use crate::profile::profile_function;
 
 /// CartPole physics constants (matching OpenAI Gym)
 const GRAVITY: f32 = 9.8;
@@ -90,6 +91,7 @@ impl CartPole {
 
 impl Environment for CartPole {
     fn reset(&mut self) -> Vec<f32> {
+        profile_function!();
         // Random initial state in [-0.05, 0.05]
         self.x = self.rng.gen_range(-0.05..0.05);
         self.x_dot = self.rng.gen_range(-0.05..0.05);
@@ -100,6 +102,7 @@ impl Environment for CartPole {
     }
 
     fn step(&mut self, action: usize) -> (Vec<f32>, f32, bool) {
+        profile_function!();
         // Action: 0 = push left, 1 = push right
         let force = if action == 0 { -FORCE_MAG } else { FORCE_MAG };
 
