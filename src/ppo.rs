@@ -15,7 +15,7 @@ use rand::Rng;
 use crate::config::Config;
 use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
-use crate::profile::{profile_function, profile_scope};
+use crate::profile::{gpu_sync, profile_function, profile_scope};
 use crate::utils::{entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical};
 
 /// Stores trajectory data from environment rollouts
@@ -101,38 +101,44 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     for _step in 0..num_steps {
         profile_scope!("rollout_step");
 
-        // Get current observations and convert to tensor
+        // Get current observations
         let obs_flat = vec_env.get_observations();
-        let obs_tensor: Tensor<B, 2> =
-            Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device).reshape([num_envs, obs_dim]);
 
-        // Forward pass to get logits and values
-        let (logits, values) = model.forward(obs_tensor);
+        // Model inference: forward pass, sample actions, compute log probs, sync to CPU
+        // All GPU ops batched together - timing includes actual compute (sync at end)
+        let (actions_data, values_data, log_probs_data) = {
+            profile_scope!("model_inference");
 
-        // Sample actions from categorical distribution
-        let actions = sample_categorical(logits.clone(), rng, device);
+            let obs_tensor: Tensor<B, 2> =
+                Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device).reshape([num_envs, obs_dim]);
+            let (logits, values) = model.forward(obs_tensor);
+            let actions = sample_categorical(logits.clone(), rng, device);
+            let log_probs = log_prob_categorical(logits, actions.clone());
 
-        // Compute log probs of sampled actions
-        let log_probs = log_prob_categorical(logits, actions.clone());
-
-        // Convert to CPU data
-        // Note: Convert Int tensor through float to avoid WGPU backend type mismatch
-        let actions_data: Vec<i64> = actions
-            .float()
-            .into_data()
-            .to_vec::<f32>()
-            .expect("actions to vec")
-            .into_iter()
-            .map(|x| x as i64)
-            .collect();
-        let values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
-        let log_probs_data: Vec<f32> = log_probs.into_data().to_vec().expect("log_probs to vec");
+            // Sync to CPU - this is where actual GPU compute happens
+            // Note: Convert Int tensor through float to avoid WGPU backend type mismatch
+            let actions_data: Vec<i64> = actions
+                .float()
+                .into_data()
+                .to_vec::<f32>()
+                .expect("actions to vec")
+                .into_iter()
+                .map(|x| x as i64)
+                .collect();
+            let values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+            let log_probs_data: Vec<f32> = log_probs.into_data().to_vec().expect("log_probs to vec");
+            (actions_data, values_data, log_probs_data)
+        };
 
         // Convert actions to Vec<usize> for environment
         let actions_usize: Vec<usize> = actions_data.iter().map(|&a| a as usize).collect();
 
-        // Step environment
-        let (_next_obs, rewards, dones, completed) = vec_env.step(&actions_usize);
+        // Step environment (CPU-bound)
+        let (rewards, dones, completed) = {
+            profile_scope!("env_step_cpu");
+            let (_next_obs, rewards, dones, completed) = vec_env.step(&actions_usize);
+            (rewards, dones, completed)
+        };
         all_completed.extend(completed);
 
         // Append to CPU buffers
@@ -316,77 +322,118 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
 
-            // Forward pass
-            let (logits, values) = model.forward(mb_obs);
-            let new_log_probs = log_prob_categorical(logits.clone(), mb_actions);
-            let entropy = entropy_categorical(logits);
-
-            // Policy loss (clipped surrogate objective)
-            let log_ratio = new_log_probs.clone() - mb_old_log_probs;
-            let ratio = log_ratio.clone().exp();
-
-            let policy_loss_1 = -mb_advantages.clone() * ratio.clone();
-            let policy_loss_2 = -mb_advantages.clone()
-                * ratio.clone().clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
-            let policy_loss: Tensor<B, 1> = policy_loss_1.clone().max_pair(policy_loss_2);
-            let policy_loss_mean = policy_loss.mean();
-
-            // Value loss (optionally clipped)
-            let value_loss = if config.clip_value {
-                let mb_old_values = buffer.values.clone().flatten(0, 1).select(
-                    0,
-                    Tensor::from_ints(
-                        indices[mb_start..mb_end].iter().map(|&i| i as i64).collect::<Vec<_>>().as_slice(),
-                        &device,
-                    ),
-                );
-                let values_clipped = mb_old_values.clone()
-                    + (values.clone() - mb_old_values.clone())
-                        .clamp(-config.clip_epsilon, config.clip_epsilon);
-                let value_loss_1 = (values.clone() - mb_returns.clone()).powf_scalar(2.0);
-                let value_loss_2 = (values_clipped - mb_returns.clone()).powf_scalar(2.0);
-                value_loss_1.max_pair(value_loss_2).mean() * 0.5
-            } else {
-                (values.clone() - mb_returns.clone()).powf_scalar(2.0).mean() * 0.5
+            // Forward pass with GPU sync for accurate timing
+            let (logits, values) = {
+                profile_scope!("minibatch_forward");
+                let result = model.forward(mb_obs);
+                gpu_sync!(result.0); // Force sync to get accurate forward timing
+                result
             };
 
-            // Entropy bonus
-            let entropy_loss = -entropy.clone().mean() * config.entropy_coef;
+            // Compute losses and backward pass (combined for accurate timing)
+            let (grads, loss, policy_loss_mean, value_loss, entropy, approx_kl, clip_fraction, values_mean, returns_mean) = {
+                profile_scope!("loss_and_backward");
 
-            // Combined loss
-            let loss = policy_loss_mean.clone() + value_loss.clone() * config.value_coef + entropy_loss;
+                let new_log_probs = log_prob_categorical(logits.clone(), mb_actions);
+                let entropy = entropy_categorical(logits);
 
-            // Compute approximate KL divergence for logging
-            // KL ≈ (ratio - 1) - log(ratio) is the unbiased low-variance estimator
-            // from "Approximating KL Divergence" (Schulman)
-            let approx_kl = ((ratio.clone() - 1.0) - log_ratio.clone()).mean();
+                // Policy loss (clipped surrogate objective)
+                let log_ratio = new_log_probs.clone() - mb_old_log_probs;
+                let ratio = log_ratio.clone().exp();
 
-            // Compute clip fraction for logging
-            let clip_fraction = (ratio.clone() - 1.0)
-                .abs()
-                .greater_elem(config.clip_epsilon)
-                .float()
-                .mean();
+                let policy_loss_1 = -mb_advantages.clone() * ratio.clone();
+                let policy_loss_2 = -mb_advantages.clone()
+                    * ratio.clone().clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
+                let policy_loss: Tensor<B, 1> = policy_loss_1.clone().max_pair(policy_loss_2);
+                let policy_loss_mean = policy_loss.mean();
 
-            // Accumulate metrics (negate policy_loss for display - actual loss is negative)
-            total_policy_loss += -policy_loss_mean.clone().into_scalar().elem::<f32>();
-            total_value_loss += value_loss.clone().into_scalar().elem::<f32>();
-            total_entropy += entropy.mean().into_scalar().elem::<f32>();
-            total_approx_kl += approx_kl.clone().into_scalar().elem::<f32>();
-            total_clip_fraction += clip_fraction.clone().into_scalar().elem::<f32>();
-            total_loss_sum += loss.clone().into_scalar().elem::<f32>();
-            total_value_mean += values.mean().into_scalar().elem::<f32>();
-            total_returns_mean += mb_returns.mean().into_scalar().elem::<f32>();
-            num_updates += 1;
+                // Value loss (optionally clipped)
+                let value_loss = if config.clip_value {
+                    let mb_old_values = buffer.values.clone().flatten(0, 1).select(
+                        0,
+                        Tensor::from_ints(
+                            indices[mb_start..mb_end].iter().map(|&i| i as i64).collect::<Vec<_>>().as_slice(),
+                            &device,
+                        ),
+                    );
+                    let values_clipped = mb_old_values.clone()
+                        + (values.clone() - mb_old_values.clone())
+                            .clamp(-config.clip_epsilon, config.clip_epsilon);
+                    let value_loss_1 = (values.clone() - mb_returns.clone()).powf_scalar(2.0);
+                    let value_loss_2 = (values_clipped - mb_returns.clone()).powf_scalar(2.0);
+                    value_loss_1.max_pair(value_loss_2).mean() * 0.5
+                } else {
+                    (values.clone() - mb_returns.clone()).powf_scalar(2.0).mean() * 0.5
+                };
 
-            // Backward pass and optimization
-            let grads = loss.backward();
-            let grads = GradientsParams::from_grads(grads, &model);
+                // Entropy bonus
+                let entropy_loss = -entropy.clone().mean() * config.entropy_coef;
 
-            // Gradient clipping by global L2 norm
-            // Note: Burn's optimizers handle this internally with proper config
+                // Combined loss
+                let loss = policy_loss_mean.clone() + value_loss.clone() * config.value_coef + entropy_loss;
 
-            model = optimizer.step(learning_rate.into(), model, grads);
+                // Compute approximate KL divergence for logging
+                // KL ≈ (ratio - 1) - log(ratio) is the unbiased low-variance estimator
+                // from "Approximating KL Divergence" (Schulman)
+                let approx_kl = ((ratio.clone() - 1.0) - log_ratio.clone()).mean();
+
+                // Compute clip fraction for logging
+                let clip_fraction = (ratio.clone() - 1.0)
+                    .abs()
+                    .greater_elem(config.clip_epsilon)
+                    .float()
+                    .mean();
+
+                let values_mean = values.mean();
+                let returns_mean = mb_returns.mean();
+
+                // Backward pass
+                let grads = loss.backward();
+
+                (grads, loss, policy_loss_mean, value_loss, entropy, approx_kl, clip_fraction, values_mean, returns_mean)
+            };
+
+            // Optimizer step with GPU sync for accurate timing
+            model = {
+                profile_scope!("optimizer_step");
+                let grads = GradientsParams::from_grads(grads, &model);
+                let updated = optimizer.step(learning_rate.into(), model, grads);
+                gpu_sync!(updated.layers[0].weight.val()); // Force sync after weight update
+                updated
+            };
+
+            // Batched metric extraction - single GPU sync instead of 8
+            {
+                profile_scope!("extract_metrics");
+
+                // Concatenate all scalar metrics into one tensor for single GPU->CPU transfer
+                // Use reshape to convert 0-dim scalars to 1-dim, then cat along dim 0
+                let metrics_tensor: Tensor<B, 1> = Tensor::cat(
+                    vec![
+                        (-policy_loss_mean).reshape([1]),  // Negate for display
+                        value_loss.reshape([1]),
+                        entropy.mean().reshape([1]),
+                        approx_kl.reshape([1]),
+                        clip_fraction.reshape([1]),
+                        loss.reshape([1]),
+                        values_mean.reshape([1]),
+                        returns_mean.reshape([1]),
+                    ],
+                    0,
+                );
+
+                let metrics_data: Vec<f32> = metrics_tensor.into_data().to_vec().expect("metrics");
+
+                total_policy_loss += metrics_data[0];
+                total_value_loss += metrics_data[1];
+                total_entropy += metrics_data[2];
+                total_approx_kl += metrics_data[3];
+                total_clip_fraction += metrics_data[4];
+                total_loss_sum += metrics_data[5];
+                total_value_mean += metrics_data[6];
+                total_returns_mean += metrics_data[7];
+                num_updates += 1;
+            }
         }
     }
 

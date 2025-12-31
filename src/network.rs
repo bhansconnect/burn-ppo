@@ -2,7 +2,7 @@ use burn::nn::Initializer;
 use burn::prelude::*;
 
 use crate::config::Config;
-use crate::profile::profile_function;
+use crate::profile::{profile_function, profile_scope};
 
 /// Create a Linear layer with orthogonal weight initialization and zero biases
 ///
@@ -37,9 +37,12 @@ fn create_linear_orthogonal<B: Backend>(
 /// Actor-Critic network with shared backbone and separate heads
 #[derive(Module, Debug)]
 pub struct ActorCritic<B: Backend> {
-    layers: Vec<nn::Linear<B>>,
-    policy_head: nn::Linear<B>,
-    value_head: nn::Linear<B>,
+    /// Hidden layers (shared backbone)
+    pub layers: Vec<nn::Linear<B>>,
+    /// Policy output head
+    pub policy_head: nn::Linear<B>,
+    /// Value output head
+    pub value_head: nn::Linear<B>,
     /// Use ReLU activation (true) or tanh (false)
     #[module(skip)]
     use_relu: bool,
@@ -94,19 +97,27 @@ impl<B: Backend> ActorCritic<B> {
         let mut x = obs;
 
         // Shared backbone with configured activation
-        for layer in &self.layers {
-            x = layer.forward(x);
-            x = if self.use_relu {
-                burn::tensor::activation::relu(x)
-            } else {
-                x.tanh()
-            };
+        {
+            profile_scope!("backbone");
+            for layer in &self.layers {
+                x = layer.forward(x);
+                x = if self.use_relu {
+                    burn::tensor::activation::relu(x)
+                } else {
+                    x.tanh()
+                };
+            }
         }
 
         // Separate heads
-        let logits = self.policy_head.forward(x.clone());
-        // Value head output is [batch, 1], squeeze dim 1 to get [batch]
-        let value: Tensor<B, 1> = self.value_head.forward(x).squeeze_dims(&[1]);
+        let logits = {
+            profile_scope!("policy_head");
+            self.policy_head.forward(x.clone())
+        };
+        let value: Tensor<B, 1> = {
+            profile_scope!("value_head");
+            self.value_head.forward(x).squeeze_dims(&[1])
+        };
 
         (logits, value)
     }
