@@ -1,5 +1,27 @@
 # DESIGN.md - PPO Implementation in Rust with Burn ML
 
+## Reference Implementation
+
+This implementation follows the **13 core implementation details** from the ICLR Blog Track post:
+**[The 37 Implementation Details of Proximal Policy Optimization](https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/)**
+
+These details are critical for matching reference PPO performance:
+1. Vectorized architecture (N envs × M steps)
+2. **Orthogonal weight initialization** (gain √2 for hidden, 0.01 for policy, 1.0 for value)
+3. Adam epsilon = 1e-5 (not default 1e-8)
+4. Learning rate annealing (linear decay)
+5. Generalized Advantage Estimation (GAE)
+6. Mini-batch updates (shuffle and split)
+7. Advantage normalization (per-minibatch, not full batch)
+8. Clipped surrogate objective
+9. Value function loss clipping (optional, may hurt performance)
+10. Overall loss = policy_loss - entropy × coef + value_loss × coef
+11. Global gradient clipping (L2 norm ≤ 0.5)
+12. Debug variables (policy_loss, value_loss, entropy, clipfrac, approx_kl)
+13. Shared network with separate heads (2×64 hidden layers)
+
+---
+
 ## Philosophy
 
 This implementation follows the "software you can love" / Handmade community philosophy:
