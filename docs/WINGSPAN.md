@@ -589,3 +589,116 @@ All reward comes from turn-by-turn deltas for better credit assignment.
 - Cached food (1 VP each, some birds)
 - End-of-round goal points
 - Bonus card points
+
+---
+
+## Appendix: Insights from Settlers of Catan RL
+
+> **Source**: [Learning to Play Settlers of Catan with Deep RL](https://settlers-rl.github.io/)
+>
+> These are additional architectural ideas drawn from a similar board game RL project. The Settlers implementation faced comparable challenges: complex action spaces, multi-player dynamics, and long-horizon planning.
+
+### Multi-Head Action Architecture
+
+Settlers' most important insight: **decompose complex actions into specialized heads**.
+
+The Settlers implementation uses **13 specialized action heads** for different action types (placement, trading, development cards, robber movement, etc.). Each head has its own masking logic.
+
+**Relevance to Wingspan**: The hybrid action space design in this document aligns with this approach. A potential extension:
+
+| Head | Actions | Masking |
+|------|---------|---------|
+| Action Type | PLAY_BIRD, ACTIVATE_*, END_ROUND | Always valid subset |
+| Habitat | Forest, Grassland, Wetland | Bird's valid habitats |
+| Card Selection | Hand indices 0..15 | Cards actually in hand |
+| Food Payment | Combinations | Affordable combos only |
+| Egg Distribution | Bird indices | Birds with capacity |
+
+This decomposition prevents the combinatorial explosion of a flat action space while maintaining expressiveness.
+
+### Observation Encoding with Attention
+
+Settlers uses:
+- **Multi-head attention** for processing 19 board tiles
+- **Embedding → Attention → Pooling** for variable-length development card sequences
+- **Layer normalization** after attention and FC layers
+
+**Relevance to Wingspan**: Critical for handling variable structures:
+
+| Component | Encoding Strategy |
+|-----------|-------------------|
+| Hand cards (0-16) | Card embedding → Self-attention → Pool |
+| Birds on mat (variable per habitat) | Per-habitat attention blocks |
+| Tray cards (3 visible) | Fixed-size embedding |
+| Opponent public info | Separate FC module |
+
+This is more expressive than fixed-size encoding and handles the variable hand/board sizes naturally.
+
+### Historical Opponent Sampling
+
+Settlers addresses multi-agent non-stationarity by sampling opponents from earlier policy checkpoints:
+
+> "Only one of the four players would be actively controlled by the policy being trained, whilst the other three would be controlled by earlier versions chosen at random."
+
+**Relevance to Wingspan**: When moving to self-play (Phase 4+), maintain a checkpoint pool:
+
+```
+runs/<run>/checkpoints/
+  opponent_pool/  ← Symlinks to ~10-20 diverse checkpoints
+```
+
+Sample opponents uniformly from the pool during training. This prevents overfitting to the current policy and improves robustness.
+
+### Action Masking Validation
+
+The Settlers paper confirms action masking is essential: they add negative infinity to logits before softmax for invalid actions. This matches the design already in this document.
+
+**Key lesson from Settlers**: They regret not masking invalid trades as unavailable actions, leading to wasted computation proposing impossible trades. For Wingspan, ensure all sub-decisions (food payment, egg distribution) are properly masked.
+
+### What Doesn't Apply
+
+| Settlers Approach | Applies to Wingspan? | Rationale |
+|-------------------|---------------------|-----------|
+| MAPPO / Global Critic | No | Useful for cooperative games; Wingspan is competitive |
+| Value function normalization (fixed mean/std) | No | Standard advantage normalization is sufficient |
+| Recurrent trading heads | No | Wingspan trading is simpler (no negotiation) |
+| Semi-async distributed PPO | No | Vectorized sync PPO is simpler and sufficient |
+| Forward search (MCTS) | Maybe later | Nice-to-have for stronger play, not essential initially |
+
+### Network Architecture Sketch
+
+Based on Settlers' approach, a Wingspan-specific architecture could look like:
+
+```
+Observation Inputs:
+  ├─ Hand Cards ──────┬─ Card Embedding ─┬─ Self-Attention ─┬─ Pool ─┐
+  ├─ Board Birds ─────┤                  │                  │        │
+  ├─ Food/Eggs ───────┴─ MLP ────────────┴──────────────────┴─ Concat ─► Backbone
+  ├─ Tray Cards ───────────────────────────────────────────────────────┘
+  ├─ Round Goals ─────┐
+  └─ Opponent Info ───┘
+
+Backbone (shared) → [Action Type Head]   → Softmax × Mask
+                 ├─ [Habitat Head]       → Softmax × Mask
+                 ├─ [Card Selection]     → Softmax × Mask
+                 ├─ [Food Payment]       → Multi-head × Mask
+                 └─ [Egg Distribution]   → Iterative assignment
+
+Value Head → [batch, 1] (single-player framing)
+```
+
+This modular design allows:
+1. Attention-based encoding for variable structures
+2. Per-head action masking
+3. Extensibility for power choices (additional heads)
+
+### Summary Table
+
+| Settlers Learning | Priority for Wingspan | Notes |
+|-------------------|----------------------|-------|
+| Multi-head action architecture | High | Essential for action space complexity |
+| Action masking | Done | Already in design |
+| Attention for variable structures | High | Cards, birds on mat |
+| Historical opponent sampling | Medium | For Phase 4+ self-play |
+| Dense reward shaping | Medium | Score delta approach already planned |
+| MAPPO / Global critic | Skip | Not needed for competitive games |
