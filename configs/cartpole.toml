@@ -1,32 +1,39 @@
-# Default PPO configuration for CartPole
+# PPO configuration for CartPole
 # Optimized based on ablation experiments (see docs/DESIGN.md)
 
 # Environment
 env = "cartpole"
-num_envs = 4         # 4 is standard for CartPole; use "auto" for larger envs
-num_steps = 128      # Steps per rollout
+num_envs = "auto"    # Scales to CPU cores. Higher = smoother gradients, more memory.
+num_steps = 128      # Steps per rollout. 64-256 typical.
 
 # PPO hyperparameters
 learning_rate = 0.001    # 4x higher than ICLR default (2.5e-4) - critical for fast learning
-lr_anneal = false        # Set true for longer runs
-gamma = 0.99
-gae_lambda = 0.95
-clip_epsilon = 0.2
-clip_value = true        # Value clipping has minimal effect (~1%)
-entropy_coef = 0.01
-value_coef = 0.5
-max_grad_norm = 0.5
+                         # Range: 1e-4 to 3e-3
+lr_anneal = false        # Linear decay to 0. Enable for longer runs (>500k steps)
+gamma = 0.99             # Discount factor. 0.99 standard. Lower (0.95-0.98) for shorter horizons.
+gae_lambda = 0.95        # GAE smoothing. 0.95 standard. Lower = more bias, less variance.
+clip_epsilon = 0.2       # PPO clip range. 0.1-0.3 typical. Lower = more conservative updates.
+clip_value = true        # Value function clipping. May help or hurt.
+entropy_coef = 0.01      # Entropy bonus for exploration. Range: 0.001 to 0.1.
+entropy_anneal = false   # Decay entropy coef over training. Enable with higher initial (0.05).
+value_coef = 0.5         # Value loss weight. 0.5 standard.
+max_grad_norm = 0.5      # Gradient clipping. Prevents exploding gradients.
+target_kl = 0.02         # KL early stopping threshold. Stops epoch if exceeded.
+                         # Range: 0.01-0.05. Prevents destructive policy updates.
+                         # Improves training stability.
+normalize_obs = true     # Normalize observations using running mean/std.
+                         # Improves convergence speed and stability.
 
 # Training
-total_timesteps = 200_000    # Sufficient for CartPole with optimal settings
-num_epochs = 4
-num_minibatches = 4
-adam_epsilon = 1e-5      # Not default 1e-8!
+total_timesteps = 200_000    # Sufficient for CartPole. Connect Four needs 2-5M.
+num_epochs = 4               # Update epochs per rollout. 3-10 typical.
+num_minibatches = 4          # Minibatches per epoch. batch_size = num_envs * num_steps / num_minibatches
+adam_epsilon = 1e-5          # NOT default 1e-8! ICLR recommends 1e-5 for PPO stability.
 
 # Network
-hidden_size = 64
-num_hidden = 2
-activation = "relu"      # ReLU significantly outperforms tanh for CartPole
+hidden_size = 64         # Neurons per hidden layer. CartPole: 64, Connect Four: 128-256.
+num_hidden = 2           # Hidden layers. 2-4 typical. Deeper needs more data.
+activation = "relu"      # "relu" or "tanh". ReLU significantly outperforms tanh for CartPole.
 
 # Checkpointing
 run_dir = "runs"

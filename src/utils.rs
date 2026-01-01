@@ -47,10 +47,12 @@ pub fn log_prob_categorical<B: Backend>(
 /// Compute entropy of categorical distribution from logits
 ///
 /// H = -sum(p * log(p))
+///
+/// Optimization: derive probs from log_probs instead of computing softmax separately
 pub fn entropy_categorical<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 1> {
     profile_scope!("async_entropy_categorical");
-    let log_probs = burn::tensor::activation::log_softmax(logits.clone(), 1);
-    let probs = burn::tensor::activation::softmax(logits, 1);
+    let log_probs = burn::tensor::activation::log_softmax(logits, 1);
+    let probs = log_probs.clone().exp(); // Derive probs from log_probs (avoids redundant softmax)
     // sum_dim(1) returns [batch, 1], squeeze dim 1 to get [batch]
     -(probs * log_probs).sum_dim(1).squeeze_dims(&[1])
 }

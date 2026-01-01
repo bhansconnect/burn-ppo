@@ -92,10 +92,23 @@ pub struct Config {
     pub clip_value: bool,
     #[serde(default = "default_entropy_coef")]
     pub entropy_coef: f64,
+    /// Whether to anneal entropy coefficient over training
+    /// When true, decays from entropy_coef to 10% of initial value
+    #[serde(default)]
+    pub entropy_anneal: bool,
     #[serde(default = "default_value_coef")]
     pub value_coef: f64,
     #[serde(default = "default_max_grad_norm")]
     pub max_grad_norm: f64,
+    /// KL divergence threshold for early stopping (None = disabled)
+    /// If approx_kl exceeds this during an epoch, stop the epoch early.
+    /// Typical values: 0.01-0.03, recommended 0.015-0.02
+    #[serde(default)]
+    pub target_kl: Option<f64>,
+    /// Whether to normalize observations using running mean/std
+    /// Helps with environments that have varying observation scales
+    #[serde(default)]
+    pub normalize_obs: bool,
 
     // Training
     #[serde(default = "default_total_timesteps")]
@@ -212,8 +225,11 @@ impl Default for Config {
             clip_epsilon: default_clip_epsilon(),
             clip_value: default_true(),
             entropy_coef: default_entropy_coef(),
+            entropy_anneal: false,
             value_coef: default_value_coef(),
             max_grad_norm: default_max_grad_norm(),
+            target_kl: None,
+            normalize_obs: false,
             total_timesteps: default_total_timesteps(),
             num_epochs: default_num_epochs(),
             num_minibatches: default_num_minibatches(),

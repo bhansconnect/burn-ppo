@@ -7,6 +7,7 @@ mod env;
 mod envs;
 mod metrics;
 mod network;
+mod normalization;
 mod ppo;
 mod profile;
 mod progress;
@@ -24,12 +25,13 @@ use clap::Parser;
 use rand::SeedableRng;
 
 use crate::backend::{init_device, backend_name, device_name, TrainingBackend};
-use crate::checkpoint::{CheckpointManager, CheckpointMetadata, load_optimizer, save_optimizer};
+use crate::checkpoint::{CheckpointManager, CheckpointMetadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer, save_rng_state};
 use crate::config::{CliArgs, Config};
 use crate::env::VecEnv;
 use crate::envs::CartPole;
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
+use crate::normalization::ObsNormalizer;
 use crate::ppo::{collect_rollouts, compute_gae, ppo_update, RolloutBuffer};
 use crate::progress::TrainingProgress;
 
@@ -271,6 +273,13 @@ fn main() -> Result<()> {
         num_envs, obs_dim, action_count
     );
 
+    // Create observation normalizer if enabled
+    let mut obs_normalizer: Option<ObsNormalizer> = if config.normalize_obs {
+        Some(ObsNormalizer::new(obs_dim, 10.0))
+    } else {
+        None
+    };
+
     // Create optimizer with gradient clipping
     let optimizer_config = AdamConfig::new()
         .with_epsilon(config.adam_epsilon as f32)
@@ -318,9 +327,39 @@ fn main() -> Result<()> {
                 }
             };
 
+            // Load observation normalizer if it was saved
+            if config.normalize_obs {
+                match load_normalizer(checkpoint_dir) {
+                    Ok(Some(loaded_norm)) => {
+                        obs_normalizer = Some(loaded_norm);
+                        println!("Loaded observation normalizer from checkpoint");
+                    }
+                    Ok(None) => {
+                        // No normalizer saved, keep the fresh one
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load normalizer: {}", e);
+                    }
+                }
+            }
+
+            // Load RNG state if saved (for reproducible continuation)
+            match load_rng_state(checkpoint_dir) {
+                Ok(Some(loaded_rng)) => {
+                    rng = loaded_rng;
+                    println!("Loaded RNG state from checkpoint");
+                }
+                Ok(None) => {
+                    // No RNG state saved, keep the fresh one
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to load RNG state: {}", e);
+                }
+            }
+
             let step = metadata.step;
             let recent_returns = metadata.recent_returns.clone();
-            let best_return = metadata.best_avg_return;
+            let best_return = metadata.best_avg_return.unwrap_or(f32::NEG_INFINITY);
 
             println!(
                 "Loaded checkpoint from step {} (avg return: {:.1})",
@@ -400,6 +439,15 @@ fn main() -> Result<()> {
             config.learning_rate
         };
 
+        // Entropy coefficient annealing (decay to 10% of initial value)
+        let ent_coef = if config.entropy_anneal {
+            let actual_update = update_offset + update;
+            let progress = actual_update as f64 / total_updates as f64;
+            config.entropy_coef * (1.0 - progress * 0.9) // Decay to 10% of initial
+        } else {
+            config.entropy_coef
+        };
+
         // Collect rollouts
         let rollout_start = std::time::Instant::now();
         let completed_episodes = collect_rollouts(
@@ -409,6 +457,7 @@ fn main() -> Result<()> {
             config.num_steps,
             &device,
             &mut rng,
+            obs_normalizer.as_mut(),
         );
         rollout_time_acc += rollout_start.elapsed();
 
@@ -425,8 +474,11 @@ fn main() -> Result<()> {
             }
         }
 
-        // Compute bootstrap value
-        let obs_flat = vec_env.get_observations();
+        // Compute bootstrap value (normalize observations if normalizer is active)
+        let mut obs_flat = vec_env.get_observations();
+        if let Some(ref norm) = obs_normalizer {
+            norm.normalize_batch(&mut obs_flat, obs_dim);
+        }
         let obs_tensor: Tensor<TrainingBackend, 2> =
             Tensor::<TrainingBackend, 1>::from_floats(obs_flat.as_slice(), &device)
                 .reshape([num_envs, obs_dim]);
@@ -445,7 +497,7 @@ fn main() -> Result<()> {
 
         // PPO update
         let update_start = std::time::Instant::now();
-        let (updated_model, metrics) = ppo_update(model, &buffer, &mut optimizer, &config, lr, &mut rng);
+        let (updated_model, metrics) = ppo_update(model, &buffer, &mut optimizer, &config, lr, ent_coef, &mut rng);
         update_time_acc += update_start.elapsed();
         model = updated_model;
 
@@ -548,7 +600,7 @@ fn main() -> Result<()> {
                 step: global_step,
                 avg_return,
                 rng_seed: config.seed,
-                best_avg_return: checkpoint_manager.best_avg_return(),
+                best_avg_return: Some(checkpoint_manager.best_avg_return()),
                 recent_returns: recent_returns.clone(),
                 obs_dim,
                 action_count,
@@ -563,6 +615,18 @@ fn main() -> Result<()> {
                 &checkpoint_path,
             ) {
                 eprintln!("Warning: Failed to save optimizer state: {}", e);
+            }
+
+            // Save observation normalizer if enabled
+            if let Some(ref norm) = obs_normalizer {
+                if let Err(e) = save_normalizer(norm, &checkpoint_path) {
+                    eprintln!("Warning: Failed to save normalizer: {}", e);
+                }
+            }
+
+            // Save RNG state for reproducible continuation
+            if let Err(e) = save_rng_state(&mut rng, &checkpoint_path) {
+                eprintln!("Warning: Failed to save RNG state: {}", e);
             }
 
             println!(

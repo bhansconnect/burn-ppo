@@ -15,6 +15,7 @@ use rand::Rng;
 use crate::config::Config;
 use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
+use crate::normalization::ObsNormalizer;
 use crate::profile::{gpu_sync, profile_function, profile_scope};
 use crate::utils::{entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical};
 
@@ -77,6 +78,8 @@ impl<B: Backend> RolloutBuffer<B> {
 ///
 /// Runs num_steps in each of num_envs environments, storing trajectories.
 /// Uses CPU collection with batch GPU transfer for performance.
+/// If normalizer is provided, observations are normalized before model inference
+/// and the normalizer's running statistics are updated.
 pub fn collect_rollouts<B: Backend, E: Environment>(
     model: &ActorCritic<B>,
     vec_env: &mut VecEnv<E>,
@@ -84,6 +87,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     num_steps: usize,
     device: &B::Device,
     rng: &mut impl Rng,
+    mut normalizer: Option<&mut ObsNormalizer>,
 ) -> Vec<EpisodeStats> {
     profile_function!();
     let num_envs = vec_env.num_envs();
@@ -101,8 +105,12 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     for _step in 0..num_steps {
         profile_scope!("rollout_step");
 
-        // Get current observations
-        let obs_flat = vec_env.get_observations();
+        // Get current observations and optionally normalize
+        let mut obs_flat = vec_env.get_observations();
+        if let Some(norm) = normalizer.as_mut() {
+            norm.update_batch(&obs_flat, obs_dim);
+            norm.normalize_batch(&mut obs_flat, obs_dim);
+        }
 
         // Model inference: forward pass, sample actions, compute log probs, sync to CPU
         // All GPU ops batched together - timing includes actual compute (sync at end)
@@ -276,6 +284,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     optimizer: &mut impl burn::optim::Optimizer<ActorCritic<B>, B>,
     config: &Config,
     learning_rate: f64,
+    entropy_coef: f64,
     rng: &mut impl Rng,
 ) -> (ActorCritic<B>, UpdateMetrics) {
     profile_function!();
@@ -297,8 +306,8 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
 
     let mut model = model;
 
-    // Epoch loop
-    for _epoch in 0..config.num_epochs {
+    // Epoch loop (labeled for KL early stopping)
+    'epoch_loop: for _epoch in 0..config.num_epochs {
         profile_scope!("ppo_epoch");
 
         // Shuffle indices for minibatches
@@ -367,7 +376,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 };
 
                 // Entropy bonus
-                let entropy_loss = -entropy.clone().mean() * config.entropy_coef;
+                let entropy_loss = -entropy.clone().mean() * entropy_coef;
 
                 // Combined loss
                 let loss = policy_loss_mean.clone() + value_loss.clone() * config.value_coef + entropy_loss;
@@ -433,6 +442,13 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 total_value_mean += metrics_data[6];
                 total_returns_mean += metrics_data[7];
                 num_updates += 1;
+
+                // KL early stopping: stop epoch if KL divergence exceeds threshold
+                if let Some(target) = config.target_kl {
+                    if metrics_data[3] > target as f32 {
+                        break 'epoch_loop;
+                    }
+                }
             }
         }
     }

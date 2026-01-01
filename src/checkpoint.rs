@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::network::ActorCritic;
+use crate::normalization::ObsNormalizer;
 
 /// Training metadata saved alongside model weights
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,8 +26,9 @@ pub struct CheckpointMetadata {
     pub avg_return: f32,
     pub rng_seed: u64,
     /// Best average return seen during training (for CheckpointManager restoration)
-    #[serde(default = "default_best_avg_return")]
-    pub best_avg_return: f32,
+    /// Uses Option to handle f32::NEG_INFINITY which serializes as null
+    #[serde(default)]
+    pub best_avg_return: Option<f32>,
     /// Last 100 episode returns for smoothed metrics
     #[serde(default)]
     pub recent_returns: Vec<f32>,
@@ -41,9 +43,6 @@ pub struct CheckpointMetadata {
     pub forked_from: Option<String>,
 }
 
-fn default_best_avg_return() -> f32 {
-    f32::NEG_INFINITY
-}
 
 /// Manages checkpointing for a training run
 pub struct CheckpointManager {
@@ -235,6 +234,71 @@ where
     Ok(optimizer.load_record(record))
 }
 
+/// Save observation normalizer to a checkpoint directory
+///
+/// The normalizer is saved as JSON for easy inspection and portability.
+pub fn save_normalizer(normalizer: &ObsNormalizer, checkpoint_dir: &Path) -> Result<()> {
+    let normalizer_path = checkpoint_dir.join("normalizer.json");
+    let json = serde_json::to_string_pretty(normalizer)?;
+    fs::write(normalizer_path, json)?;
+    Ok(())
+}
+
+/// Save RNG state to a checkpoint directory
+///
+/// Generates a fresh seed from the current RNG state and saves it.
+/// This allows resuming training with deterministic continuation.
+pub fn save_rng_state(rng: &mut rand::rngs::StdRng, checkpoint_dir: &Path) -> Result<()> {
+    use rand::RngCore;
+
+    // Generate a 32-byte seed from current RNG state
+    let mut seed = [0u8; 32];
+    rng.fill_bytes(&mut seed);
+
+    let rng_path = checkpoint_dir.join("rng_state.bin");
+    fs::write(rng_path, seed)?;
+    Ok(())
+}
+
+/// Load RNG state from a checkpoint directory
+///
+/// Returns a new StdRng initialized from the saved seed.
+pub fn load_rng_state(checkpoint_dir: &Path) -> Result<Option<rand::rngs::StdRng>> {
+    use rand::SeedableRng;
+
+    let rng_path = checkpoint_dir.join("rng_state.bin");
+    if !rng_path.exists() {
+        return Ok(None);
+    }
+
+    let seed_bytes = fs::read(&rng_path)
+        .context("Failed to read RNG state")?;
+
+    if seed_bytes.len() != 32 {
+        anyhow::bail!("Invalid RNG state file: expected 32 bytes, got {}", seed_bytes.len());
+    }
+
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_bytes);
+
+    Ok(Some(rand::rngs::StdRng::from_seed(seed)))
+}
+
+/// Load observation normalizer from a checkpoint directory
+///
+/// Returns None if no normalizer was saved (older checkpoint or normalize_obs=false).
+pub fn load_normalizer(checkpoint_dir: &Path) -> Result<Option<ObsNormalizer>> {
+    let normalizer_path = checkpoint_dir.join("normalizer.json");
+    if !normalizer_path.exists() {
+        return Ok(None);
+    }
+
+    let json = fs::read_to_string(&normalizer_path)
+        .context("Failed to read normalizer")?;
+    let normalizer: ObsNormalizer = serde_json::from_str(&json)?;
+    Ok(Some(normalizer))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,7 +328,7 @@ mod tests {
             step: 1000,
             avg_return: 150.0,
             rng_seed: 42,
-            best_avg_return: 150.0,
+            best_avg_return: Some(150.0),
             recent_returns: vec![140.0, 150.0, 160.0],
             obs_dim: 4,
             action_count: 2,
@@ -307,7 +371,7 @@ mod tests {
                     step: 1000,
                     avg_return: 100.0,
                     rng_seed: 42,
-                    best_avg_return: 100.0,
+                    best_avg_return: Some(100.0),
                     recent_returns: vec![100.0],
                     obs_dim: 4,
                     action_count: 2,
@@ -324,7 +388,7 @@ mod tests {
                     step: 2000,
                     avg_return: 200.0,
                     rng_seed: 42,
-                    best_avg_return: 200.0,
+                    best_avg_return: Some(200.0),
                     recent_returns: vec![100.0, 200.0],
                     obs_dim: 4,
                     action_count: 2,
@@ -341,7 +405,7 @@ mod tests {
                     step: 3000,
                     avg_return: 150.0,
                     rng_seed: 42,
-                    best_avg_return: 200.0,
+                    best_avg_return: Some(200.0),
                     recent_returns: vec![100.0, 200.0, 150.0],
                     obs_dim: 4,
                     action_count: 2,

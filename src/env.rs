@@ -35,8 +35,10 @@ pub struct EpisodeStats {
 /// on episode termination.
 pub struct VecEnv<E: Environment> {
     envs: Vec<E>,
-    /// Current observations for each env
-    observations: Vec<Vec<f32>>,
+    /// Pre-allocated flat observation buffer [num_envs * obs_dim]
+    obs_buffer: Vec<f32>,
+    /// Observation dimension (cached for slicing)
+    obs_dim: usize,
     /// Accumulated reward per env (reset on episode end)
     episode_rewards: Vec<f32>,
     /// Steps taken per env (reset on episode end)
@@ -50,11 +52,20 @@ impl<E: Environment> VecEnv<E> {
         F: Fn(usize) -> E,
     {
         let mut envs: Vec<E> = (0..num_envs).map(|i| factory(i)).collect();
-        let observations: Vec<Vec<f32>> = envs.iter_mut().map(|e| e.reset()).collect();
+        let obs_dim = envs[0].observation_dim();
+
+        // Pre-allocate flat observation buffer and initialize with reset observations
+        let mut obs_buffer = vec![0.0; num_envs * obs_dim];
+        for (i, env) in envs.iter_mut().enumerate() {
+            let obs = env.reset();
+            let offset = i * obs_dim;
+            obs_buffer[offset..offset + obs_dim].copy_from_slice(&obs);
+        }
 
         Self {
             envs,
-            observations,
+            obs_buffer,
+            obs_dim,
             episode_rewards: vec![0.0; num_envs],
             episode_lengths: vec![0; num_envs],
         }
@@ -67,7 +78,7 @@ impl<E: Environment> VecEnv<E> {
 
     /// Observation dimension (all envs must match)
     pub fn observation_dim(&self) -> usize {
-        self.envs[0].observation_dim()
+        self.obs_dim
     }
 
     /// Action count (all envs must match)
@@ -77,7 +88,7 @@ impl<E: Environment> VecEnv<E> {
 
     /// Get current observations as flat array [num_envs * obs_dim]
     pub fn get_observations(&self) -> Vec<f32> {
-        self.observations.iter().flatten().copied().collect()
+        self.obs_buffer.clone()
     }
 
     /// Step all environments with given actions
@@ -100,8 +111,8 @@ impl<E: Environment> VecEnv<E> {
                 .zip(actions.par_iter())
                 .zip(self.episode_rewards.par_iter_mut())
                 .zip(self.episode_lengths.par_iter_mut())
-                .zip(self.observations.par_iter_mut())
-                .map(|((((env, &action), reward), length), obs)| {
+                .zip(self.obs_buffer.par_chunks_mut(self.obs_dim))
+                .map(|((((env, &action), reward), length), obs_chunk)| {
                     #[cfg(feature = "tracy")]
                     let _span = tracy_client::span!("env_step");
 
@@ -114,12 +125,13 @@ impl<E: Environment> VecEnv<E> {
                             total_reward: *reward,
                             length: *length,
                         };
-                        *obs = env.reset();
+                        let reset_obs = env.reset();
+                        obs_chunk.copy_from_slice(&reset_obs);
                         *reward = 0.0;
                         *length = 0;
                         Some(stats)
                     } else {
-                        *obs = new_obs;
+                        obs_chunk.copy_from_slice(&new_obs);
                         None
                     };
 
@@ -148,7 +160,9 @@ impl<E: Environment> VecEnv<E> {
     /// Reset all environments
     pub fn reset_all(&mut self) {
         for (i, env) in self.envs.iter_mut().enumerate() {
-            self.observations[i] = env.reset();
+            let obs = env.reset();
+            let offset = i * self.obs_dim;
+            self.obs_buffer[offset..offset + self.obs_dim].copy_from_slice(&obs);
             self.episode_rewards[i] = 0.0;
             self.episode_lengths[i] = 0;
         }
