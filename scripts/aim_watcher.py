@@ -26,10 +26,56 @@ from pathlib import Path
 from aim import Run
 
 
+class RunManager:
+    """Manages the global pool of open Aim runs to enforce limits"""
+
+    def __init__(self, trackers: dict, max_open: int):
+        self.trackers = trackers
+        self.max_open = max_open
+        self.open_count = 0
+
+    def can_open(self) -> bool:
+        """Check if we can open another run"""
+        return self.open_count < self.max_open
+
+    def on_open(self):
+        """Called when a run is opened"""
+        self.open_count += 1
+
+    def on_close(self):
+        """Called when a run is closed"""
+        self.open_count = max(0, self.open_count - 1)
+
+    def close_oldest_idle(self) -> bool:
+        """Close the oldest idle run to make room. Returns True if one was closed."""
+        oldest_tracker = None
+        oldest_time = float("inf")
+
+        for tracker in self.trackers.values():
+            if tracker.aim_run is not None:
+                if tracker.last_activity_time < oldest_time:
+                    oldest_time = tracker.last_activity_time
+                    oldest_tracker = tracker
+
+        if oldest_tracker:
+            print(f">>> Closing oldest idle run to make room: {oldest_tracker.run_name}")
+            oldest_tracker.close()
+            return True
+        return False
+
+    def ensure_capacity(self):
+        """Ensure there's capacity for a new run, closing old ones if needed"""
+        while not self.can_open():
+            if not self.close_oldest_idle():
+                break  # No more runs to close
+
+
 class RunTracker:
     """Manages Aim Run and metrics reading for a single training run"""
 
-    def __init__(self, run_dir: Path, aim_repo: Path, print_interval: int):
+    def __init__(
+        self, run_dir: Path, aim_repo: Path, print_interval: int, manager: RunManager
+    ):
         self.run_dir = run_dir
         self.run_name = run_dir.name
         self.metrics_path = run_dir / "metrics.jsonl"
@@ -39,6 +85,7 @@ class RunTracker:
 
         # Store aim_repo for lazy initialization
         self.aim_repo = aim_repo
+        self.manager = manager
         self.aim_run = None  # Lazy init - only open when new data arrives
         self.last_activity_time = time.time()
 
@@ -86,7 +133,9 @@ class RunTracker:
     def _ensure_open(self):
         """Ensure the Aim run is open, initializing if needed"""
         if self.aim_run is None:
+            self.manager.ensure_capacity()
             self._init_aim_run()
+            self.manager.on_open()
 
     def poll(self) -> bool:
         """Read and process any new lines in the metrics file. Returns True if new data found."""
@@ -119,34 +168,55 @@ class RunTracker:
             return True
 
         except OSError as e:
-            print(f"Warning: Could not read metrics: {e}", file=sys.stderr)
+            # Handle "Too many open files" by closing this run and retrying later
+            if "Too many open files" in str(e) or e.errno == 24:
+                print(
+                    f"Warning: File descriptor limit hit for {self.run_name}, "
+                    "closing run to recover",
+                    file=sys.stderr,
+                )
+                self.close()
+            else:
+                print(f"Warning: Could not read metrics: {e}", file=sys.stderr)
             return False
 
     def _log_metric(self, metric: dict):
         """Log a single metric to Aim"""
-        self._ensure_open()
+        try:
+            self._ensure_open()
 
-        metric_type = metric.get("type")
-        step = metric.get("step", 0)
+            metric_type = metric.get("type")
+            step = metric.get("step", 0)
 
-        if metric_type == "hparams":
-            # Log hyperparameters
-            data = metric.get("data", {})
-            for key, value in data.items():
-                self.aim_run[key] = value
-            print(f"[{self.run_name}] Logged hyperparameters: {list(data.keys())}")
+            if metric_type == "hparams":
+                # Log hyperparameters
+                data = metric.get("data", {})
+                for key, value in data.items():
+                    self.aim_run[key] = value
+                print(f"[{self.run_name}] Logged hyperparameters: {list(data.keys())}")
 
-        elif metric_type == "scalar":
-            name = metric.get("name", "unknown")
-            value = metric.get("value", 0.0)
-            self.aim_run.track(value, name=name, step=step)
+            elif metric_type == "scalar":
+                name = metric.get("name", "unknown")
+                value = metric.get("value", 0.0)
+                self.aim_run.track(value, name=name, step=step)
 
-            # Print if enabled and: not a _single metric AND N+ steps since last print
-            if self.print_interval > 0 and "_single" not in name:
-                last_step = self.last_printed_step.get(name, -self.print_interval)
-                if step - last_step >= self.print_interval:
-                    print(f"[{self.run_name}] Step {step}: {name} = {value:.4f}")
-                    self.last_printed_step[name] = step
+                # Print if enabled and: not a _single metric AND N+ steps since last print
+                if self.print_interval > 0 and "_single" not in name:
+                    last_step = self.last_printed_step.get(name, -self.print_interval)
+                    if step - last_step >= self.print_interval:
+                        print(f"[{self.run_name}] Step {step}: {name} = {value:.4f}")
+                        self.last_printed_step[name] = step
+
+        except OSError as e:
+            if "Too many open files" in str(e) or e.errno == 24:
+                print(
+                    f"Warning: File descriptor limit hit logging to {self.run_name}, "
+                    "closing run to recover",
+                    file=sys.stderr,
+                )
+                self.close()
+            else:
+                raise
 
     def check_idle_timeout(self, timeout: float) -> bool:
         """Close run if idle too long. Returns True if closed."""
@@ -163,8 +233,57 @@ class RunTracker:
     def close(self):
         """Close the Aim run"""
         if self.aim_run is not None:
-            self.aim_run.close()
+            try:
+                self.aim_run.close()
+            except Exception as e:
+                print(f"Warning: Error closing run {self.run_name}: {e}", file=sys.stderr)
             self.aim_run = None
+            self.manager.on_close()
+
+
+def validate_run_hashes(runs_dir: Path, aim_repo: Path):
+    """Reset runs whose Aim run hash no longer exists (repo was recreated).
+
+    When the .aim directory is deleted and recreated, the stored .aim_run_hash
+    files point to non-existent runs. This function detects this and resets
+    those runs so they re-upload all metrics from the beginning.
+    """
+    chunks_dir = aim_repo / ".aim" / "meta" / "chunks"
+
+    if not chunks_dir.exists():
+        # Aim repo doesn't exist or is empty - reset all runs
+        print(">>> Aim repo appears empty, will reset any existing run tracking")
+
+    reset_count = 0
+    try:
+        for run_dir in runs_dir.iterdir():
+            if not run_dir.is_dir() or run_dir.name.startswith("."):
+                continue
+
+            hash_file = run_dir / ".aim_run_hash"
+            offset_file = run_dir / ".aim_offset"
+
+            if hash_file.exists():
+                try:
+                    run_hash = hash_file.read_text().strip()
+                    hash_dir = chunks_dir / run_hash
+
+                    if not hash_dir.exists():
+                        print(f">>> Reset run {run_dir.name}: Aim repo was recreated")
+                        hash_file.unlink()
+                        if offset_file.exists():
+                            offset_file.unlink()
+                        reset_count += 1
+                except OSError as e:
+                    print(
+                        f"Warning: Could not validate run {run_dir.name}: {e}",
+                        file=sys.stderr,
+                    )
+    except OSError as e:
+        print(f"Warning: Could not scan runs directory: {e}", file=sys.stderr)
+
+    if reset_count > 0:
+        print(f">>> Reset {reset_count} run(s) due to Aim repo recreation")
 
 
 def main():
@@ -194,6 +313,12 @@ def main():
         default=60.0,
         help="Close idle runs after N seconds (default: 60.0, 0 = never)",
     )
+    parser.add_argument(
+        "--max-open-runs",
+        type=int,
+        default=3,
+        help="Maximum concurrent open Aim runs (default: 3)",
+    )
     args = parser.parse_args()
 
     runs_dir = args.runs_dir.resolve()
@@ -207,8 +332,14 @@ def main():
     # Use scripts directory as Aim repo location
     aim_repo = Path(__file__).parent
 
+    # Validate run hashes on startup (detect if Aim repo was recreated)
+    validate_run_hashes(runs_dir, aim_repo)
+
     # Dictionary of active run trackers
     trackers: dict[str, RunTracker] = {}
+
+    # Manager to enforce max open runs limit
+    manager = RunManager(trackers, args.max_open_runs)
 
     def register_run(run_dir: Path):
         """Register a new run for tracking"""
@@ -218,7 +349,9 @@ def main():
         if run_name.startswith("."):
             return  # Skip hidden directories
         try:
-            trackers[run_name] = RunTracker(run_dir, aim_repo, args.print_interval)
+            trackers[run_name] = RunTracker(
+                run_dir, aim_repo, args.print_interval, manager
+            )
         except Exception as e:
             print(f"Warning: Could not track run {run_name}: {e}", file=sys.stderr)
 
