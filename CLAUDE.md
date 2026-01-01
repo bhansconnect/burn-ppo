@@ -45,7 +45,8 @@ cargo run --release -- --fork runs/<run_name>/checkpoints/best --learning-rate 0
 
 ### Run Tests
 ```bash
-cargo test
+cargo nextest run  # Preferred, if installed
+cargo test         # Fallback
 ```
 
 ### Aim Metrics Viewer
