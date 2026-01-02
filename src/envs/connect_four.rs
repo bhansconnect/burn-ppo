@@ -2,7 +2,6 @@
 ///
 /// 7x6 board game where players drop pieces to connect four in a row.
 /// True self-play: same network plays both sides, one move per step.
-
 use crate::env::{Environment, GameOutcome};
 use crate::profile::profile_function;
 
@@ -184,7 +183,7 @@ impl ConnectFour {
             for col in 0..COLS {
                 let idx = row * COLS + col;
                 match self.board[row][col] {
-                    Cell::Empty => {} // Both planes are 0
+                    Cell::Empty => {}                             // Both planes are 0
                     Cell::Player1 => obs[idx] = 1.0,              // P0 plane [0..42)
                     Cell::Player2 => obs[BOARD_SIZE + idx] = 1.0, // P1 plane [42..84)
                 }

@@ -5,7 +5,6 @@
 /// - Learning rate annealing, GAE, minibatch shuffled updates
 /// - Advantage normalization, clipped surrogate, value clipping
 /// - Combined loss, gradient clipping
-
 use burn::optim::GradientsParams;
 use burn::prelude::*;
 use burn::tensor::Int;
@@ -17,7 +16,9 @@ use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
 use crate::profile::{gpu_sync, profile_function, profile_scope};
-use crate::utils::{entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical};
+use crate::utils::{
+    entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical,
+};
 
 /// Stores trajectory data from environment rollouts
 ///
@@ -91,15 +92,34 @@ impl<B: Backend> RolloutBuffer<B> {
     /// Flatten buffer for minibatch processing
     /// Returns (obs, actions, old_log_probs, advantages, returns, acting_players)
     /// Each with shape [num_steps * num_envs, ...]
-    pub fn flatten(&self) -> (Tensor<B, 2>, Tensor<B, 1, Int>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1, Int>) {
+    pub fn flatten(
+        &self,
+    ) -> (
+        Tensor<B, 2>,
+        Tensor<B, 1, Int>,
+        Tensor<B, 1>,
+        Tensor<B, 1>,
+        Tensor<B, 1>,
+        Tensor<B, 1, Int>,
+    ) {
         let [num_steps, num_envs, obs_dim] = self.observations.dims();
         let batch_size = num_steps * num_envs;
 
         let obs = self.observations.clone().reshape([batch_size, obs_dim]);
         let actions = self.actions.clone().flatten(0, 1);
         let log_probs = self.log_probs.clone().flatten(0, 1);
-        let advantages = self.advantages.as_ref().expect("Advantages not computed").clone().flatten(0, 1);
-        let returns = self.returns.as_ref().expect("Returns not computed").clone().flatten(0, 1);
+        let advantages = self
+            .advantages
+            .as_ref()
+            .expect("Advantages not computed")
+            .clone()
+            .flatten(0, 1);
+        let returns = self
+            .returns
+            .as_ref()
+            .expect("Returns not computed")
+            .clone()
+            .flatten(0, 1);
         let acting_players = self.acting_players.clone().flatten(0, 1);
 
         (obs, actions, log_probs, advantages, returns, acting_players)
@@ -174,8 +194,8 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         let (actions_data, acting_values_data, log_probs_data, values_all_data) = {
             profile_scope!("model_inference");
 
-            let obs_tensor: Tensor<B, 2> =
-                Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device).reshape([num_envs, obs_dim]);
+            let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device)
+                .reshape([num_envs, obs_dim]);
             let (logits, values) = model.forward(obs_tensor);
             // values is [num_envs, num_players]
 
@@ -202,8 +222,14 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
                 .map(|(e, &p)| values_all_data[e * num_players + p])
                 .collect();
 
-            let log_probs_data: Vec<f32> = log_probs.into_data().to_vec().expect("log_probs to vec");
-            (actions_data, acting_values_data, log_probs_data, values_all_data)
+            let log_probs_data: Vec<f32> =
+                log_probs.into_data().to_vec().expect("log_probs to vec");
+            (
+                actions_data,
+                acting_values_data,
+                log_probs_data,
+                values_all_data,
+            )
         };
 
         // Convert actions to Vec<usize> for environment
@@ -225,10 +251,13 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             .collect();
 
         // Flatten all player rewards [num_envs, num_players] -> [num_envs * num_players]
-        let rewards_flat: Vec<f32> = player_rewards.iter().flat_map(|r| {
-            // Pad with zeros if rewards vec is shorter than num_players
-            (0..num_players).map(|p| r.get(p).copied().unwrap_or(0.0))
-        }).collect();
+        let rewards_flat: Vec<f32> = player_rewards
+            .iter()
+            .flat_map(|r| {
+                // Pad with zeros if rewards vec is shorter than num_players
+                (0..num_players).map(|p| r.get(p).copied().unwrap_or(0.0))
+            })
+            .collect();
 
         // Append to CPU buffers
         all_obs.extend_from_slice(&obs_flat);
@@ -247,26 +276,27 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     // Batch transfer to GPU
     {
         profile_scope!("batch_gpu_transfer");
-        buffer.observations =
-            Tensor::<B, 1>::from_floats(all_obs.as_slice(), device).reshape([num_steps, num_envs, obs_dim]);
-        buffer.actions =
-            Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device).reshape([num_steps, num_envs]);
-        buffer.rewards =
-            Tensor::<B, 1>::from_floats(all_acting_rewards.as_slice(), device).reshape([num_steps, num_envs]);
-        buffer.dones =
-            Tensor::<B, 1>::from_floats(all_dones.as_slice(), device).reshape([num_steps, num_envs]);
-        buffer.values =
-            Tensor::<B, 1>::from_floats(all_acting_values.as_slice(), device).reshape([num_steps, num_envs]);
-        buffer.log_probs =
-            Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device).reshape([num_steps, num_envs]);
+        buffer.observations = Tensor::<B, 1>::from_floats(all_obs.as_slice(), device)
+            .reshape([num_steps, num_envs, obs_dim]);
+        buffer.actions = Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.rewards = Tensor::<B, 1>::from_floats(all_acting_rewards.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.dones = Tensor::<B, 1>::from_floats(all_dones.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.values = Tensor::<B, 1>::from_floats(all_acting_values.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.log_probs = Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device)
+            .reshape([num_steps, num_envs]);
 
         // Multi-player data
-        buffer.all_values =
-            Tensor::<B, 1>::from_floats(all_values_flat.as_slice(), device).reshape([num_steps, num_envs, num_players]);
-        buffer.all_rewards =
-            Tensor::<B, 1>::from_floats(all_rewards_flat.as_slice(), device).reshape([num_steps, num_envs, num_players]);
+        buffer.all_values = Tensor::<B, 1>::from_floats(all_values_flat.as_slice(), device)
+            .reshape([num_steps, num_envs, num_players]);
+        buffer.all_rewards = Tensor::<B, 1>::from_floats(all_rewards_flat.as_slice(), device)
+            .reshape([num_steps, num_envs, num_players]);
         buffer.acting_players =
-            Tensor::<B, 1, Int>::from_ints(all_acting_players.as_slice(), device).reshape([num_steps, num_envs]);
+            Tensor::<B, 1, Int>::from_ints(all_acting_players.as_slice(), device)
+                .reshape([num_steps, num_envs]);
     }
 
     // Update normalizer stats at end of rollout with all RAW observations
@@ -293,7 +323,12 @@ pub fn compute_gae<B: Backend>(
     let [num_steps, num_envs] = buffer.rewards.dims();
 
     // Get tensor data for computation
-    let rewards_data: Vec<f32> = buffer.rewards.clone().into_data().to_vec().expect("rewards");
+    let rewards_data: Vec<f32> = buffer
+        .rewards
+        .clone()
+        .into_data()
+        .to_vec()
+        .expect("rewards");
     let dones_data: Vec<f32> = buffer.dones.clone().into_data().to_vec().expect("dones");
     let values_data: Vec<f32> = buffer.values.clone().into_data().to_vec().expect("values");
     let last_values_data: Vec<f32> = last_values.into_data().to_vec().expect("last values");
@@ -355,8 +390,18 @@ pub fn compute_gae_multiplayer<B: Backend>(
     let [num_steps, num_envs, _] = buffer.all_rewards.dims();
 
     // Extract data from tensors
-    let all_rewards_data: Vec<f32> = buffer.all_rewards.clone().into_data().to_vec().expect("all_rewards");
-    let all_values_data: Vec<f32> = buffer.all_values.clone().into_data().to_vec().expect("all_values");
+    let all_rewards_data: Vec<f32> = buffer
+        .all_rewards
+        .clone()
+        .into_data()
+        .to_vec()
+        .expect("all_rewards");
+    let all_values_data: Vec<f32> = buffer
+        .all_values
+        .clone()
+        .into_data()
+        .to_vec()
+        .expect("all_values");
     let dones_data: Vec<f32> = buffer.dones.clone().into_data().to_vec().expect("dones");
     // Convert through float to avoid IntElem type mismatches between backends
     let acting_players_data: Vec<usize> = buffer
@@ -474,7 +519,11 @@ pub fn compute_explained_variance(values: &[f32], returns: &[f32]) -> f32 {
     }
 
     let mean_returns = returns.iter().sum::<f32>() / n;
-    let var_returns = returns.iter().map(|r| (r - mean_returns).powi(2)).sum::<f32>() / n;
+    let var_returns = returns
+        .iter()
+        .map(|r| (r - mean_returns).powi(2))
+        .sum::<f32>()
+        / n;
 
     if var_returns < 1e-8 {
         return 0.0;
@@ -550,16 +599,22 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         for mb_start in (0..batch_size).step_by(minibatch_size) {
             profile_scope!("ppo_minibatch");
             let mb_end = (mb_start + minibatch_size).min(batch_size);
-            let mb_indices: Vec<i64> = indices[mb_start..mb_end].iter().map(|&i| i as i64).collect();
-            let mb_indices_tensor: Tensor<B, 1, Int> = Tensor::from_ints(mb_indices.as_slice(), &device);
+            let mb_indices: Vec<i64> = indices[mb_start..mb_end]
+                .iter()
+                .map(|&i| i as i64)
+                .collect();
+            let mb_indices_tensor: Tensor<B, 1, Int> =
+                Tensor::from_ints(mb_indices.as_slice(), &device);
 
             // Gather minibatch data
             let mb_obs = obs.clone().select(0, mb_indices_tensor.clone());
-            let mb_actions: Tensor<B, 1, Int> = actions.clone().select(0, mb_indices_tensor.clone());
+            let mb_actions: Tensor<B, 1, Int> =
+                actions.clone().select(0, mb_indices_tensor.clone());
             let mb_old_log_probs = old_log_probs.clone().select(0, mb_indices_tensor.clone());
             let mb_advantages_raw = advantages.clone().select(0, mb_indices_tensor.clone());
             let mb_returns = returns.clone().select(0, mb_indices_tensor.clone());
-            let mb_acting_players: Tensor<B, 1, Int> = acting_players.clone().select(0, mb_indices_tensor);
+            let mb_acting_players: Tensor<B, 1, Int> =
+                acting_players.clone().select(0, mb_indices_tensor);
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
@@ -580,7 +635,8 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             } else {
                 // Multi-player: extract acting player's value for each sample
                 // This is done on CPU since gather operations on GPU can be slow for small tensors
-                let all_values_data: Vec<f32> = all_values.clone().into_data().to_vec().expect("values");
+                let all_values_data: Vec<f32> =
+                    all_values.clone().into_data().to_vec().expect("values");
                 // Convert through float to avoid IntElem type mismatches between backends
                 let acting_data: Vec<usize> = mb_acting_players
                     .clone()
@@ -601,7 +657,17 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             };
 
             // Compute losses and backward pass (combined for accurate timing)
-            let (grads, loss, policy_loss_mean, value_loss, entropy, approx_kl, clip_fraction, values_mean, returns_mean) = {
+            let (
+                grads,
+                loss,
+                policy_loss_mean,
+                value_loss,
+                entropy,
+                approx_kl,
+                clip_fraction,
+                values_mean,
+                returns_mean,
+            ) = {
                 profile_scope!("loss_and_backward");
 
                 let new_log_probs = log_prob_categorical(logits.clone(), mb_actions);
@@ -613,7 +679,9 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
 
                 let policy_loss_1 = -mb_advantages.clone() * ratio.clone();
                 let policy_loss_2 = -mb_advantages.clone()
-                    * ratio.clone().clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
+                    * ratio
+                        .clone()
+                        .clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
                 let policy_loss: Tensor<B, 1> = policy_loss_1.clone().max_pair(policy_loss_2);
                 let policy_loss_mean = policy_loss.mean();
 
@@ -622,7 +690,11 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                     let mb_old_values = buffer.values.clone().flatten(0, 1).select(
                         0,
                         Tensor::from_ints(
-                            indices[mb_start..mb_end].iter().map(|&i| i as i64).collect::<Vec<_>>().as_slice(),
+                            indices[mb_start..mb_end]
+                                .iter()
+                                .map(|&i| i as i64)
+                                .collect::<Vec<_>>()
+                                .as_slice(),
                             &device,
                         ),
                     );
@@ -633,14 +705,19 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                     let value_loss_2 = (values_clipped - mb_returns.clone()).powf_scalar(2.0);
                     value_loss_1.max_pair(value_loss_2).mean() * 0.5
                 } else {
-                    (values.clone() - mb_returns.clone()).powf_scalar(2.0).mean() * 0.5
+                    (values.clone() - mb_returns.clone())
+                        .powf_scalar(2.0)
+                        .mean()
+                        * 0.5
                 };
 
                 // Entropy bonus
                 let entropy_loss = -entropy.clone().mean() * entropy_coef;
 
                 // Combined loss
-                let loss = policy_loss_mean.clone() + value_loss.clone() * config.value_coef + entropy_loss;
+                let loss = policy_loss_mean.clone()
+                    + value_loss.clone() * config.value_coef
+                    + entropy_loss;
 
                 // Compute approximate KL divergence for logging
                 // KL ≈ (ratio - 1) - log(ratio) is the unbiased low-variance estimator
@@ -660,7 +737,17 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 // Backward pass
                 let grads = loss.backward();
 
-                (grads, loss, policy_loss_mean, value_loss, entropy, approx_kl, clip_fraction, values_mean, returns_mean)
+                (
+                    grads,
+                    loss,
+                    policy_loss_mean,
+                    value_loss,
+                    entropy,
+                    approx_kl,
+                    clip_fraction,
+                    values_mean,
+                    returns_mean,
+                )
             };
 
             // Optimizer step with GPU sync for accurate timing
@@ -680,7 +767,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 // Use reshape to convert 0-dim scalars to 1-dim, then cat along dim 0
                 let metrics_tensor: Tensor<B, 1> = Tensor::cat(
                     vec![
-                        (-policy_loss_mean).reshape([1]),  // Negate for display
+                        (-policy_loss_mean).reshape([1]), // Negate for display
                         value_loss.reshape([1]),
                         entropy.mean().reshape([1]),
                         approx_kl.reshape([1]),
@@ -785,17 +872,14 @@ mod tests {
         let num_envs = 2;
         let num_players = 1u8;
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(num_steps, num_envs, 1, num_players, &device);
+        let mut buffer: RolloutBuffer<TestBackend> =
+            RolloutBuffer::new(num_steps, num_envs, 1, num_players, &device);
 
         // Set up simple rewards and values for testing
-        buffer.rewards = Tensor::from_floats(
-            [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
-            &device,
-        );
-        buffer.values = Tensor::from_floats(
-            [[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [0.5, 0.5]],
-            &device,
-        );
+        buffer.rewards =
+            Tensor::from_floats([[1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]], &device);
+        buffer.values =
+            Tensor::from_floats([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [0.5, 0.5]], &device);
         buffer.dones = Tensor::zeros([num_steps, num_envs], &device);
 
         let last_values: Tensor<TestBackend, 1> = Tensor::from_floats([0.5, 0.5], &device);
@@ -806,7 +890,12 @@ mod tests {
         assert!(buffer.returns.is_some());
 
         // Verify advantages are non-zero
-        let adv_data: Vec<f32> = buffer.advantages.unwrap().into_data().to_vec().expect("advantages");
+        let adv_data: Vec<f32> = buffer
+            .advantages
+            .unwrap()
+            .into_data()
+            .to_vec()
+            .expect("advantages");
         assert!(adv_data.iter().any(|&x| x.abs() > 0.01));
     }
 
@@ -817,7 +906,8 @@ mod tests {
         let num_envs = 2;
         let num_players = 2u8;
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(num_steps, num_envs, 86, num_players, &device);
+        let mut buffer: RolloutBuffer<TestBackend> =
+            RolloutBuffer::new(num_steps, num_envs, 86, num_players, &device);
 
         // Set up multi-player data
         // All rewards and values for both players
@@ -841,10 +931,8 @@ mod tests {
         );
         // Alternating players: P0, P1, P0, P1
         buffer.acting_players = Tensor::from_ints([[0, 0], [1, 1], [0, 0], [1, 1]], &device);
-        buffer.dones = Tensor::from_floats(
-            [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 1.0]],
-            &device,
-        );
+        buffer.dones =
+            Tensor::from_floats([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 1.0]], &device);
 
         let last_values: Tensor<TestBackend, 2> = Tensor::from_floats(
             [[0.0, 0.0], [0.0, 0.0]], // Terminal state, values don't matter

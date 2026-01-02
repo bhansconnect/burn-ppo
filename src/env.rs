@@ -1,5 +1,4 @@
 /// Environment trait and VecEnv parallel wrapper
-
 use rayon::prelude::*;
 use std::collections::VecDeque;
 
@@ -92,7 +91,10 @@ impl EpisodeStats {
 ///
 /// Returns (win_rates[player], draw_rate) where win_rates[i] is the fraction
 /// of games won by player i, and draw_rate is the fraction of games that were draws.
-pub fn compute_outcome_rates(outcomes: &VecDeque<GameOutcome>, num_players: usize) -> (Vec<f32>, f32) {
+pub fn compute_outcome_rates(
+    outcomes: &VecDeque<GameOutcome>,
+    num_players: usize,
+) -> (Vec<f32>, f32) {
     let total = outcomes.len() as f32;
     if total == 0.0 {
         return (vec![0.0; num_players], 0.0);
@@ -244,7 +246,10 @@ impl<E: Environment> VecEnv<E> {
                 .zip(self.terminal.par_iter())
                 .enumerate()
                 .map(
-                    |(env_idx, (((((env, &action), ep_rewards), length), obs_chunk), &is_terminal))| {
+                    |(
+                        env_idx,
+                        (((((env, &action), ep_rewards), length), obs_chunk), &is_terminal),
+                    )| {
                         #[cfg(feature = "tracy")]
                         let _span = tracy_client::span!("env_step");
 

@@ -208,6 +208,30 @@ pub struct Config {
     #[serde(default = "default_log_freq")]
     pub log_freq: usize,
 
+    // Challenger evaluation (multiplayer best checkpoint selection)
+    /// Enable challenger-style evaluation for multiplayer games
+    /// When enabled, new checkpoints must beat the current best to become "best"
+    #[serde(default)]
+    pub challenger_eval: bool,
+    /// Number of games for challenger evaluation
+    #[serde(default = "default_challenger_games")]
+    pub challenger_games: usize,
+    /// Win rate threshold to become new best (0.55 = 55%)
+    #[serde(default = "default_challenger_threshold")]
+    pub challenger_threshold: f64,
+    /// Temperature for challenger evaluation action sampling (default: 0.3)
+    #[serde(default = "default_challenger_temperature")]
+    pub challenger_temperature: f32,
+    /// Final temperature after cutoff (default: 0.0)
+    #[serde(default)]
+    pub challenger_temp_final: Option<f32>,
+    /// Move number to switch/decay temperature (default: None = constant temp)
+    #[serde(default)]
+    pub challenger_temp_cutoff: Option<usize>,
+    /// Use linear decay instead of hard cutoff (default: false)
+    #[serde(default)]
+    pub challenger_temp_decay: bool,
+
     // Experiment
     #[serde(default = "default_seed")]
     pub seed: u64,
@@ -281,6 +305,15 @@ fn default_log_freq() -> usize {
 fn default_seed() -> u64 {
     42
 }
+fn default_challenger_games() -> usize {
+    64
+}
+fn default_challenger_threshold() -> f64 {
+    0.55
+}
+fn default_challenger_temperature() -> f32 {
+    0.3
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -310,6 +343,13 @@ impl Default for Config {
             run_dir: default_run_dir(),
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
+            challenger_eval: false,
+            challenger_games: default_challenger_games(),
+            challenger_threshold: default_challenger_threshold(),
+            challenger_temperature: default_challenger_temperature(),
+            challenger_temp_final: None,
+            challenger_temp_cutoff: None,
+            challenger_temp_decay: false,
             seed: default_seed(),
             run_name: None,
             forked_from: None,
@@ -337,7 +377,9 @@ impl Config {
         // For fork mode, always generate child name (ignore --run-name if specified)
         if forked_from.is_some() {
             if config.run_name.is_some() {
-                eprintln!("Warning: --run-name is ignored when forking; using auto-generated child name");
+                eprintln!(
+                    "Warning: --run-name is ignored when forking; using auto-generated child name"
+                );
             }
             config.run_name = Some(generate_run_name(&config, forked_from.as_deref()));
         } else if config.run_name.is_none() {

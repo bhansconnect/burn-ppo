@@ -2,7 +2,6 @@
 ///
 /// Logs metrics to metrics.jsonl in append-only format for crash safety
 /// and streaming reads by the Aim watcher.
-
 use serde::Serialize;
 use serde_json;
 use std::fs::{File, OpenOptions};
@@ -19,9 +18,16 @@ pub struct MetricsLogger {
 #[serde(tag = "type")]
 pub enum Metric {
     #[serde(rename = "hparams")]
-    Hyperparams { step: usize, data: serde_json::Value },
+    Hyperparams {
+        step: usize,
+        data: serde_json::Value,
+    },
     #[serde(rename = "scalar")]
-    Scalar { step: usize, name: String, value: f32 },
+    Scalar {
+        step: usize,
+        name: String,
+        value: f32,
+    },
 }
 
 impl MetricsLogger {

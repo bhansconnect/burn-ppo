@@ -25,17 +25,23 @@ use burn::prelude::*;
 use clap::Parser;
 use rand::SeedableRng;
 
-use crate::backend::{init_device, backend_name, device_name, TrainingBackend};
-use crate::checkpoint::{CheckpointManager, CheckpointMetadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer, save_rng_state};
+use crate::backend::{backend_name, device_name, init_device, TrainingBackend};
+use crate::checkpoint::{
+    load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer,
+    save_rng_state, CheckpointManager, CheckpointMetadata,
+};
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_outcome_rates, Environment, GameOutcome, VecEnv};
-use std::collections::VecDeque;
 use crate::envs::{CartPole, ConnectFour};
+use crate::eval::run_challenger_eval;
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
-use crate::ppo::{collect_rollouts, compute_gae, compute_gae_multiplayer, ppo_update, RolloutBuffer};
+use crate::ppo::{
+    collect_rollouts, compute_gae, compute_gae_multiplayer, ppo_update, RolloutBuffer,
+};
 use crate::progress::TrainingProgress;
+use std::collections::VecDeque;
 
 /// Extract run name from a checkpoint path
 ///
@@ -44,6 +50,21 @@ fn extract_run_name_from_checkpoint_path(checkpoint_path: &std::path::Path) -> O
     // Navigate up from checkpoint: checkpoints/<name> -> checkpoints -> run_dir
     let run_dir = checkpoint_path.parent()?.parent()?;
     run_dir.file_name()?.to_str().map(String::from)
+}
+
+/// Get the step number from the best checkpoint symlink
+///
+/// Reads the symlink target and extracts the step number from the directory name.
+/// e.g., "step_00010240" -> 10240
+fn get_best_checkpoint_step(best_path: &std::path::Path) -> Option<usize> {
+    let target = std::fs::read_link(best_path).ok()?;
+    let name = target.file_name()?.to_str()?;
+    // Parse "step_XXXXXXXX" format
+    if name.starts_with("step_") {
+        name[5..].parse().ok()
+    } else {
+        None
+    }
 }
 
 /// Check if run directory exists and prompt user for deletion confirmation
@@ -114,9 +135,7 @@ enum TrainingMode {
         checkpoint_dir: PathBuf,
     },
     /// Fork from checkpoint (new run, allows config changes)
-    Fork {
-        checkpoint_dir: PathBuf,
-    },
+    Fork { checkpoint_dir: PathBuf },
 }
 
 /// Run training with a specific environment type
@@ -148,7 +167,11 @@ where
     let num_players = E::NUM_PLAYERS as u8;
     println!(
         "Created {} {} environments (obs_dim={}, actions={}, players={})",
-        num_envs, E::NAME, obs_dim, action_count, num_players
+        num_envs,
+        E::NAME,
+        obs_dim,
+        action_count,
+        num_players
     );
 
     // Create observation normalizer if enabled
@@ -189,7 +212,9 @@ where
             // Load model from checkpoint
             let (model, _) =
                 CheckpointManager::load::<TrainingBackend>(checkpoint_dir, &config, device)
-                    .with_context(|| format!("Failed to load checkpoint from {:?}", checkpoint_dir))?;
+                    .with_context(|| {
+                        format!("Failed to load checkpoint from {:?}", checkpoint_dir)
+                    })?;
 
             // Create optimizer and try to load saved state
             let optimizer = optimizer_config.init();
@@ -264,6 +289,8 @@ where
     let mut checkpoint_manager = CheckpointManager::new(&run_dir)?;
     checkpoint_manager.set_best_avg_return(best_return);
     let mut last_checkpoint_step = global_step;
+    let mut last_checkpoint_time = std::time::Instant::now();
+    let mut warned_challenger_eval_time = false;
 
     // Training state
     let steps_per_update = config.num_steps * num_envs;
@@ -281,7 +308,8 @@ where
     println!("---");
 
     // Progress bar (with multiplayer support)
-    let progress = TrainingProgress::new_with_players(config.total_timesteps as u64, num_players as usize);
+    let progress =
+        TrainingProgress::new_with_players(config.total_timesteps as u64, num_players as usize);
 
     // Timing for SPS calculation
     let training_start = std::time::Instant::now();
@@ -302,8 +330,9 @@ where
     // Multiplayer tracking (only used when num_players > 1)
     let num_players_usize = num_players as usize;
     // Per-player rolling returns (last 100 episodes)
-    let mut recent_returns_per_player: Vec<VecDeque<f32>> =
-        (0..num_players_usize).map(|_| VecDeque::with_capacity(100)).collect();
+    let mut recent_returns_per_player: Vec<VecDeque<f32>> = (0..num_players_usize)
+        .map(|_| VecDeque::with_capacity(100))
+        .collect();
     // Rolling game outcomes for win rate calculation
     let mut recent_outcomes: VecDeque<GameOutcome> = VecDeque::with_capacity(100);
     // Per-player episode data for logging (cleared on each log)
@@ -352,7 +381,7 @@ where
         // Track episode returns for metrics and checkpointing
         for ep in &completed_episodes {
             let ep_return = ep.total_reward(); // Player 0's return for single-agent, or overall
-            // For logging (cleared each log)
+                                               // For logging (cleared each log)
             episodes_since_log.push((ep_return, ep.length));
             // For checkpoint best selection (cleared each checkpoint)
             episodes_since_checkpoint.push(ep_return);
@@ -425,7 +454,15 @@ where
 
         // PPO update
         let update_start = std::time::Instant::now();
-        let (updated_model, metrics) = ppo_update(model, &buffer, &mut optimizer, &config, lr, ent_coef, &mut rng);
+        let (updated_model, metrics) = ppo_update(
+            model,
+            &buffer,
+            &mut optimizer,
+            &config,
+            lr,
+            ent_coef,
+            &mut rng,
+        );
         update_time_acc += update_start.elapsed();
         model = updated_model;
 
@@ -437,12 +474,20 @@ where
             let returns_per_player: Vec<f32> = recent_returns_per_player
                 .iter()
                 .map(|rp| {
-                    if rp.is_empty() { 0.0 }
-                    else { rp.iter().sum::<f32>() / rp.len() as f32 }
+                    if rp.is_empty() {
+                        0.0
+                    } else {
+                        rp.iter().sum::<f32>() / rp.len() as f32
+                    }
                 })
                 .collect();
             let (win_rates, draw_rate) = compute_outcome_rates(&recent_outcomes, num_players_usize);
-            progress.update_multiplayer(global_step as u64, &returns_per_player, &win_rates, draw_rate);
+            progress.update_multiplayer(
+                global_step as u64,
+                &returns_per_player,
+                &win_rates,
+                draw_rate,
+            );
         } else {
             // Single-player: show average return
             let avg_return = if recent_returns.is_empty() {
@@ -454,7 +499,8 @@ where
         }
 
         // Log metrics (at least once per log_freq steps)
-        let should_log = update == 0 || global_step / config.log_freq > (global_step - steps_per_update) / config.log_freq;
+        let should_log = update == 0
+            || global_step / config.log_freq > (global_step - steps_per_update) / config.log_freq;
         if should_log {
             logger.log_scalar("train/policy_loss", metrics.policy_loss, global_step)?;
             logger.log_scalar("train/value_loss", metrics.value_loss, global_step)?;
@@ -462,7 +508,11 @@ where
             logger.log_scalar("train/approx_kl", metrics.approx_kl, global_step)?;
             logger.log_scalar("train/clip_fraction", metrics.clip_fraction, global_step)?;
             logger.log_scalar("train/learning_rate", lr as f32, global_step)?;
-            logger.log_scalar("train/explained_variance", metrics.explained_variance, global_step)?;
+            logger.log_scalar(
+                "train/explained_variance",
+                metrics.explained_variance,
+                global_step,
+            )?;
             logger.log_scalar("train/total_loss", metrics.total_loss, global_step)?;
             logger.log_scalar("train/value_mean", metrics.value_mean, global_step)?;
             logger.log_scalar("train/returns_mean", metrics.returns_mean, global_step)?;
@@ -471,7 +521,11 @@ where
             let now = std::time::Instant::now();
             let interval_elapsed = now.duration_since(last_log_time).as_secs_f32();
             let interval_steps = (global_step - last_log_step) as f32;
-            let sps = if interval_elapsed > 0.0 { interval_steps / interval_elapsed } else { 0.0 };
+            let sps = if interval_elapsed > 0.0 {
+                interval_steps / interval_elapsed
+            } else {
+                0.0
+            };
             logger.log_scalar("perf/sps", sps, global_step)?;
 
             // Phase timing
@@ -485,8 +539,16 @@ where
             logger.log_scalar("perf/update_time", update_secs, global_step)?;
 
             if total_secs > 0.0 {
-                logger.log_scalar("perf/rollout_pct", rollout_secs / total_secs * 100.0, global_step)?;
-                logger.log_scalar("perf/update_pct", update_secs / total_secs * 100.0, global_step)?;
+                logger.log_scalar(
+                    "perf/rollout_pct",
+                    rollout_secs / total_secs * 100.0,
+                    global_step,
+                )?;
+                logger.log_scalar(
+                    "perf/update_pct",
+                    update_secs / total_secs * 100.0,
+                    global_step,
+                )?;
             }
 
             // Reset timing accumulators
@@ -516,7 +578,11 @@ where
                 logger.log_scalar("episode/length_mean", length_mean, global_step)?;
                 logger.log_scalar("episode/length_max", length_max, global_step)?;
                 logger.log_scalar("episode/length_min", length_min, global_step)?;
-                logger.log_scalar("episode/count", episodes_since_log.len() as f32, global_step)?;
+                logger.log_scalar(
+                    "episode/count",
+                    episodes_since_log.len() as f32,
+                    global_step,
+                )?;
 
                 episodes_since_log.clear();
             }
@@ -532,12 +598,27 @@ where
 
                     if !player_returns.is_empty() {
                         let mean = player_returns.iter().sum::<f32>() / player_returns.len() as f32;
-                        let max = player_returns.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let max = player_returns
+                            .iter()
+                            .cloned()
+                            .fold(f32::NEG_INFINITY, f32::max);
                         let min = player_returns.iter().cloned().fold(f32::INFINITY, f32::min);
 
-                        logger.log_scalar(&format!("episode/return_mean_p{}", player), mean, global_step)?;
-                        logger.log_scalar(&format!("episode/return_max_p{}", player), max, global_step)?;
-                        logger.log_scalar(&format!("episode/return_min_p{}", player), min, global_step)?;
+                        logger.log_scalar(
+                            &format!("episode/return_mean_p{}", player),
+                            mean,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            &format!("episode/return_max_p{}", player),
+                            max,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            &format!("episode/return_min_p{}", player),
+                            min,
+                            global_step,
+                        )?;
                     }
                 }
 
@@ -569,7 +650,11 @@ where
 
                 for player in 0..num_players_usize {
                     let win_rate = wins_per_player[player] as f32 / total_games as f32;
-                    logger.log_scalar(&format!("episode/win_rate_p{}", player), win_rate, global_step)?;
+                    logger.log_scalar(
+                        &format!("episode/win_rate_p{}", player),
+                        win_rate,
+                        global_step,
+                    )?;
                 }
 
                 let draw_rate = draws as f32 / total_games as f32;
@@ -593,7 +678,8 @@ where
                     recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
                 }
             } else {
-                episodes_since_checkpoint.iter().sum::<f32>() / episodes_since_checkpoint.len() as f32
+                episodes_since_checkpoint.iter().sum::<f32>()
+                    / episodes_since_checkpoint.len() as f32
             };
 
             let metadata = CheckpointMetadata {
@@ -611,7 +697,9 @@ where
                 env_name: E::NAME.to_string(),
             };
 
-            let checkpoint_path = checkpoint_manager.save(&model, &metadata)?;
+            // Disable auto-best when using challenger evaluation for multiplayer
+            let use_auto_best = !(config.challenger_eval && E::NUM_PLAYERS > 1);
+            let checkpoint_path = checkpoint_manager.save(&model, &metadata, use_auto_best)?;
 
             // Save optimizer state alongside model
             if let Err(e) = save_optimizer::<TrainingBackend, _, ActorCritic<TrainingBackend>>(
@@ -633,13 +721,123 @@ where
                 eprintln!("Warning: Failed to save RNG state: {}", e);
             }
 
-            progress.println(&format!(
-                "Saved checkpoint at step {} (avg return: {:.1}) -> {:?}",
-                global_step,
-                avg_return,
-                checkpoint_path.file_name().unwrap()
-            ));
+            // Challenger evaluation for multiplayer games
+            let challenger_win_rate: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1 {
+                let best_path = checkpoint_manager.best_checkpoint_path();
+                if best_path.exists() {
+                    // Run challenger evaluation
+                    match run_challenger_eval::<TrainingBackend, E>(
+                        &model,
+                        &best_path,
+                        config.challenger_games,
+                        config.challenger_threshold,
+                        &config,
+                        device,
+                        config.seed.wrapping_add(global_step as u64),
+                    ) {
+                        Ok(result) => {
+                            // Log metrics
+                            logger.log_scalar(
+                                "challenger/eval_time_ms",
+                                result.elapsed_ms as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/win_rate",
+                                result.win_rate as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/current_wins",
+                                result.current_wins as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/best_wins",
+                                result.best_wins as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/draws",
+                                result.draws as f32,
+                                global_step,
+                            )?;
+
+                            // Check if eval took >5% of checkpoint interval
+                            let checkpoint_interval_ms =
+                                last_checkpoint_time.elapsed().as_millis() as u64;
+                            if checkpoint_interval_ms > 0 {
+                                let eval_pct = (result.elapsed_ms as f64
+                                    / checkpoint_interval_ms as f64)
+                                    * 100.0;
+                                if eval_pct > 5.0 && !warned_challenger_eval_time {
+                                    progress.println(&format!(
+                                        "Warning: Challenger evaluation took {:.1}% of checkpoint interval (consider reducing challenger_games)",
+                                        eval_pct
+                                    ));
+                                    warned_challenger_eval_time = true;
+                                }
+                            }
+
+                            // Promote if win rate exceeds threshold
+                            if result.should_promote {
+                                if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path)
+                                {
+                                    eprintln!(
+                                        "Warning: Failed to promote checkpoint to best: {}",
+                                        e
+                                    );
+                                }
+                            }
+
+                            // Log current best step (after potential promotion)
+                            if let Some(best_step) = get_best_checkpoint_step(&best_path) {
+                                logger.log_scalar(
+                                    "challenger/best_step",
+                                    best_step as f32,
+                                    global_step,
+                                )?;
+                            }
+
+                            Some(result.win_rate)
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Challenger evaluation failed: {}", e);
+                            None
+                        }
+                    }
+                } else {
+                    // First checkpoint - becomes best automatically
+                    if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
+                        eprintln!("Warning: Failed to set initial best checkpoint: {}", e);
+                    }
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Log checkpoint save message
+            let checkpoint_msg = if let Some(win_rate) = challenger_win_rate {
+                format!(
+                    "Saved checkpoint at step {} (avg return: {:.1}, vs best: {:.1}%) -> {:?}",
+                    global_step,
+                    avg_return,
+                    win_rate * 100.0,
+                    checkpoint_path.file_name().unwrap()
+                )
+            } else {
+                format!(
+                    "Saved checkpoint at step {} (avg return: {:.1}) -> {:?}",
+                    global_step,
+                    avg_return,
+                    checkpoint_path.file_name().unwrap()
+                )
+            };
+            progress.println(&checkpoint_msg);
+
             last_checkpoint_step = global_step;
+            last_checkpoint_time = std::time::Instant::now();
             episodes_since_checkpoint.clear();
         }
 
@@ -657,7 +855,10 @@ where
 
     if !recent_returns.is_empty() {
         let avg_return: f32 = recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
-        println!("Final average return (last 100 episodes): {:.1}", avg_return);
+        println!(
+            "Final average return (last 100 episodes): {:.1}",
+            avg_return
+        );
     }
 
     Ok(())
@@ -714,10 +915,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
         // Fork mode: new run from checkpoint
         let checkpoint_dir = fork_path.clone();
         if !checkpoint_dir.exists() {
-            bail!(
-                "Checkpoint not found at {:?}. Cannot fork.",
-                checkpoint_dir
-            );
+            bail!("Checkpoint not found at {:?}. Cannot fork.", checkpoint_dir);
         }
         TrainingMode::Fork { checkpoint_dir }
     } else {
@@ -737,7 +935,10 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
 
             (config, run_dir, None)
         }
-        TrainingMode::Resume { run_dir, checkpoint_dir } => {
+        TrainingMode::Resume {
+            run_dir,
+            checkpoint_dir,
+        } => {
             // Load config from the run directory
             let config_path = run_dir.join("config.toml");
             let mut config = Config::load_from_path(&config_path)
@@ -827,29 +1028,28 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
     // Full static dispatch: VecEnv<CartPole> and VecEnv<ConnectFour> are separate types
     let seed = config.seed;
     match config.env.as_str() {
-        "cartpole" => {
-            run_training::<CartPole, _>(
-                mode,
-                config,
-                run_dir,
-                resumed_metadata,
-                &device,
-                running,
-                move |i| CartPole::new(seed + i as u64),
-            )
-        }
-        "connect_four" => {
-            run_training::<ConnectFour, _>(
-                mode,
-                config,
-                run_dir,
-                resumed_metadata,
-                &device,
-                running,
-                move |i| ConnectFour::new(seed + i as u64),
-            )
-        }
-        _ => bail!("Unknown environment '{}'. Supported: cartpole, connect_four", config.env),
+        "cartpole" => run_training::<CartPole, _>(
+            mode,
+            config,
+            run_dir,
+            resumed_metadata,
+            &device,
+            running,
+            move |i| CartPole::new(seed + i as u64),
+        ),
+        "connect_four" => run_training::<ConnectFour, _>(
+            mode,
+            config,
+            run_dir,
+            resumed_metadata,
+            &device,
+            running,
+            move |i| ConnectFour::new(seed + i as u64),
+        ),
+        _ => bail!(
+            "Unknown environment '{}'. Supported: cartpole, connect_four",
+            config.env
+        ),
     }
 }
 

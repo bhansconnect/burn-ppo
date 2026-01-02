@@ -19,8 +19,8 @@ pub fn sample_categorical<B: Backend>(
     let uniform: Vec<f32> = (0..batch * num_actions)
         .map(|_| rng.gen_range(1e-10_f32..1.0_f32))
         .collect();
-    let uniform = Tensor::<B, 1>::from_floats(uniform.as_slice(), device)
-        .reshape([batch, num_actions]);
+    let uniform =
+        Tensor::<B, 1>::from_floats(uniform.as_slice(), device).reshape([batch, num_actions]);
 
     let gumbel = -(-uniform.log()).log();
 
@@ -53,7 +53,7 @@ pub fn entropy_categorical<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 1> {
     profile_scope!("async_entropy_categorical");
     let log_probs = burn::tensor::activation::log_softmax(logits, 1);
     let probs = log_probs.clone().exp(); // Derive probs from log_probs (avoids redundant softmax)
-    // sum_dim(1) returns [batch, 1], squeeze dim 1 to get [batch]
+                                         // sum_dim(1) returns [batch, 1], squeeze dim 1 to get [batch]
     -(probs * log_probs).sum_dim(1).squeeze_dims(&[1])
 }
 
@@ -106,8 +106,7 @@ mod tests {
         let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
         // Heavily biased towards action 2
-        let logits: Tensor<TestBackend, 2> =
-            Tensor::from_floats([[0.0, 0.0, 100.0, 0.0]], &device);
+        let logits: Tensor<TestBackend, 2> = Tensor::from_floats([[0.0, 0.0, 100.0, 0.0]], &device);
         let actions = sample_categorical(logits, &mut rng, &device);
 
         let action: i64 = actions.into_scalar();

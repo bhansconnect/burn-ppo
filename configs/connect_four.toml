@@ -3,15 +3,15 @@
 
 # Environment
 env = "connect_four"
-num_envs = "auto"
-num_steps = 128
+num_envs = 32
+num_steps = 32
 
 # PPO hyperparameters
 learning_rate = 0.0003   # Standard PPO default
 lr_anneal = true         # Decay learning rate over training
 gamma = 0.99             # Discount factor
 gae_lambda = 0.95        # GAE smoothing
-clip_epsilon = 0.2       # PPO clip range
+clip_epsilon = 0.1       # PPO clip range
 clip_value = true        # Value function clipping
 entropy_coef = 0.05      # Higher entropy for exploration in discrete game
 entropy_anneal = true    # Decay entropy over training
@@ -40,3 +40,7 @@ log_freq = 5_000
 
 # Experiment
 seed = 42
+
+challenger_eval = true
+challenger_games = 64
+challenger_threshold = 0.55

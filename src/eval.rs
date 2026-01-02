@@ -21,6 +21,7 @@ use crate::config::{Config, EvalArgs};
 use crate::dispatch_env;
 use crate::env::{Environment, GameOutcome, VecEnv};
 use crate::network::ActorCritic;
+use crate::profile::profile_function;
 
 /// Temperature schedule for action sampling
 ///
@@ -476,6 +477,23 @@ impl EvalStats {
     }
 }
 
+/// Result of challenger evaluation between current model and best checkpoint
+#[derive(Debug, Clone)]
+pub struct ChallengerResult {
+    /// Wins for the current (challenger) model
+    pub current_wins: usize,
+    /// Wins for the best checkpoint model
+    pub best_wins: usize,
+    /// Draw count
+    pub draws: usize,
+    /// Win rate for current model (0.0 - 1.0)
+    pub win_rate: f64,
+    /// Whether current model should be promoted to best
+    pub should_promote: bool,
+    /// Time taken for evaluation in milliseconds
+    pub elapsed_ms: u64,
+}
+
 /// Get ordinal suffix (1st, 2nd, 3rd, 4th, ...)
 fn ordinal(n: usize) -> String {
     let suffix = match n % 10 {
@@ -509,6 +527,93 @@ fn load_model_from_checkpoint<B: Backend>(
     let (model, _) = CheckpointManager::load::<B>(checkpoint_path, &config, device)?;
 
     Ok((model, metadata))
+}
+
+/// Run challenger evaluation: current model vs best checkpoint
+///
+/// Plays `num_games` games between the current model and the best checkpoint,
+/// with position swapping for fairness in 2-player games.
+///
+/// Returns a `ChallengerResult` indicating whether the current model should be promoted.
+pub fn run_challenger_eval<B: Backend, E: Environment>(
+    current_model: &ActorCritic<B>,
+    best_checkpoint_path: &Path,
+    num_games: usize,
+    threshold: f64,
+    config: &Config,
+    device: &B::Device,
+    seed: u64,
+) -> Result<ChallengerResult> {
+    profile_function!();
+    let start = Instant::now();
+    let num_players = E::NUM_PLAYERS;
+
+    // Load best checkpoint model
+    let best_config = Config {
+        hidden_size: config.hidden_size,
+        num_hidden: config.num_hidden,
+        ..Config::default()
+    };
+    let (best_model, _) = CheckpointManager::load::<B>(best_checkpoint_path, &best_config, device)?;
+
+    // Setup models and checkpoint mapping
+    // models = [new, best], checkpoint_to_model = [0, 1, 1, 1, ...]
+    // This means: checkpoint 0 = new model, checkpoints 1..N-1 = best model
+    let models = vec![current_model.clone(), best_model];
+    let checkpoint_to_model: Vec<usize> = (0..num_players)
+        .map(|i| if i == 0 { 0 } else { 1 })
+        .collect();
+    let names: Vec<String> = (0..num_players)
+        .map(|i| if i == 0 { "new".into() } else { "best".into() })
+        .collect();
+
+    // Create temperature schedule from config
+    let temp_schedule = TempSchedule::new(
+        config.challenger_temperature,
+        config.challenger_temp_final.unwrap_or(0.0),
+        config.challenger_temp_cutoff,
+        config.challenger_temp_decay,
+    );
+
+    // Run games - stats mode handles position permutations
+    let num_envs = num_games.min(64);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let stats = run_stats_mode_env::<B, E>(
+        &models,
+        &checkpoint_to_model,
+        &names,
+        num_games,
+        num_envs,
+        &temp_schedule,
+        &mut rng,
+        device,
+        true, // silent
+    )?;
+
+    // Extract stats for checkpoint 0 (the "new" model)
+    let current_wins = stats.wins[0];
+    let best_wins = stats.losses[0];
+    let draws = stats.draws;
+
+    // Tie value = 1/N for N-player games
+    let tie_value = 1.0 / num_players as f64;
+    let total = (current_wins + best_wins + draws) as f64;
+    let win_rate = if total > 0.0 {
+        (current_wins as f64 + tie_value * draws as f64) / total
+    } else {
+        tie_value // Expected value if no games played
+    };
+
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    Ok(ChallengerResult {
+        current_wins,
+        best_wins,
+        draws,
+        win_rate,
+        should_promote: win_rate > threshold,
+        elapsed_ms,
+    })
 }
 
 /// Run evaluation based on command-line arguments
@@ -807,6 +912,7 @@ fn run_stats_mode<B: Backend>(
     let temp_schedule = TempSchedule::from_args(args)?;
 
     // Dispatch based on env_name stored in checkpoint metadata
+    // Stats are printed inside run_stats_mode_env when not silent
     dispatch_env!(metadata.env_name, {
         run_stats_mode_env::<B, E>(
             models,
@@ -817,11 +923,16 @@ fn run_stats_mode<B: Backend>(
             &temp_schedule,
             &mut rng,
             device,
+            false, // not silent - print progress and summary
         )
+        .map(|_| ()) // Discard stats, they were already printed
     })
 }
 
 /// Stats mode implementation for a specific environment type
+///
+/// When `silent` is true, suppresses output (used by challenger eval).
+/// Returns EvalStats for further processing.
 fn run_stats_mode_env<B: Backend, E: Environment>(
     models: &[ActorCritic<B>],
     checkpoint_to_model: &[usize],
@@ -831,40 +942,36 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
     temp_schedule: &TempSchedule,
     rng: &mut StdRng,
     device: &B::Device,
-) -> Result<()> {
+    silent: bool,
+) -> Result<EvalStats> {
     use rand::RngCore;
     let num_players = E::NUM_PLAYERS;
+    let num_checkpoints = checkpoint_to_model.len();
     let obs_dim = E::OBSERVATION_DIM;
     let action_count = E::ACTION_COUNT;
-
-    // For 2-player games, swap positions every other game for fairness
-    let swap_positions = num_players == 2;
 
     // Create vectorized environment with unique seeds per env
     let base_seed = rng.next_u64();
     let mut vec_env: VecEnv<E> =
         VecEnv::new(num_envs, |i| E::new(base_seed.wrapping_add(i as u64)));
-    let mut stats = EvalStats::new(num_players);
+    let mut stats = EvalStats::new(num_checkpoints);
 
     // Track move counts per environment (for temperature schedule)
     let mut move_counts = vec![0usize; num_envs];
 
-    // Track which position each checkpoint is in per environment
-    // For position swapping: positions[env_idx][checkpoint_idx] = player_idx
-    let mut positions: Vec<Vec<usize>> = (0..num_envs)
-        .map(|env_idx| {
-            if swap_positions && env_idx % 2 == 1 {
-                vec![1, 0] // Swapped
-            } else {
-                (0..num_players).collect() // Normal
-            }
-        })
+    // Track permutation offset per environment for position rotation
+    // checkpoint i plays as player (i + perm_offset) % num_players
+    // This rotates all checkpoints through all positions for fairness
+    let mut perm_offsets: Vec<usize> = (0..num_envs)
+        .map(|env_idx| env_idx % num_players)
         .collect();
 
-    println!(
-        "Running {} games across {} parallel environments...",
-        num_games, num_envs
-    );
+    if !silent {
+        println!(
+            "Running {} games across {} parallel environments...",
+            num_games, num_envs
+        );
+    }
 
     let mut games_completed = 0;
 
@@ -897,10 +1004,10 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
 
                 let current_player = current_players[env_idx];
                 // Which checkpoint controls this player position in this env?
-                let checkpoint_for_player = positions[env_idx]
-                    .iter()
-                    .position(|&p| p == current_player)
-                    .unwrap_or(current_player);
+                // checkpoint i plays as player (i + perm_offset) % num_players
+                // So checkpoint_for_player = (player - perm_offset + num_players) % num_players
+                let checkpoint_for_player =
+                    (current_player + num_players - perm_offsets[env_idx]) % num_players;
 
                 // Check if this checkpoint uses the current model (supports deduplication)
                 if checkpoint_to_model[checkpoint_for_player] == model_idx {
@@ -967,18 +1074,17 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
 
             // Use the env_index from the completed episode
             let env_idx = ep.env_index;
+            let perm_offset = perm_offsets[env_idx];
 
-            let mut checkpoint_rewards = vec![0.0f32; num_players];
-            for (player_idx, &reward) in ep.total_rewards.iter().enumerate() {
-                // Which checkpoint was at this player position?
-                let checkpoint_idx = positions[env_idx]
-                    .iter()
-                    .position(|&p| p == player_idx)
-                    .unwrap_or(player_idx);
-                checkpoint_rewards[checkpoint_idx] = reward;
+            // Map player rewards to checkpoint rewards using permutation offset
+            // checkpoint i was at player position (i + perm_offset) % num_players
+            let mut checkpoint_rewards = vec![0.0f32; num_checkpoints];
+            for checkpoint_idx in 0..num_checkpoints {
+                let player_idx = (checkpoint_idx + perm_offset) % num_players;
+                checkpoint_rewards[checkpoint_idx] = ep.total_rewards[player_idx];
             }
 
-            // Create a dummy env to check game_outcome (won't have the actual state)
+            // Determine outcome from checkpoint rewards
             let outcome = {
                 let placements = rewards_to_placements(&checkpoint_rewards);
                 let first_count = placements.iter().filter(|&&p| p == 1).count();
@@ -994,19 +1100,12 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
 
             stats.record_with_rewards(&outcome, &checkpoint_rewards, ep.length);
 
-            // Reset move count and swap positions for this env
+            // Reset move count and rotate to next permutation for fairness
             move_counts[env_idx] = 0;
-            if swap_positions {
-                // Toggle between normal and swapped
-                positions[env_idx] = if positions[env_idx] == vec![0, 1] {
-                    vec![1, 0]
-                } else {
-                    vec![0, 1]
-                };
-            }
+            perm_offsets[env_idx] = (perm_offset + 1) % num_players;
 
             // Progress indicator
-            if games_completed % 100 == 0 {
+            if !silent && games_completed % 100 == 0 {
                 println!("  {} / {} games completed", games_completed, num_games);
             }
         }
@@ -1044,9 +1143,11 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
         }
     }
 
-    stats.print_summary(checkpoint_names);
+    if !silent {
+        stats.print_summary(checkpoint_names);
+    }
 
-    Ok(())
+    Ok(stats)
 }
 
 #[cfg(test)]

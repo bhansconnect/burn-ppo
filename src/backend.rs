@@ -4,7 +4,6 @@
 /// - `cargo run --release` → WGPU (default, cross-platform)
 /// - `cargo run --release --features cuda` → CUDA (NVIDIA GPUs)
 /// - `cargo run --release --features libtorch` → LibTorch (PyTorch)
-
 use burn::backend::Autodiff;
 
 // CUDA backend (highest priority)

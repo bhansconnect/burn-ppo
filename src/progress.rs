@@ -1,7 +1,6 @@
 /// Progress bar for training visualization
 ///
 /// Uses indicatif for progress display with ETA and metrics.
-
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Instant;
 
@@ -55,10 +54,8 @@ impl TrainingProgress {
             0.0
         };
 
-        self.main_bar.set_message(format!(
-            "SPS: {:.0} | Return: {:.1}",
-            sps, avg_return
-        ));
+        self.main_bar
+            .set_message(format!("SPS: {:.0} | Return: {:.1}", sps, avg_return));
     }
 
     /// Update with multiplayer statistics

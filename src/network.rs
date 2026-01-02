@@ -21,12 +21,15 @@ fn create_linear_orthogonal<B: Backend>(
 ) -> nn::Linear<B> {
     // Orthogonal initialization for weights (2D tensor)
     // init_with returns Param<Tensor<B, D>> directly
-    let weight = Initializer::Orthogonal { gain }
-        .init_with([d_input, d_output], Some(d_input), Some(d_output), device);
+    let weight = Initializer::Orthogonal { gain }.init_with(
+        [d_input, d_output],
+        Some(d_input),
+        Some(d_output),
+        device,
+    );
 
     // Zero initialization for biases (1D tensor)
-    let bias = Initializer::Zeros
-        .init_with([d_output], Some(d_input), Some(d_output), device);
+    let bias = Initializer::Zeros.init_with([d_output], Some(d_input), Some(d_output), device);
 
     nn::Linear {
         weight,
@@ -81,7 +84,12 @@ impl<B: Backend> ActorCritic<B> {
         let mut in_size = obs_dim;
 
         for _ in 0..num_hidden {
-            layers.push(create_linear_orthogonal(in_size, hidden_size, hidden_gain, device));
+            layers.push(create_linear_orthogonal(
+                in_size,
+                hidden_size,
+                hidden_gain,
+                device,
+            ));
             in_size = hidden_size;
         }
 

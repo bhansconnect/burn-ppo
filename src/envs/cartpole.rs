@@ -2,7 +2,6 @@
 ///
 /// Physics based on OpenAI Gym CartPole-v1
 /// Goal: Balance a pole on a cart by pushing left or right
-
 use rand::Rng;
 
 use crate::env::Environment;
@@ -66,9 +65,7 @@ impl CartPole {
 
     /// Check if episode should terminate
     fn is_terminal(&self) -> bool {
-        self.x.abs() > X_THRESHOLD
-            || self.theta.abs() > THETA_THRESHOLD
-            || self.steps >= MAX_STEPS
+        self.x.abs() > X_THRESHOLD || self.theta.abs() > THETA_THRESHOLD || self.steps >= MAX_STEPS
     }
 
     /// Get state as observation vector
@@ -478,11 +475,20 @@ mod tests {
         let output = env.render().unwrap();
         let header = output.lines().next().unwrap();
 
-        assert!(header.contains("Step:  42"), "Header should show step count");
+        assert!(
+            header.contains("Step:  42"),
+            "Header should show step count"
+        );
         assert!(header.contains("x:  1.50"), "Header should show x position");
         assert!(header.contains("v:  0.25"), "Header should show velocity");
-        assert!(header.contains("θ:  5.7°"), "Header should show angle in degrees");
-        assert!(header.contains("ω: -0.30"), "Header should show angular velocity");
+        assert!(
+            header.contains("θ:  5.7°"),
+            "Header should show angle in degrees"
+        );
+        assert!(
+            header.contains("ω: -0.30"),
+            "Header should show angular velocity"
+        );
     }
 
     #[test]
@@ -498,7 +504,8 @@ mod tests {
         // Find cart top left corner (┌) and right corner (┐)
         let cart_line_idx = 7; // Cart top is line 7 (0=header, 1=blank, 2-6=pole, 7=cart)
         let left = find_char_col(&output, cart_line_idx, '┌').expect("Cart left corner not found");
-        let right = find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
+        let right =
+            find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
 
         let cart_center = (left + right) / 2;
         let expected_center = 30; // WIDTH/2
@@ -541,7 +548,8 @@ mod tests {
         let output = env.render().unwrap();
 
         let cart_line_idx = 7;
-        let right = find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
+        let right =
+            find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
 
         // Cart should be near right side (column > 45 for WIDTH=60)
         assert!(
@@ -637,7 +645,10 @@ mod tests {
         let output = env.render().unwrap();
 
         let track_line_idx = 9; // Track is line 9
-        let track_line = output.lines().nth(track_line_idx).expect("Track line missing");
+        let track_line = output
+            .lines()
+            .nth(track_line_idx)
+            .expect("Track line missing");
 
         // Track should have ═ characters
         assert!(
@@ -679,7 +690,8 @@ mod tests {
         // Cart should be right of center
         let cart_line_idx = 7;
         let left = find_char_col(&output, cart_line_idx, '┌').expect("Cart left corner not found");
-        let right = find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
+        let right =
+            find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
         let cart_center = (left + right) / 2;
 
         assert!(

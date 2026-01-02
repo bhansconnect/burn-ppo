@@ -4,7 +4,6 @@
 /// - Atomic writes (temp file + rename)
 /// - `latest` symlink to most recent checkpoint
 /// - `best` symlink to highest avg return checkpoint
-
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -70,7 +69,6 @@ fn default_num_hidden() -> usize {
     2
 }
 
-
 /// Manages checkpointing for a training run
 pub struct CheckpointManager {
     checkpoints_dir: PathBuf,
@@ -91,17 +89,24 @@ impl CheckpointManager {
 
     /// Save a checkpoint with atomic write
     ///
+    /// If `update_best` is true, updates the "best" symlink if this checkpoint
+    /// has a higher avg_return than the previous best. Set to false when using
+    /// challenger evaluation to control best selection manually.
+    ///
     /// Returns the path to the saved checkpoint directory
     pub fn save<B: burn::tensor::backend::Backend>(
         &mut self,
         model: &ActorCritic<B>,
         metadata: &CheckpointMetadata,
+        update_best: bool,
     ) -> Result<PathBuf> {
         let checkpoint_name = format!("step_{:08}", metadata.step);
         let checkpoint_dir = self.checkpoints_dir.join(&checkpoint_name);
 
         // Create temp directory for atomic write
-        let temp_dir = self.checkpoints_dir.join(format!(".tmp_{}", checkpoint_name));
+        let temp_dir = self
+            .checkpoints_dir
+            .join(format!(".tmp_{}", checkpoint_name));
         fs::create_dir_all(&temp_dir)?;
 
         // Save model using Burn's recorder
@@ -126,8 +131,8 @@ impl CheckpointManager {
         // Update latest symlink
         self.update_symlink("latest", &checkpoint_dir)?;
 
-        // Update best symlink if this is a new best
-        if metadata.avg_return > self.best_avg_return {
+        // Update best symlink if this is a new best (and auto-update is enabled)
+        if update_best && metadata.avg_return > self.best_avg_return {
             self.best_avg_return = metadata.avg_return;
             self.update_symlink("best", &checkpoint_dir)?;
         }
@@ -145,14 +150,26 @@ impl CheckpointManager {
     ) -> Result<(ActorCritic<B>, CheckpointMetadata)> {
         // Load metadata
         let metadata_path = checkpoint_dir.join("metadata.json");
-        let metadata_json = fs::read_to_string(&metadata_path)
-            .context("Failed to read checkpoint metadata")?;
+        let metadata_json =
+            fs::read_to_string(&metadata_path).context("Failed to read checkpoint metadata")?;
         let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
 
         // Use dimensions from metadata if available, otherwise fall back to CartPole defaults
-        let obs_dim = if metadata.obs_dim > 0 { metadata.obs_dim } else { 4 };
-        let action_count = if metadata.action_count > 0 { metadata.action_count } else { 2 };
-        let num_players = if metadata.num_players > 0 { metadata.num_players } else { 1 };
+        let obs_dim = if metadata.obs_dim > 0 {
+            metadata.obs_dim
+        } else {
+            4
+        };
+        let action_count = if metadata.action_count > 0 {
+            metadata.action_count
+        } else {
+            2
+        };
+        let num_players = if metadata.num_players > 0 {
+            metadata.num_players
+        } else {
+            1
+        };
         let default_model: ActorCritic<B> =
             ActorCritic::new(obs_dim, action_count, num_players, config, device);
 
@@ -200,6 +217,22 @@ impl CheckpointManager {
     /// Set the best average return (used when resuming)
     pub fn set_best_avg_return(&mut self, value: f32) {
         self.best_avg_return = value;
+    }
+
+    /// Manually promote a checkpoint to best
+    ///
+    /// Used by challenger evaluation to update best based on head-to-head win rate
+    /// rather than average return.
+    pub fn promote_to_best(&mut self, checkpoint_dir: &Path) -> Result<()> {
+        self.update_symlink("best", checkpoint_dir)
+    }
+
+    /// Get the full path to the best checkpoint symlink
+    ///
+    /// Returns the path to the "best" symlink (not the resolved target).
+    /// Use this to check if a best checkpoint exists.
+    pub fn best_checkpoint_path(&self) -> PathBuf {
+        self.checkpoints_dir.join("best")
     }
 
     /// Update a symlink atomically
@@ -306,11 +339,13 @@ pub fn load_rng_state(checkpoint_dir: &Path) -> Result<Option<rand::rngs::StdRng
         return Ok(None);
     }
 
-    let seed_bytes = fs::read(&rng_path)
-        .context("Failed to read RNG state")?;
+    let seed_bytes = fs::read(&rng_path).context("Failed to read RNG state")?;
 
     if seed_bytes.len() != 32 {
-        anyhow::bail!("Invalid RNG state file: expected 32 bytes, got {}", seed_bytes.len());
+        anyhow::bail!(
+            "Invalid RNG state file: expected 32 bytes, got {}",
+            seed_bytes.len()
+        );
     }
 
     let mut seed = [0u8; 32];
@@ -328,8 +363,7 @@ pub fn load_normalizer(checkpoint_dir: &Path) -> Result<Option<ObsNormalizer>> {
         return Ok(None);
     }
 
-    let json = fs::read_to_string(&normalizer_path)
-        .context("Failed to read normalizer")?;
+    let json = fs::read_to_string(&normalizer_path).context("Failed to read normalizer")?;
     let normalizer: ObsNormalizer = serde_json::from_str(&json)?;
     Ok(Some(normalizer))
 }
@@ -374,7 +408,7 @@ mod tests {
             env_name: "cartpole".to_string(),
         };
 
-        let checkpoint_path = manager.save(&model, &metadata).unwrap();
+        let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
         assert!(checkpoint_path.exists());
 
         // Verify latest symlink
@@ -420,6 +454,7 @@ mod tests {
                     forked_from: None,
                     env_name: "cartpole".to_string(),
                 },
+                true,
             )
             .unwrap();
 
@@ -441,6 +476,7 @@ mod tests {
                     forked_from: None,
                     env_name: "cartpole".to_string(),
                 },
+                true,
             )
             .unwrap();
 
@@ -462,6 +498,7 @@ mod tests {
                     forked_from: None,
                     env_name: "cartpole".to_string(),
                 },
+                true,
             )
             .unwrap();
 
