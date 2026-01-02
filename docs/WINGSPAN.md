@@ -659,11 +659,43 @@ The Settlers paper confirms action masking is essential: they add negative infin
 
 | Settlers Approach | Applies to Wingspan? | Rationale |
 |-------------------|---------------------|-----------|
-| MAPPO / Global Critic | No | Useful for cooperative games; Wingspan is competitive |
+| MAPPO (as originally designed) | Partially | Original MAPPO is cooperative; see "Global Critic" section below |
 | Value function normalization (fixed mean/std) | No | Standard advantage normalization is sufficient |
 | Recurrent trading heads | No | Wingspan trading is simpler (no negotiation) |
 | Semi-async distributed PPO | No | Vectorized sync PPO is simpler and sufficient |
 | Forward search (MCTS) | Maybe later | Nice-to-have for stronger play, not essential initially |
+
+### Global Critic for Competitive Games (CTDE)
+
+> **Update**: Recent research (2022-2024) proves that centralized critics work for competitive zero-sum games,
+> contradicting the earlier Settlers-based assessment. Key papers:
+> - [Cen et al. 2022](https://arxiv.org/abs/2210.01050): Entropy-regularized OMWU with **simultaneous symmetric updates**
+> - [Alacaoglu et al. 2022](https://proceedings.mlr.press/v162/alacaoglu22a.html): Natural Actor-Critic for zero-sum Markov games
+
+**The CTDE Paradigm (Centralized Training, Decentralized Execution):**
+
+| Component | Training | Execution |
+|-----------|----------|-----------|
+| Critic (Value) | Sees global state (all players' info) | Not used |
+| Policy (Actor) | Sees only local observation | Sees only local observation |
+
+**Why This Works for Zero-Sum:**
+- For two-player zero-sum: V₂*(s) = -V₁*(s) (values are exact opposites)
+- A single omniscient critic can compute both players' values
+- Simultaneous updates provably converge to Nash equilibrium (Cen 2022, Alacaoglu 2022)
+- No need to freeze one player while training the other
+
+**Theoretical Guarantees:**
+- Cen et al.: Õ(|S|/(1-γ)⁵·ε) complexity, last-iterate linear convergence
+- Alacaoglu et al.: Sample complexity matches single-agent RL
+
+**Caveats for Wingspan:**
+1. **N-player complexity**: Proofs are for 2-player; Wingspan has 1-5 players
+2. **Not strictly zero-sum**: Wingspan scores aren't exact opposites (your gain ≠ others' loss)
+3. **Implementation complexity**: Global critic needs all players' hidden info during training
+
+**Recommendation**: Consider CTDE for 2-player Wingspan variant first. For N-player,
+historical opponent sampling (Settlers approach) may be simpler with comparable results.
 
 ### Network Architecture Sketch
 
@@ -684,7 +716,7 @@ Backbone (shared) → [Action Type Head]   → Softmax × Mask
                  ├─ [Food Payment]       → Multi-head × Mask
                  └─ [Egg Distribution]   → Iterative assignment
 
-Value Head → [batch, 1] (single-player framing)
+Value Head → [batch, num_players] or omniscient [batch, 1] with CTDE
 ```
 
 This modular design allows:
@@ -701,4 +733,4 @@ This modular design allows:
 | Attention for variable structures | High | Cards, birds on mat |
 | Historical opponent sampling | Medium | For Phase 4+ self-play |
 | Dense reward shaping | Medium | Score delta approach already planned |
-| MAPPO / Global critic | Skip | Not needed for competitive games |
+| Global Critic (CTDE) | Medium | Proven for 2-player zero-sum; N-player Wingspan needs more research |
