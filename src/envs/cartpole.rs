@@ -99,13 +99,169 @@ impl Environment for CartPole {
     }
 
     fn render(&self) -> Option<String> {
-        Some(format!(
-            "x={:.3} | v={:.3} | \u{03b8}={:.1}\u{00b0} | \u{03c9}={:.2}",
+        // ASCII visualization of CartPole
+        //
+        // Layout (60 chars wide):
+        //   Row 0: Header with numeric values
+        //   Row 1: Empty
+        //   Rows 2-6: Pole (5 chars tall, bottom to top)
+        //   Row 7: Cart top edge
+        //   Row 8: Cart bottom edge
+        //   Row 9: Track with wheels
+        //   Row 10: Position scale
+
+        const WIDTH: usize = 60;
+        const CART_WIDTH: usize = 9;
+        const POLE_HEIGHT: usize = 5;
+
+        // Buffer rows: 0=pole_top, 4=pole_bottom, 5=cart_top, 6=cart_bottom, 7=track
+        let mut buffer = vec![vec![' '; WIDTH]; 8];
+
+        // Row indices in buffer
+        const CART_TOP: usize = 5;
+        const CART_BOTTOM: usize = 6;
+        const TRACK: usize = 7;
+
+        // Calculate cart center position
+        // x ranges from -2.4 to 2.4, map to screen coordinates
+        let margin = CART_WIDTH / 2 + 3;
+        let usable_width = WIDTH - 2 * margin;
+        let x_clamped = self.x.clamp(-2.4, 2.4);
+        let x_normalized = (x_clamped + 2.4) / 4.8; // 0.0 to 1.0
+        let cart_center = margin + (x_normalized * usable_width as f32) as usize;
+
+        // Draw track
+        for x in 0..WIDTH {
+            buffer[TRACK][x] = '═';
+        }
+
+        // Draw cart body
+        let cart_left = cart_center.saturating_sub(CART_WIDTH / 2);
+        let cart_right = (cart_center + CART_WIDTH / 2).min(WIDTH - 1);
+
+        // Top of cart: ┌───────┐
+        if cart_left < WIDTH {
+            buffer[CART_TOP][cart_left] = '┌';
+        }
+        if cart_right < WIDTH {
+            buffer[CART_TOP][cart_right] = '┐';
+        }
+        for x in (cart_left + 1)..cart_right {
+            buffer[CART_TOP][x] = '─';
+        }
+
+        // Bottom of cart: └───────┘
+        if cart_left < WIDTH {
+            buffer[CART_BOTTOM][cart_left] = '└';
+        }
+        if cart_right < WIDTH {
+            buffer[CART_BOTTOM][cart_right] = '┘';
+        }
+        for x in (cart_left + 1)..cart_right {
+            buffer[CART_BOTTOM][x] = '─';
+        }
+
+        // Wheels on track: ═══○═══○═══
+        let wheel_offset = 2;
+        let wheel_left = cart_left + wheel_offset;
+        let wheel_right = cart_right.saturating_sub(wheel_offset);
+        if wheel_left < WIDTH {
+            buffer[TRACK][wheel_left] = '○';
+        }
+        if wheel_right < WIDTH && wheel_right > wheel_left {
+            buffer[TRACK][wheel_right] = '○';
+        }
+
+        // Draw pole from cart center going upward
+        // Pivot point is top-center of cart
+        let pivot_col = cart_center as f32;
+
+        // Character aspect ratio: terminal chars are ~2x taller than wide
+        // Horizontal offset = vertical_distance * tan(theta) * aspect_ratio
+        let aspect_ratio = 2.0_f32;
+
+        // Track column positions for each pole segment (bottom to top)
+        let mut pole_cols: Vec<i32> = Vec::with_capacity(POLE_HEIGHT);
+        for i in 0..POLE_HEIGHT {
+            let vertical_dist = (i + 1) as f32;
+            let h_offset = vertical_dist * self.theta.tan() * aspect_ratio;
+            pole_cols.push((pivot_col + h_offset).round() as i32);
+        }
+
+        // Draw pole segments from bottom (near cart) to top
+        for (i, &col) in pole_cols.iter().enumerate() {
+            let row = CART_TOP - 1 - i; // Start just above cart top
+
+            if col >= 0 && (col as usize) < WIDTH {
+                let col_usize = col as usize;
+
+                let pole_char = if i == POLE_HEIGHT - 1 {
+                    // Top of pole - ball
+                    '●'
+                } else {
+                    // Determine character based on direction to next segment
+                    let next_col = pole_cols[i + 1];
+                    let delta = next_col - col;
+
+                    if delta > 0 {
+                        '╱' // Moving right going up = / slope (bottom-left to top-right)
+                    } else if delta < 0 {
+                        '╲' // Moving left going up = \ slope (bottom-right to top-left)
+                    } else {
+                        '│' // Next segment is directly above (vertical)
+                    }
+                };
+
+                buffer[row][col_usize] = pole_char;
+            }
+        }
+
+        // Build output string
+        let mut lines = Vec::with_capacity(11);
+
+        // Header with numeric values
+        lines.push(format!(
+            " Step:{:4} │ x:{:6.2}  v:{:6.2} │ θ:{:5.1}°  ω:{:6.2}",
+            self.steps,
             self.x,
             self.x_dot,
             self.theta.to_degrees(),
             self.theta_dot
-        ))
+        ));
+        lines.push(String::new());
+
+        // Add visual buffer rows
+        for row in &buffer {
+            lines.push(row.iter().collect());
+        }
+
+        // Scale line showing position bounds
+        let mut scale = vec![' '; WIDTH];
+        // Left bound: -2.4 at x=0 position
+        let left_pos = margin;
+        for (i, c) in "-2.4".chars().enumerate() {
+            if left_pos + i < WIDTH {
+                scale[left_pos + i] = c;
+            }
+        }
+        // Center: 0
+        let center_pos = margin + usable_width / 2;
+        if center_pos < WIDTH {
+            scale[center_pos] = '0';
+        }
+        // Right bound: 2.4 at x=2.4 position
+        let right_pos = margin + usable_width;
+        if right_pos >= 3 {
+            for (i, c) in "2.4".chars().enumerate() {
+                let pos = right_pos - 3 + i;
+                if pos < WIDTH {
+                    scale[pos] = c;
+                }
+            }
+        }
+        lines.push(scale.iter().collect());
+
+        Some(lines.join("\n"))
     }
 
     fn reset(&mut self) -> Vec<f32> {
@@ -260,41 +416,306 @@ mod tests {
         assert_eq!(state, [0.5, 1.0, 0.1, -0.5]);
     }
 
-    #[test]
-    fn test_cartpole_render() {
+    // =========================================================================
+    // ASCII Render Tests
+    // =========================================================================
+    //
+    // The render output looks like:
+    //
+    //  Step:   0 │ x:  0.00  v:  0.00 │ θ:  0.0°  ω:  0.00
+    //
+    //                            ●
+    //                            │
+    //                            │
+    //                            │
+    //                            │
+    //                       ┌─────────┐
+    // ══════════════════════╪══○═══○══╪═════════════════════════════════════
+    //                       └─────────┘
+    //       -2.4                 0                                      2.4
+
+    /// Helper to set up an environment with specific state for render testing
+    fn setup_render_env(x: f32, theta: f32) -> CartPole {
         let mut env = CartPole::new(42);
         env.reset();
+        env.x = x;
+        env.x_dot = 0.0;
+        env.theta = theta;
+        env.theta_dot = 0.0;
+        env.steps = 0;
+        env
+    }
 
-        // Set known state for predictable output
-        env.x = 1.5;
-        env.x_dot = 0.25;
-        env.theta = 0.1; // ~5.7 degrees
-        env.theta_dot = -0.3;
+    /// Helper to find the column of a character in a specific line
+    fn find_char_col(output: &str, line_idx: usize, ch: char) -> Option<usize> {
+        output
+            .lines()
+            .nth(line_idx)
+            .and_then(|line| line.chars().position(|c| c == ch))
+    }
 
-        let rendered = env.render();
-        assert!(rendered.is_some());
-
-        let output = rendered.unwrap();
-        // Check that state values appear in output
-        assert!(output.contains("x=1.500"));
-        assert!(output.contains("v=0.250"));
-        // Theta should be converted to degrees (~5.7)
-        assert!(output.contains("θ="));
-        assert!(output.contains("ω="));
+    /// Helper to check if a line contains a character
+    fn line_contains(output: &str, line_idx: usize, ch: char) -> bool {
+        output
+            .lines()
+            .nth(line_idx)
+            .map(|line| line.contains(ch))
+            .unwrap_or(false)
     }
 
     #[test]
-    fn test_cartpole_render_format() {
-        let mut env = CartPole::new(42);
-        env.reset();
+    fn test_render_header_contains_values() {
+        // Test: Header line shows all state values
+        //
+        // Expected format:
+        //  Step:  42 │ x:  1.50  v:  0.25 │ θ:  5.7°  ω: -0.30
 
-        env.x = 0.0;
-        env.x_dot = 0.0;
-        env.theta = std::f32::consts::PI / 6.0; // 30 degrees
-        env.theta_dot = 0.0;
+        let mut env = setup_render_env(1.5, 0.1); // 0.1 rad ≈ 5.7°
+        env.x_dot = 0.25;
+        env.theta_dot = -0.3;
+        env.steps = 42;
 
         let output = env.render().unwrap();
-        // Should show ~30 degrees
-        assert!(output.contains("30.0°") || output.contains("30°"));
+        let header = output.lines().next().unwrap();
+
+        assert!(header.contains("Step:  42"), "Header should show step count");
+        assert!(header.contains("x:  1.50"), "Header should show x position");
+        assert!(header.contains("v:  0.25"), "Header should show velocity");
+        assert!(header.contains("θ:  5.7°"), "Header should show angle in degrees");
+        assert!(header.contains("ω: -0.30"), "Header should show angular velocity");
+    }
+
+    #[test]
+    fn test_render_cart_centered_when_x_zero() {
+        // Test: Cart is centered when x = 0
+        //
+        // Visual check: Cart center (middle of ┌─────────┐) should be at column ~30
+        //               (WIDTH=60, so center is 30)
+
+        let env = setup_render_env(0.0, 0.0);
+        let output = env.render().unwrap();
+
+        // Find cart top left corner (┌) and right corner (┐)
+        let cart_line_idx = 7; // Cart top is line 7 (0=header, 1=blank, 2-6=pole, 7=cart)
+        let left = find_char_col(&output, cart_line_idx, '┌').expect("Cart left corner not found");
+        let right = find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
+
+        let cart_center = (left + right) / 2;
+        let expected_center = 30; // WIDTH/2
+
+        assert!(
+            (cart_center as i32 - expected_center as i32).abs() <= 2,
+            "Cart should be centered. Found center at {}, expected ~{}",
+            cart_center,
+            expected_center
+        );
+    }
+
+    #[test]
+    fn test_render_cart_at_left_edge() {
+        // Test: Cart moves left when x = -2.4
+        //
+        // Expected: Cart is near left side of display
+
+        let env = setup_render_env(-2.4, 0.0);
+        let output = env.render().unwrap();
+
+        let cart_line_idx = 7;
+        let left = find_char_col(&output, cart_line_idx, '┌').expect("Cart left corner not found");
+
+        // Cart should be near left margin (around column 7-10)
+        assert!(
+            left < 15,
+            "Cart at x=-2.4 should be on left side. Found at column {}",
+            left
+        );
+    }
+
+    #[test]
+    fn test_render_cart_at_right_edge() {
+        // Test: Cart moves right when x = 2.4
+        //
+        // Expected: Cart is near right side of display
+
+        let env = setup_render_env(2.4, 0.0);
+        let output = env.render().unwrap();
+
+        let cart_line_idx = 7;
+        let right = find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
+
+        // Cart should be near right side (column > 45 for WIDTH=60)
+        assert!(
+            right > 45,
+            "Cart at x=2.4 should be on right side. Found at column {}",
+            right
+        );
+    }
+
+    #[test]
+    fn test_render_pole_vertical_when_theta_zero() {
+        // Test: Pole uses vertical character (│) when theta = 0
+        //
+        // Expected: All pole segments except top (●) are │
+
+        let env = setup_render_env(0.0, 0.0);
+        let output = env.render().unwrap();
+
+        // Pole is in lines 2-6 (0=header, 1=blank, 2=top with ●, 3-6=pole body)
+        // Line 2 should have ● (ball at top)
+        assert!(
+            line_contains(&output, 2, '●'),
+            "Top of pole should have ball (●)"
+        );
+
+        // Lines 3-6 should have │ (vertical pole)
+        for line_idx in 3..=6 {
+            assert!(
+                line_contains(&output, line_idx, '│'),
+                "Line {} should have vertical pole segment (│)",
+                line_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_pole_leans_right_positive_theta() {
+        // Test: Pole uses ╲ character when leaning right (theta > 0)
+        //
+        // At theta = 10° ≈ 0.175 rad, pole should visibly lean right
+
+        let theta = 10.0_f32.to_radians();
+        let env = setup_render_env(0.0, theta);
+        let output = env.render().unwrap();
+
+        // Should have at least one ╱ character in the pole (/ = bottom-left to top-right)
+        let pole_area: String = output.lines().skip(2).take(5).collect();
+        assert!(
+            pole_area.contains('╱'),
+            "Pole leaning right (θ=+10°) should have ╱ character.\nPole area:\n{}",
+            pole_area
+        );
+
+        // Should still have ball at top
+        assert!(
+            line_contains(&output, 2, '●'),
+            "Top of pole should have ball (●)"
+        );
+    }
+
+    #[test]
+    fn test_render_pole_leans_left_negative_theta() {
+        // Test: Pole uses ╱ character when leaning left (theta < 0)
+        //
+        // At theta = -10° ≈ -0.175 rad, pole should visibly lean left
+
+        let theta = (-10.0_f32).to_radians();
+        let env = setup_render_env(0.0, theta);
+        let output = env.render().unwrap();
+
+        // Should have at least one ╲ character in the pole (\ = bottom-right to top-left)
+        let pole_area: String = output.lines().skip(2).take(5).collect();
+        assert!(
+            pole_area.contains('╲'),
+            "Pole leaning left (θ=-10°) should have ╲ character.\nPole area:\n{}",
+            pole_area
+        );
+
+        // Should still have ball at top
+        assert!(
+            line_contains(&output, 2, '●'),
+            "Top of pole should have ball (●)"
+        );
+    }
+
+    #[test]
+    fn test_render_track_and_wheels_present() {
+        // Test: Track (═) and wheels (○) are rendered
+        //
+        // Expected: Track line has ═ characters and two ○ wheels
+
+        let env = setup_render_env(0.0, 0.0);
+        let output = env.render().unwrap();
+
+        let track_line_idx = 9; // Track is line 9
+        let track_line = output.lines().nth(track_line_idx).expect("Track line missing");
+
+        // Track should have ═ characters
+        assert!(
+            track_line.contains('═'),
+            "Track line should have ═ character"
+        );
+
+        // Should have exactly 2 wheel characters
+        let wheel_count = track_line.chars().filter(|&c| c == '○').count();
+        assert_eq!(wheel_count, 2, "Should have exactly 2 wheels");
+    }
+
+    #[test]
+    fn test_render_scale_markers_present() {
+        // Test: Scale line shows position markers -2.4, 0, 2.4
+        //
+        // Expected: Last line contains these markers
+
+        let env = setup_render_env(0.0, 0.0);
+        let output = env.render().unwrap();
+
+        let scale_line = output.lines().last().expect("Scale line missing");
+
+        assert!(scale_line.contains("-2.4"), "Scale should show -2.4 marker");
+        assert!(scale_line.contains("0"), "Scale should show 0 marker");
+        assert!(scale_line.contains("2.4"), "Scale should show 2.4 marker");
+    }
+
+    #[test]
+    fn test_render_combined_position_and_angle() {
+        // Test: Cart position and pole angle render correctly together
+        //
+        // Cart at x=1.0 (right of center), pole at theta=+5° (slight lean right)
+
+        let theta = 5.0_f32.to_radians();
+        let env = setup_render_env(1.0, theta);
+        let output = env.render().unwrap();
+
+        // Cart should be right of center
+        let cart_line_idx = 7;
+        let left = find_char_col(&output, cart_line_idx, '┌').expect("Cart left corner not found");
+        let right = find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
+        let cart_center = (left + right) / 2;
+
+        assert!(
+            cart_center > 30,
+            "Cart at x=1.0 should be right of center. Found at column {}",
+            cart_center
+        );
+
+        // Ball should be present
+        assert!(
+            line_contains(&output, 2, '●'),
+            "Top of pole should have ball (●)"
+        );
+    }
+
+    #[test]
+    fn test_render_output_dimensions() {
+        // Test: Output has expected dimensions
+        //
+        // Expected: 11 lines, each 60 characters wide (except header may vary)
+
+        let env = setup_render_env(0.0, 0.0);
+        let output = env.render().unwrap();
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 11, "Output should have 11 lines");
+
+        // Visual lines (not header) should be 60 chars
+        for (i, line) in lines.iter().enumerate().skip(2) {
+            assert_eq!(
+                line.chars().count(),
+                60,
+                "Line {} should be 60 chars, got {}",
+                i,
+                line.chars().count()
+            );
+        }
     }
 }

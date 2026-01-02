@@ -81,6 +81,14 @@ pub struct EvalArgs {
     #[arg(long)]
     pub step: bool,
 
+    /// Enable smooth animation (in-place frame updates)
+    #[arg(long)]
+    pub animate: bool,
+
+    /// Frames per second for animation (default: 10)
+    #[arg(long, default_value = "10")]
+    pub fps: u32,
+
     /// Random seed for reproducibility
     #[arg(long)]
     pub seed: Option<u64>,

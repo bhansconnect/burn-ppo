@@ -8,6 +8,8 @@
 
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
@@ -632,6 +634,8 @@ fn run_watch_mode<B: Backend>(
             num_games,
             &temp_schedule,
             args.step,
+            args.animate,
+            args.fps,
             &mut rng,
             device,
         )
@@ -645,6 +649,8 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
     num_games: usize,
     temp_schedule: &TempSchedule,
     step_mode: bool,
+    animate: bool,
+    fps: u32,
     rng: &mut StdRng,
     device: &B::Device,
 ) -> Result<()> {
@@ -662,8 +668,12 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
         let mut obs = env.reset();
         let mut total_rewards = vec![0.0f32; E::NUM_PLAYERS];
         let mut move_num = 0;
+        let mut is_first_frame = true;
+        let mut last_frame_lines = 0usize;
+        let frame_duration = Duration::from_millis(1000 / fps as u64);
 
         loop {
+            let frame_start = if animate { Some(Instant::now()) } else { None };
             let current_player = env.current_player();
             let model = &models[current_player];
             let mask = env.action_mask();
@@ -679,12 +689,39 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
 
             // Render before step
             if let Some(rendered) = env.render() {
-                println!("{}", rendered);
+                if animate {
+                    let frame_lines = rendered.lines().count();
+                    // Move cursor up to overwrite previous frame
+                    if !is_first_frame {
+                        // +1 for the action line
+                        print!("\x1b[{}A", last_frame_lines + 1);
+                    }
+                    print!("{}\n", rendered);
+                    // Trailing spaces clear any leftover characters from previous longer text
+                    println!("Action: {} (temp={:.2})                    ", action, temp);
+                    io::stdout().flush().ok();
+                    last_frame_lines = frame_lines;
+                    is_first_frame = false;
+                    // Sleep only the remainder of frame time
+                    if let Some(start) = frame_start {
+                        let elapsed = start.elapsed();
+                        if elapsed < frame_duration {
+                            thread::sleep(frame_duration - elapsed);
+                        }
+                    }
+                } else {
+                    println!("{}", rendered);
+                    println!(
+                        "Player {} selects action {} (temp={:.2})",
+                        current_player, action, temp
+                    );
+                }
+            } else {
+                println!(
+                    "Player {} selects action {} (temp={:.2})",
+                    current_player, action, temp
+                );
             }
-            println!(
-                "Player {} selects action {} (temp={:.2})",
-                current_player, action, temp
-            );
 
             if step_mode {
                 wait_for_enter();
@@ -701,7 +738,14 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
             if done {
                 // Show final state
                 if let Some(rendered) = env.render() {
-                    println!("{}", rendered);
+                    if animate {
+                        // Overwrite the animation frame with final state
+                        print!("\x1b[{}A", last_frame_lines + 1);
+                        println!("{}", rendered);
+                        println!(); // Extra line to separate from outcome
+                    } else {
+                        println!("{}", rendered);
+                    }
                 }
 
                 let outcome = determine_outcome(&env, &total_rewards);
