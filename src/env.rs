@@ -1,6 +1,7 @@
 /// Environment trait and VecEnv parallel wrapper
 
 use rayon::prelude::*;
+use std::collections::VecDeque;
 
 use crate::profile::{profile_function, profile_scope};
 
@@ -76,6 +77,8 @@ pub struct EpisodeStats {
     pub length: usize,
     /// Which environment index this episode came from
     pub env_index: usize,
+    /// Game outcome (for multiplayer games)
+    pub outcome: Option<GameOutcome>,
 }
 
 impl EpisodeStats {
@@ -83,6 +86,46 @@ impl EpisodeStats {
     pub fn total_reward(&self) -> f32 {
         self.total_rewards.first().copied().unwrap_or(0.0)
     }
+}
+
+/// Compute win rates and draw rate from a collection of game outcomes
+///
+/// Returns (win_rates[player], draw_rate) where win_rates[i] is the fraction
+/// of games won by player i, and draw_rate is the fraction of games that were draws.
+pub fn compute_outcome_rates(outcomes: &VecDeque<GameOutcome>, num_players: usize) -> (Vec<f32>, f32) {
+    let total = outcomes.len() as f32;
+    if total == 0.0 {
+        return (vec![0.0; num_players], 0.0);
+    }
+
+    let mut wins = vec![0usize; num_players];
+    let mut draws = 0usize;
+
+    for outcome in outcomes {
+        match outcome {
+            GameOutcome::Winner(w) => wins[*w] += 1,
+            GameOutcome::Tie => draws += 1,
+            GameOutcome::Placements(places) => {
+                // Count first-place finishes
+                let first_count = places.iter().filter(|&&p| p == 1).count();
+                if first_count == places.len() {
+                    // All tied for first = draw
+                    draws += 1;
+                } else {
+                    // Sole first place = win
+                    for (i, &place) in places.iter().enumerate() {
+                        if place == 1 && first_count == 1 {
+                            wins[i] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let win_rates: Vec<f32> = wins.iter().map(|&w| w as f32 / total).collect();
+    let draw_rate = draws as f32 / total;
+    (win_rates, draw_rate)
 }
 
 /// Vectorized environment wrapper for parallel execution
@@ -219,10 +262,13 @@ impl<E: Environment> VecEnv<E> {
                         *length += 1;
 
                         let completed = if done {
+                            // Capture game outcome BEFORE reset (state is lost after reset)
+                            let outcome = env.game_outcome();
                             let stats = EpisodeStats {
                                 total_rewards: ep_rewards.clone(),
                                 length: *length,
                                 env_index: env_idx,
+                                outcome,
                             };
                             let reset_obs = env.reset();
                             obs_chunk.copy_from_slice(&reset_obs);

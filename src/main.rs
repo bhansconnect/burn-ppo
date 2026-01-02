@@ -28,7 +28,8 @@ use rand::SeedableRng;
 use crate::backend::{init_device, backend_name, device_name, TrainingBackend};
 use crate::checkpoint::{CheckpointManager, CheckpointMetadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer, save_rng_state};
 use crate::config::{Cli, CliArgs, Command, Config};
-use crate::env::{Environment, VecEnv};
+use crate::env::{compute_outcome_rates, Environment, GameOutcome, VecEnv};
+use std::collections::VecDeque;
 use crate::envs::{CartPole, ConnectFour};
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
@@ -279,8 +280,8 @@ where
     );
     println!("---");
 
-    // Progress bar
-    let progress = TrainingProgress::new(config.total_timesteps as u64);
+    // Progress bar (with multiplayer support)
+    let progress = TrainingProgress::new_with_players(config.total_timesteps as u64, num_players as usize);
 
     // Timing for SPS calculation
     let training_start = std::time::Instant::now();
@@ -297,6 +298,16 @@ where
 
     // Episode tracking for checkpoint selection (cleared on each checkpoint)
     let mut episodes_since_checkpoint: Vec<f32> = Vec::new();
+
+    // Multiplayer tracking (only used when num_players > 1)
+    let num_players_usize = num_players as usize;
+    // Per-player rolling returns (last 100 episodes)
+    let mut recent_returns_per_player: Vec<VecDeque<f32>> =
+        (0..num_players_usize).map(|_| VecDeque::with_capacity(100)).collect();
+    // Rolling game outcomes for win rate calculation
+    let mut recent_outcomes: VecDeque<GameOutcome> = VecDeque::with_capacity(100);
+    // Per-player episode data for logging (cleared on each log)
+    let mut episodes_since_log_mp: Vec<(Vec<f32>, Option<GameOutcome>)> = Vec::new();
 
     // Training loop
     for update in 0..num_updates {
@@ -350,6 +361,30 @@ where
             if recent_returns.len() > 100 {
                 recent_returns.remove(0);
             }
+
+            // Multiplayer tracking
+            if num_players > 1 {
+                // Per-player returns
+                for (p, &reward) in ep.total_rewards.iter().enumerate() {
+                    if p < recent_returns_per_player.len() {
+                        recent_returns_per_player[p].push_back(reward);
+                        if recent_returns_per_player[p].len() > 100 {
+                            recent_returns_per_player[p].pop_front();
+                        }
+                    }
+                }
+
+                // Track outcome for win rate calculation
+                if let Some(ref outcome) = ep.outcome {
+                    recent_outcomes.push_back(outcome.clone());
+                    if recent_outcomes.len() > 100 {
+                        recent_outcomes.pop_front();
+                    }
+                }
+
+                // Store for logging
+                episodes_since_log_mp.push((ep.total_rewards.clone(), ep.outcome.clone()));
+            }
         }
 
         // Compute bootstrap value (normalize observations if normalizer is active)
@@ -397,12 +432,26 @@ where
         global_step += steps_per_update;
 
         // Update progress bar
-        let avg_return = if recent_returns.is_empty() {
-            0.0
+        if num_players > 1 {
+            // Multiplayer: show per-player returns and win rates
+            let returns_per_player: Vec<f32> = recent_returns_per_player
+                .iter()
+                .map(|rp| {
+                    if rp.is_empty() { 0.0 }
+                    else { rp.iter().sum::<f32>() / rp.len() as f32 }
+                })
+                .collect();
+            let (win_rates, draw_rate) = compute_outcome_rates(&recent_outcomes, num_players_usize);
+            progress.update_multiplayer(global_step as u64, &returns_per_player, &win_rates, draw_rate);
         } else {
-            recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
-        };
-        progress.update(global_step as u64, avg_return);
+            // Single-player: show average return
+            let avg_return = if recent_returns.is_empty() {
+                0.0
+            } else {
+                recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
+            };
+            progress.update(global_step as u64, avg_return);
+        }
 
         // Log metrics (at least once per log_freq steps)
         let should_log = update == 0 || global_step / config.log_freq > (global_step - steps_per_update) / config.log_freq;
@@ -472,6 +521,64 @@ where
                 episodes_since_log.clear();
             }
 
+            // Multiplayer metrics (per-player returns and win rates)
+            if num_players > 1 && !episodes_since_log_mp.is_empty() {
+                // Per-player return statistics
+                for player in 0..num_players_usize {
+                    let player_returns: Vec<f32> = episodes_since_log_mp
+                        .iter()
+                        .map(|(rewards, _)| rewards.get(player).copied().unwrap_or(0.0))
+                        .collect();
+
+                    if !player_returns.is_empty() {
+                        let mean = player_returns.iter().sum::<f32>() / player_returns.len() as f32;
+                        let max = player_returns.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let min = player_returns.iter().cloned().fold(f32::INFINITY, f32::min);
+
+                        logger.log_scalar(&format!("episode/return_mean_p{}", player), mean, global_step)?;
+                        logger.log_scalar(&format!("episode/return_max_p{}", player), max, global_step)?;
+                        logger.log_scalar(&format!("episode/return_min_p{}", player), min, global_step)?;
+                    }
+                }
+
+                // Win/Loss/Draw rates
+                let total_games = episodes_since_log_mp.len();
+                let mut wins_per_player = vec![0usize; num_players_usize];
+                let mut draws = 0usize;
+
+                for (_, outcome) in &episodes_since_log_mp {
+                    if let Some(ref outcome) = outcome {
+                        match outcome {
+                            GameOutcome::Winner(w) => wins_per_player[*w] += 1,
+                            GameOutcome::Tie => draws += 1,
+                            GameOutcome::Placements(places) => {
+                                let first_count = places.iter().filter(|&&p| p == 1).count();
+                                if first_count == places.len() {
+                                    draws += 1;
+                                } else {
+                                    for (i, &place) in places.iter().enumerate() {
+                                        if place == 1 && first_count == 1 {
+                                            wins_per_player[i] += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for player in 0..num_players_usize {
+                    let win_rate = wins_per_player[player] as f32 / total_games as f32;
+                    logger.log_scalar(&format!("episode/win_rate_p{}", player), win_rate, global_step)?;
+                }
+
+                let draw_rate = draws as f32 / total_games as f32;
+                logger.log_scalar("episode/draw_rate", draw_rate, global_step)?;
+                logger.log_scalar("episode/games_completed", total_games as f32, global_step)?;
+
+                episodes_since_log_mp.clear();
+            }
+
             logger.flush()?;
         }
 
@@ -526,12 +633,12 @@ where
                 eprintln!("Warning: Failed to save RNG state: {}", e);
             }
 
-            println!(
+            progress.println(&format!(
                 "Saved checkpoint at step {} (avg return: {:.1}) -> {:?}",
                 global_step,
                 avg_return,
                 checkpoint_path.file_name().unwrap()
-            );
+            ));
             last_checkpoint_step = global_step;
             episodes_since_checkpoint.clear();
         }
@@ -539,9 +646,14 @@ where
         profile::profile_frame!();
     }
 
-    progress.finish();
-    println!("---");
-    println!("Training complete!");
+    // Finish progress bar appropriately based on whether we were interrupted
+    if running.load(Ordering::SeqCst) {
+        progress.finish();
+        println!("---");
+        println!("Training complete!");
+    } else {
+        progress.finish_interrupted();
+    }
 
     if !recent_returns.is_empty() {
         let avg_return: f32 = recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
