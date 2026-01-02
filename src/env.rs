@@ -6,27 +6,53 @@ use crate::profile::{profile_function, profile_scope};
 
 /// Minimal environment interface - just what PPO needs
 pub trait Environment: Send + Sync + 'static {
+    /// Dimension of observation vector
+    const OBSERVATION_DIM: usize;
+
+    /// Number of discrete actions
+    const ACTION_COUNT: usize;
+
+    /// Environment name for logging
+    const NAME: &'static str;
+
+    /// Number of players (1 for single-agent, 2+ for multi-player)
+    const NUM_PLAYERS: usize = 1;
+
     /// Reset environment and return initial observation
     fn reset(&mut self) -> Vec<f32>;
 
-    /// Take action and return (observation, reward, done)
-    fn step(&mut self, action: usize) -> (Vec<f32>, f32, bool);
+    /// Take action and return (observation, rewards[NUM_PLAYERS], done)
+    ///
+    /// For multi-player games:
+    /// - observation: player-agnostic (same encoding for all players)
+    /// - rewards: reward for EACH player this step (not just actor)
+    /// - done: true if episode ended
+    fn step(&mut self, action: usize) -> (Vec<f32>, Vec<f32>, bool);
 
-    /// Dimension of observation vector
-    fn observation_dim(&self) -> usize;
+    /// Current player index (0..NUM_PLAYERS). Default 0 for single-agent.
+    fn current_player(&self) -> usize {
+        0
+    }
 
-    /// Number of discrete actions
-    fn action_count(&self) -> usize;
-
-    /// Environment name for logging
-    fn name(&self) -> &'static str;
+    /// Return mask of valid actions (true = valid). None = all valid.
+    fn action_mask(&self) -> Option<Vec<bool>> {
+        None
+    }
 }
 
 /// Episode statistics for completed episodes
 #[derive(Debug, Clone)]
 pub struct EpisodeStats {
-    pub total_reward: f32,
+    /// Total reward per player [NUM_PLAYERS]
+    pub total_rewards: Vec<f32>,
     pub length: usize,
+}
+
+impl EpisodeStats {
+    /// Get total reward for player 0 (backward compatibility for single-agent)
+    pub fn total_reward(&self) -> f32 {
+        self.total_rewards.first().copied().unwrap_or(0.0)
+    }
 }
 
 /// Vectorized environment wrapper for parallel execution
@@ -37,10 +63,8 @@ pub struct VecEnv<E: Environment> {
     envs: Vec<E>,
     /// Pre-allocated flat observation buffer [num_envs * obs_dim]
     obs_buffer: Vec<f32>,
-    /// Observation dimension (cached for slicing)
-    obs_dim: usize,
-    /// Accumulated reward per env (reset on episode end)
-    episode_rewards: Vec<f32>,
+    /// Accumulated rewards per env, per player [num_envs][num_players] (reset on episode end)
+    episode_rewards: Vec<Vec<f32>>,
     /// Steps taken per env (reset on episode end)
     episode_lengths: Vec<usize>,
 }
@@ -52,21 +76,19 @@ impl<E: Environment> VecEnv<E> {
         F: Fn(usize) -> E,
     {
         let mut envs: Vec<E> = (0..num_envs).map(|i| factory(i)).collect();
-        let obs_dim = envs[0].observation_dim();
 
         // Pre-allocate flat observation buffer and initialize with reset observations
-        let mut obs_buffer = vec![0.0; num_envs * obs_dim];
+        let mut obs_buffer = vec![0.0; num_envs * E::OBSERVATION_DIM];
         for (i, env) in envs.iter_mut().enumerate() {
             let obs = env.reset();
-            let offset = i * obs_dim;
-            obs_buffer[offset..offset + obs_dim].copy_from_slice(&obs);
+            let offset = i * E::OBSERVATION_DIM;
+            obs_buffer[offset..offset + E::OBSERVATION_DIM].copy_from_slice(&obs);
         }
 
         Self {
             envs,
             obs_buffer,
-            obs_dim,
-            episode_rewards: vec![0.0; num_envs],
+            episode_rewards: vec![vec![0.0; E::NUM_PLAYERS]; num_envs],
             episode_lengths: vec![0; num_envs],
         }
     }
@@ -76,31 +98,47 @@ impl<E: Environment> VecEnv<E> {
         self.envs.len()
     }
 
-    /// Observation dimension (all envs must match)
-    pub fn observation_dim(&self) -> usize {
-        self.obs_dim
-    }
-
-    /// Action count (all envs must match)
-    pub fn action_count(&self) -> usize {
-        self.envs[0].action_count()
-    }
-
     /// Get current observations as flat array [num_envs * obs_dim]
     pub fn get_observations(&self) -> Vec<f32> {
         self.obs_buffer.clone()
+    }
+
+    /// Get current player index for each environment (0..NUM_PLAYERS)
+    pub fn get_current_players(&self) -> Vec<usize> {
+        self.envs.iter().map(|e| e.current_player()).collect()
+    }
+
+    /// Get action masks for all environments, flattened [num_envs * action_count]
+    /// Returns None if environment doesn't support action masking.
+    pub fn get_action_masks(&self) -> Option<Vec<bool>> {
+        // Check first env for masking support
+        self.envs[0].action_mask()?;
+
+        let action_count = E::ACTION_COUNT;
+        let mut masks = Vec::with_capacity(self.envs.len() * action_count);
+        for env in &self.envs {
+            if let Some(mask) = env.action_mask() {
+                masks.extend(mask);
+            }
+        }
+        Some(masks)
     }
 
     /// Step all environments with given actions
     ///
     /// Returns:
     /// - observations: [num_envs, obs_dim] flattened
-    /// - rewards: [num_envs]
+    /// - all_rewards: [num_envs][num_players] - rewards for ALL players per env
     /// - dones: [num_envs]
     /// - completed_episodes: stats for any episodes that finished this step
-    pub fn step(&mut self, actions: &[usize]) -> (Vec<f32>, Vec<f32>, Vec<bool>, Vec<EpisodeStats>) {
+    pub fn step(
+        &mut self,
+        actions: &[usize],
+    ) -> (Vec<f32>, Vec<Vec<f32>>, Vec<bool>, Vec<EpisodeStats>) {
         profile_function!();
         assert_eq!(actions.len(), self.envs.len());
+
+        let num_players = E::NUM_PLAYERS;
 
         // Parallel step all environments
         let results: Vec<_> = {
@@ -111,23 +149,29 @@ impl<E: Environment> VecEnv<E> {
                 .zip(actions.par_iter())
                 .zip(self.episode_rewards.par_iter_mut())
                 .zip(self.episode_lengths.par_iter_mut())
-                .zip(self.obs_buffer.par_chunks_mut(self.obs_dim))
-                .map(|((((env, &action), reward), length), obs_chunk)| {
+                .zip(self.obs_buffer.par_chunks_mut(E::OBSERVATION_DIM))
+                .map(|((((env, &action), ep_rewards), length), obs_chunk)| {
                     #[cfg(feature = "tracy")]
                     let _span = tracy_client::span!("env_step");
 
-                    let (new_obs, r, done) = env.step(action);
-                    *reward += r;
+                    let (new_obs, step_rewards, done) = env.step(action);
+
+                    // Accumulate per-player rewards
+                    for (i, &r) in step_rewards.iter().enumerate() {
+                        ep_rewards[i] += r;
+                    }
                     *length += 1;
 
                     let completed = if done {
                         let stats = EpisodeStats {
-                            total_reward: *reward,
+                            total_rewards: ep_rewards.clone(),
                             length: *length,
                         };
                         let reset_obs = env.reset();
                         obs_chunk.copy_from_slice(&reset_obs);
-                        *reward = 0.0;
+                        for r in ep_rewards.iter_mut() {
+                            *r = 0.0;
+                        }
                         *length = 0;
                         Some(stats)
                     } else {
@@ -135,18 +179,21 @@ impl<E: Environment> VecEnv<E> {
                         None
                     };
 
-                    (r, done, completed)
+                    (step_rewards, done, completed)
                 })
                 .collect()
         };
 
         // Collect results (sequential, fast)
-        let mut rewards = Vec::with_capacity(self.envs.len());
+        let mut all_rewards = Vec::with_capacity(self.envs.len());
         let mut dones = Vec::with_capacity(self.envs.len());
         let mut completed_episodes = Vec::new();
 
-        for (r, done, completed) in results {
-            rewards.push(r);
+        for (step_rewards, done, completed) in results {
+            // Ensure proper size even if env returned wrong size
+            let mut rewards = step_rewards;
+            rewards.resize(num_players, 0.0);
+            all_rewards.push(rewards);
             dones.push(done);
             if let Some(stats) = completed {
                 completed_episodes.push(stats);
@@ -154,18 +201,7 @@ impl<E: Environment> VecEnv<E> {
         }
 
         let flat_obs = self.get_observations();
-        (flat_obs, rewards, dones, completed_episodes)
-    }
-
-    /// Reset all environments
-    pub fn reset_all(&mut self) {
-        for (i, env) in self.envs.iter_mut().enumerate() {
-            let obs = env.reset();
-            let offset = i * self.obs_dim;
-            self.obs_buffer[offset..offset + self.obs_dim].copy_from_slice(&obs);
-            self.episode_rewards[i] = 0.0;
-            self.episode_lengths[i] = 0;
-        }
+        (flat_obs, all_rewards, dones, completed_episodes)
     }
 }
 
@@ -186,27 +222,19 @@ mod tests {
     }
 
     impl Environment for CounterEnv {
+        const OBSERVATION_DIM: usize = 1;
+        const ACTION_COUNT: usize = 2;
+        const NAME: &'static str = "counter";
+
         fn reset(&mut self) -> Vec<f32> {
             self.count = 0;
             vec![0.0]
         }
 
-        fn step(&mut self, _action: usize) -> (Vec<f32>, f32, bool) {
+        fn step(&mut self, _action: usize) -> (Vec<f32>, Vec<f32>, bool) {
             self.count += 1;
             let done = self.count >= self.max_steps;
-            (vec![self.count as f32], 1.0, done)
-        }
-
-        fn observation_dim(&self) -> usize {
-            1
-        }
-
-        fn action_count(&self) -> usize {
-            2
-        }
-
-        fn name(&self) -> &'static str {
-            "counter"
+            (vec![self.count as f32], vec![1.0], done)
         }
     }
 
@@ -215,8 +243,8 @@ mod tests {
         let vec_env: VecEnv<CounterEnv> = VecEnv::new(4, |_| CounterEnv::new(3));
 
         assert_eq!(vec_env.num_envs(), 4);
-        assert_eq!(vec_env.observation_dim(), 1);
-        assert_eq!(vec_env.action_count(), 2);
+        assert_eq!(CounterEnv::OBSERVATION_DIM, 1);
+        assert_eq!(CounterEnv::ACTION_COUNT, 2);
     }
 
     #[test]
@@ -224,10 +252,10 @@ mod tests {
         let mut vec_env: VecEnv<CounterEnv> = VecEnv::new(2, |_| CounterEnv::new(3));
 
         let actions = vec![0, 1];
-        let (obs, rewards, dones, completed) = vec_env.step(&actions);
+        let (obs, all_rewards, dones, completed) = vec_env.step(&actions);
 
         assert_eq!(obs, vec![1.0, 1.0]); // Both envs stepped to count=1
-        assert_eq!(rewards, vec![1.0, 1.0]);
+        assert_eq!(all_rewards, vec![vec![1.0], vec![1.0]]);
         assert_eq!(dones, vec![false, false]);
         assert!(completed.is_empty());
     }
@@ -239,11 +267,11 @@ mod tests {
         // Step 1
         vec_env.step(&[0]);
         // Step 2 - should terminate
-        let (obs, rewards, dones, completed) = vec_env.step(&[0]);
+        let (obs, _all_rewards, dones, completed) = vec_env.step(&[0]);
 
         assert_eq!(dones, vec![true]);
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].total_reward, 2.0);
+        assert_eq!(completed[0].total_reward(), 2.0);
         assert_eq!(completed[0].length, 2);
 
         // After auto-reset, observations should be reset state
@@ -263,7 +291,7 @@ mod tests {
         let (_, _, dones, completed) = vec_env.step(&[0]);
         assert_eq!(dones, vec![true]);
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].total_reward, 5.0);
+        assert_eq!(completed[0].total_reward(), 5.0);
         assert_eq!(completed[0].length, 5);
     }
 }

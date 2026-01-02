@@ -90,6 +90,10 @@ impl CartPole {
 }
 
 impl Environment for CartPole {
+    const OBSERVATION_DIM: usize = 4;
+    const ACTION_COUNT: usize = 2;
+    const NAME: &'static str = "cartpole";
+
     fn reset(&mut self) -> Vec<f32> {
         profile_function!();
         // Random initial state in [-0.05, 0.05]
@@ -101,7 +105,7 @@ impl Environment for CartPole {
         self.get_obs()
     }
 
-    fn step(&mut self, action: usize) -> (Vec<f32>, f32, bool) {
+    fn step(&mut self, action: usize) -> (Vec<f32>, Vec<f32>, bool) {
         profile_function!();
         // Action: 0 = push left, 1 = push right
         let force = if action == 0 { -FORCE_MAG } else { FORCE_MAG };
@@ -118,19 +122,7 @@ impl Environment for CartPole {
             1.0
         };
 
-        (self.get_obs(), reward, done)
-    }
-
-    fn observation_dim(&self) -> usize {
-        4
-    }
-
-    fn action_count(&self) -> usize {
-        2
-    }
-
-    fn name(&self) -> &'static str {
-        "cartpole"
+        (self.get_obs(), vec![reward], done)
     }
 }
 
@@ -155,10 +147,10 @@ mod tests {
         let mut env = CartPole::new(42);
         env.reset();
 
-        let (obs, reward, done) = env.step(1); // Push right
+        let (obs, rewards, done) = env.step(1); // Push right
 
         assert_eq!(obs.len(), 4);
-        assert_eq!(reward, 1.0);
+        assert_eq!(rewards, vec![1.0]);
         assert!(!done);
     }
 
@@ -232,10 +224,10 @@ mod tests {
         let obs2 = env2.reset();
         assert_eq!(obs1, obs2);
 
-        let (obs1, r1, d1) = env1.step(1);
-        let (obs2, r2, d2) = env2.step(1);
+        let (obs1, rewards1, d1) = env1.step(1);
+        let (obs2, rewards2, d2) = env2.step(1);
         assert_eq!(obs1, obs2);
-        assert_eq!(r1, r2);
+        assert_eq!(rewards1, rewards2);
         assert_eq!(d1, d2);
     }
 }

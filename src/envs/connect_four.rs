@@ -1,9 +1,7 @@
-/// Connect Four environment with self-play
+/// Connect Four environment with N-player self-play
 ///
 /// 7x6 board game where players drop pieces to connect four in a row.
-/// Uses self-play: after agent moves, opponent (same/random policy) moves.
-
-use rand::Rng;
+/// True self-play: same network plays both sides, one move per step.
 
 use crate::env::Environment;
 use crate::profile::profile_function;
@@ -11,6 +9,7 @@ use crate::profile::profile_function;
 const COLS: usize = 7;
 const ROWS: usize = 6;
 const WIN_LENGTH: usize = 4;
+const BOARD_SIZE: usize = ROWS * COLS; // 42
 
 /// Board cell state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,27 +26,39 @@ pub struct ConnectFour {
     current_player: Cell,
     game_over: bool,
     winner: Option<Cell>,
-    rng: rand::rngs::StdRng,
-    /// Opponent policy: random moves for initial training
-    random_opponent: bool,
 }
 
 impl ConnectFour {
-    /// Create new game with seeded RNG
-    pub fn new(seed: u64, random_opponent: bool) -> Self {
-        use rand::SeedableRng;
+    /// Create new game
+    pub fn new(_seed: u64) -> Self {
         Self {
             board: [[Cell::Empty; COLS]; ROWS],
             current_player: Cell::Player1,
             game_over: false,
             winner: None,
-            rng: rand::rngs::StdRng::seed_from_u64(seed),
-            random_opponent,
+        }
+    }
+
+    /// Get current player index (0 or 1)
+    fn current_player_idx(&self) -> usize {
+        match self.current_player {
+            Cell::Player1 => 0,
+            Cell::Player2 => 1,
+            Cell::Empty => unreachable!(),
+        }
+    }
+
+    /// Get the other player
+    fn other_player(&self) -> Cell {
+        match self.current_player {
+            Cell::Player1 => Cell::Player2,
+            Cell::Player2 => Cell::Player1,
+            Cell::Empty => unreachable!(),
         }
     }
 
     /// Drop a piece in the given column
-    /// Returns (row placed, success)
+    /// Returns row placed if successful
     fn drop_piece(&mut self, col: usize, player: Cell) -> Option<usize> {
         if col >= COLS {
             return None;
@@ -127,54 +138,40 @@ impl ConnectFour {
             .collect()
     }
 
-    /// Convert board to flat observation vector
-    /// Uses +1 for Player1, -1 for Player2, 0 for empty
+    /// Multi-plane observation encoding:
+    /// - P0 plane [0..42): 1.0 if Player1 piece, else 0.0
+    /// - P1 plane [42..84): 1.0 if Player2 piece, else 0.0
+    /// - Turn indicator [84..86): one-hot, [1,0] if P0's turn, [0,1] if P1's turn
     fn get_observation(&self) -> Vec<f32> {
-        let mut obs = Vec::with_capacity(ROWS * COLS);
+        let mut obs = vec![0.0; BOARD_SIZE * 2 + 2]; // 86 total
+
+        // Board planes
         for row in 0..ROWS {
             for col in 0..COLS {
-                obs.push(match self.board[row][col] {
-                    Cell::Empty => 0.0,
-                    Cell::Player1 => 1.0,
-                    Cell::Player2 => -1.0,
-                });
+                let idx = row * COLS + col;
+                match self.board[row][col] {
+                    Cell::Empty => {} // Both planes are 0
+                    Cell::Player1 => obs[idx] = 1.0,              // P0 plane [0..42)
+                    Cell::Player2 => obs[BOARD_SIZE + idx] = 1.0, // P1 plane [42..84)
+                }
             }
         }
+
+        // Turn indicator (one-hot) [84..86)
+        let current = self.current_player_idx();
+        obs[BOARD_SIZE * 2 + current] = 1.0;
+
         obs
-    }
-
-    /// Make opponent move (random or self-play)
-    fn opponent_move(&mut self) {
-        if self.game_over {
-            return;
-        }
-
-        let valid = self.valid_actions();
-        if valid.is_empty() {
-            self.game_over = true;
-            return;
-        }
-
-        // Random opponent for now
-        let col = if self.random_opponent {
-            valid[self.rng.gen_range(0..valid.len())]
-        } else {
-            // TODO: Use the same model for self-play
-            valid[self.rng.gen_range(0..valid.len())]
-        };
-
-        if let Some(row) = self.drop_piece(col, Cell::Player2) {
-            if self.check_winner(row, col, Cell::Player2) {
-                self.game_over = true;
-                self.winner = Some(Cell::Player2);
-            } else if self.is_full() {
-                self.game_over = true;
-            }
-        }
     }
 }
 
 impl Environment for ConnectFour {
+    /// 42 cells × 2 players + 2 turn indicator = 86
+    const OBSERVATION_DIM: usize = BOARD_SIZE * 2 + 2;
+    const ACTION_COUNT: usize = COLS; // 7
+    const NAME: &'static str = "connect_four";
+    const NUM_PLAYERS: usize = 2;
+
     fn reset(&mut self) -> Vec<f32> {
         profile_function!();
         self.board = [[Cell::Empty; COLS]; ROWS];
@@ -184,56 +181,59 @@ impl Environment for ConnectFour {
         self.get_observation()
     }
 
-    fn step(&mut self, action: usize) -> (Vec<f32>, f32, bool) {
+    /// Single-move step with N-player rewards
+    ///
+    /// Reward structure (non-zero-sum, non-negative):
+    /// - Win: 1.0
+    /// - Draw: 0.5 (1/N for N players)
+    /// - Loss: 0.0
+    /// - Invalid move: 0.0 for all (action masking should prevent this)
+    fn step(&mut self, action: usize) -> (Vec<f32>, Vec<f32>, bool) {
         profile_function!();
-        // Invalid action (column full or out of bounds)
+
+        let current = self.current_player_idx();
+        let other = 1 - current;
+        let mut rewards = vec![0.0; 2]; // [P0 reward, P1 reward]
+
+        // Invalid action: end episode (action masking should prevent this)
         if action >= COLS || self.board[0][action] != Cell::Empty || self.game_over {
-            // Penalize invalid moves heavily
-            return (self.get_observation(), -1.0, true);
+            return (self.get_observation(), rewards, true);
         }
 
-        // Player 1 (agent) moves
-        if let Some(row) = self.drop_piece(action, Cell::Player1) {
-            if self.check_winner(row, action, Cell::Player1) {
+        // Execute move
+        if let Some(row) = self.drop_piece(action, self.current_player) {
+            if self.check_winner(row, action, self.current_player) {
                 self.game_over = true;
-                self.winner = Some(Cell::Player1);
-                return (self.get_observation(), 1.0, true); // Win!
+                self.winner = Some(self.current_player);
+                rewards[current] = 1.0; // Winner gets 1.0
+                rewards[other] = 0.0; // Loser gets 0.0
+                return (self.get_observation(), rewards, true);
             }
         }
 
-        // Check for draw
+        // Draw
         if self.is_full() {
             self.game_over = true;
-            return (self.get_observation(), 0.0, true); // Draw
+            rewards[0] = 0.5; // Both get 1/N = 0.5
+            rewards[1] = 0.5;
+            return (self.get_observation(), rewards, true);
         }
 
-        // Opponent moves
-        self.opponent_move();
-
-        // Check if opponent won
-        if self.winner == Some(Cell::Player2) {
-            return (self.get_observation(), -1.0, true); // Loss
-        }
-
-        // Check for draw after opponent
-        if self.game_over {
-            return (self.get_observation(), 0.0, true); // Draw
-        }
-
-        // Game continues
-        (self.get_observation(), 0.0, false)
+        // Switch player
+        self.current_player = self.other_player();
+        (self.get_observation(), rewards, false)
     }
 
-    fn observation_dim(&self) -> usize {
-        ROWS * COLS // 42
+    fn current_player(&self) -> usize {
+        self.current_player_idx()
     }
 
-    fn action_count(&self) -> usize {
-        COLS // 7
-    }
-
-    fn name(&self) -> &'static str {
-        "connect_four"
+    fn action_mask(&self) -> Option<Vec<bool>> {
+        Some(
+            (0..COLS)
+                .map(|col| self.board[0][col] == Cell::Empty)
+                .collect(),
+        )
     }
 }
 
@@ -243,34 +243,42 @@ mod tests {
 
     #[test]
     fn test_connect_four_reset() {
-        let mut env = ConnectFour::new(42, true);
+        let mut env = ConnectFour::new(42);
         let obs = env.reset();
 
-        assert_eq!(obs.len(), 42);
-        // All cells should be empty initially
-        assert!(obs.iter().all(|&x| x == 0.0));
+        // 86 = 42*2 + 2
+        assert_eq!(obs.len(), 86);
+        // Board planes should be all zeros (empty)
+        assert!(obs[..84].iter().all(|&x| x == 0.0));
+        // Turn indicator: P0's turn [1, 0]
+        assert_eq!(obs[84], 1.0);
+        assert_eq!(obs[85], 0.0);
     }
 
     #[test]
     fn test_connect_four_step() {
-        let mut env = ConnectFour::new(42, true);
+        let mut env = ConnectFour::new(42);
         env.reset();
 
-        // Make a move in column 3
-        let (obs, reward, done) = env.step(3);
+        // Make a move in column 3 (P0's turn)
+        let (obs, rewards, done) = env.step(3);
 
-        assert_eq!(obs.len(), 42);
-        // Bottom row, column 3 should have Player1's piece
+        assert_eq!(obs.len(), 86);
+        // Bottom row (row 5), column 3 should have P0's piece in P0 plane
         assert_eq!(obs[5 * COLS + 3], 1.0);
-        // Opponent should have moved too
-        let opponent_pieces: f32 = obs.iter().filter(|&&x| x == -1.0).sum();
-        assert_eq!(opponent_pieces, -1.0);
-        assert!(!done || reward != 0.0);
+        // P1 plane should be empty at that position
+        assert_eq!(obs[BOARD_SIZE + 5 * COLS + 3], 0.0);
+        // Now it's P1's turn [0, 1]
+        assert_eq!(obs[84], 0.0);
+        assert_eq!(obs[85], 1.0);
+        // No rewards yet
+        assert_eq!(rewards, vec![0.0, 0.0]);
+        assert!(!done);
     }
 
     #[test]
     fn test_connect_four_invalid_move() {
-        let mut env = ConnectFour::new(42, false);
+        let mut env = ConnectFour::new(42);
         env.reset();
 
         // Manually fill column 0
@@ -278,69 +286,81 @@ mod tests {
             env.board[row][0] = Cell::Player1;
         }
 
-        // Column is full, move should be invalid
-        let (_, reward, done) = env.step(0);
-        assert_eq!(reward, -1.0);
+        // Column is full, move should end game with no rewards
+        let (_, rewards, done) = env.step(0);
+        assert_eq!(rewards, vec![0.0, 0.0]);
         assert!(done);
     }
 
     #[test]
     fn test_connect_four_out_of_bounds() {
-        let mut env = ConnectFour::new(42, true);
+        let mut env = ConnectFour::new(42);
         env.reset();
 
         // Out of bounds column
-        let (_, reward, done) = env.step(10);
-        assert_eq!(reward, -1.0);
+        let (_, rewards, done) = env.step(10);
+        assert_eq!(rewards, vec![0.0, 0.0]);
         assert!(done);
     }
 
     #[test]
     fn test_connect_four_horizontal_win() {
-        let mut env = ConnectFour::new(42, false);
+        let mut env = ConnectFour::new(42);
         env.reset();
 
-        // Manual setup: Player1 has 4 in a row at bottom
+        // Manual setup: Player1 has 3 in a row at bottom
         env.board[5][0] = Cell::Player1;
         env.board[5][1] = Cell::Player1;
         env.board[5][2] = Cell::Player1;
 
         // Winning move
-        env.drop_piece(3, Cell::Player1);
-        assert!(env.check_winner(5, 3, Cell::Player1));
+        let (_, rewards, done) = env.step(3);
+        assert!(done);
+        assert_eq!(rewards[0], 1.0); // P0 wins
+        assert_eq!(rewards[1], 0.0); // P1 loses
     }
 
     #[test]
     fn test_connect_four_vertical_win() {
-        let mut env = ConnectFour::new(42, false);
+        let mut env = ConnectFour::new(42);
         env.reset();
 
-        // Stack 4 in column 0
+        // Stack 3 in column 0 (P0's pieces)
         env.board[5][0] = Cell::Player1;
         env.board[4][0] = Cell::Player1;
         env.board[3][0] = Cell::Player1;
-        env.board[2][0] = Cell::Player1;
 
-        assert!(env.check_winner(2, 0, Cell::Player1));
+        // Winning move at row 2
+        let (_, rewards, done) = env.step(0);
+        assert!(done);
+        assert_eq!(rewards[0], 1.0); // P0 wins
+        assert_eq!(rewards[1], 0.0); // P1 loses
     }
 
     #[test]
     fn test_connect_four_diagonal_win() {
-        let mut env = ConnectFour::new(42, false);
+        let mut env = ConnectFour::new(42);
         env.reset();
 
-        // Diagonal from (5,0) to (2,3)
+        // Diagonal from (5,0) to (2,3) - need 3 pieces for P0
         env.board[5][0] = Cell::Player1;
         env.board[4][1] = Cell::Player1;
         env.board[3][2] = Cell::Player1;
-        env.board[2][3] = Cell::Player1;
+        // Fill supporting pieces so we can drop at col 3
+        env.board[5][3] = Cell::Player2;
+        env.board[4][3] = Cell::Player2;
+        env.board[3][3] = Cell::Player2;
 
-        assert!(env.check_winner(2, 3, Cell::Player1));
+        // Winning move at (2,3)
+        let (_, rewards, done) = env.step(3);
+        assert!(done);
+        assert_eq!(rewards[0], 1.0);
+        assert_eq!(rewards[1], 0.0);
     }
 
     #[test]
     fn test_valid_actions() {
-        let mut env = ConnectFour::new(42, true);
+        let mut env = ConnectFour::new(42);
         env.reset();
 
         assert_eq!(env.valid_actions().len(), 7);
@@ -352,5 +372,94 @@ mod tests {
 
         assert_eq!(env.valid_actions().len(), 6);
         assert!(!env.valid_actions().contains(&0));
+    }
+
+    #[test]
+    fn test_action_mask() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        let mask = env.action_mask().unwrap();
+        assert_eq!(mask.len(), 7);
+        assert!(mask.iter().all(|&v| v)); // All valid initially
+
+        // Fill column 3
+        for row in 0..ROWS {
+            env.board[row][3] = Cell::Player1;
+        }
+
+        let mask = env.action_mask().unwrap();
+        assert!(mask[0]); // Col 0 valid
+        assert!(!mask[3]); // Col 3 full
+        assert!(mask[6]); // Col 6 valid
+    }
+
+    #[test]
+    fn test_current_player_switching() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        assert_eq!(env.current_player(), 0); // P0 starts
+
+        env.step(0); // P0 moves
+        assert_eq!(env.current_player(), 1); // Now P1
+
+        env.step(1); // P1 moves
+        assert_eq!(env.current_player(), 0); // Back to P0
+    }
+
+    #[test]
+    fn test_draw() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Fill board in a way that creates no winner
+        // Pattern that avoids 4-in-a-row
+        // Row 0-2: P1 P2 P1 P2 P1 P2 P1
+        // Row 3-5: P2 P1 P2 P1 P2 P1 P2
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                if row < 3 {
+                    env.board[row][col] = if col % 2 == 0 {
+                        Cell::Player1
+                    } else {
+                        Cell::Player2
+                    };
+                } else {
+                    env.board[row][col] = if col % 2 == 0 {
+                        Cell::Player2
+                    } else {
+                        Cell::Player1
+                    };
+                }
+            }
+        }
+
+        // Leave one cell empty to trigger draw
+        env.board[0][0] = Cell::Empty;
+
+        let (_, rewards, done) = env.step(0);
+        assert!(done);
+        assert_eq!(rewards[0], 0.5);
+        assert_eq!(rewards[1], 0.5);
+    }
+
+    #[test]
+    fn test_multi_plane_encoding() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Place P0 piece at (5, 0)
+        env.step(0);
+        // Place P1 piece at (5, 1)
+        let (obs, _, _) = env.step(1);
+
+        // P0 plane: (5,0) should be 1.0
+        assert_eq!(obs[5 * COLS + 0], 1.0);
+        // P1 plane: (5,1) should be 1.0
+        assert_eq!(obs[BOARD_SIZE + 5 * COLS + 1], 1.0);
+        // Turn indicator: P0's turn [1, 0]
+        assert_eq!(obs[84], 1.0);
+        assert_eq!(obs[85], 0.0);
     }
 }

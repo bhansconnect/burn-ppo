@@ -38,9 +38,17 @@ pub struct CheckpointMetadata {
     /// Action count (for generic model loading)
     #[serde(default)]
     pub action_count: usize,
+    /// Number of players (for value head dimension)
+    #[serde(default = "default_num_players")]
+    pub num_players: usize,
     /// Parent run name if this run was forked from another
     #[serde(default)]
     pub forked_from: Option<String>,
+}
+
+/// Default num_players for backward compatibility with older checkpoints
+fn default_num_players() -> usize {
+    1
 }
 
 
@@ -125,7 +133,9 @@ impl CheckpointManager {
         // Use dimensions from metadata if available, otherwise fall back to CartPole defaults
         let obs_dim = if metadata.obs_dim > 0 { metadata.obs_dim } else { 4 };
         let action_count = if metadata.action_count > 0 { metadata.action_count } else { 2 };
-        let default_model: ActorCritic<B> = ActorCritic::new(obs_dim, action_count, config, device);
+        let num_players = if metadata.num_players > 0 { metadata.num_players } else { 1 };
+        let default_model: ActorCritic<B> =
+            ActorCritic::new(obs_dim, action_count, num_players, config, device);
 
         // Load model using Burn's recorder
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
@@ -138,6 +148,9 @@ impl CheckpointManager {
     }
 
     /// Get the path to the latest checkpoint, if any
+    ///
+    /// Note: Currently unused in training. Reserved for future inference mode.
+    #[allow(dead_code)]
     pub fn latest_checkpoint(&self) -> Option<PathBuf> {
         let latest = self.checkpoints_dir.join("latest");
         if latest.exists() {
@@ -148,6 +161,9 @@ impl CheckpointManager {
     }
 
     /// Get the path to the best checkpoint, if any
+    ///
+    /// Note: Currently unused in training. Reserved for future inference mode.
+    #[allow(dead_code)]
     pub fn best_checkpoint(&self) -> Option<PathBuf> {
         let best = self.checkpoints_dir.join("best");
         if best.exists() {
@@ -323,7 +339,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, &config, &device);
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
         let metadata = CheckpointMetadata {
             step: 1000,
             avg_return: 150.0,
@@ -332,6 +348,7 @@ mod tests {
             recent_returns: vec![140.0, 150.0, 160.0],
             obs_dim: 4,
             action_count: 2,
+            num_players: 1,
             forked_from: None,
         };
 
@@ -351,7 +368,7 @@ mod tests {
         // Verify model has same structure
         let (logits, values) = loaded_model.forward(burn::tensor::Tensor::zeros([1, 4], &device));
         assert_eq!(logits.dims(), [1, 2]);
-        assert_eq!(values.dims(), [1]);
+        assert_eq!(values.dims(), [1, 1]); // [batch, num_players]
     }
 
     #[test]
@@ -361,7 +378,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, &config, &device);
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
 
         // Save first checkpoint with low return
         manager
@@ -375,6 +392,7 @@ mod tests {
                     recent_returns: vec![100.0],
                     obs_dim: 4,
                     action_count: 2,
+                    num_players: 1,
                     forked_from: None,
                 },
             )
@@ -392,6 +410,7 @@ mod tests {
                     recent_returns: vec![100.0, 200.0],
                     obs_dim: 4,
                     action_count: 2,
+                    num_players: 1,
                     forked_from: None,
                 },
             )
@@ -409,6 +428,7 @@ mod tests {
                     recent_returns: vec![100.0, 200.0, 150.0],
                     obs_dim: 4,
                     action_count: 2,
+                    num_players: 1,
                     forked_from: None,
                 },
             )

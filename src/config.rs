@@ -352,6 +352,14 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         use anyhow::bail;
 
+        // Validate environment name
+        if !["cartpole", "connect_four"].contains(&self.env.as_str()) {
+            bail!(
+                "Unknown environment '{}'. Supported: cartpole, connect_four",
+                self.env
+            );
+        }
+
         if self.learning_rate <= 0.0 {
             bail!("learning_rate must be > 0");
         }

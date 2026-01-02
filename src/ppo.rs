@@ -22,20 +22,32 @@ use crate::utils::{entropy_categorical, log_prob_categorical, normalize_advantag
 /// Stores trajectory data from environment rollouts
 ///
 /// Shape: [num_steps, num_envs] for most fields
+/// For multi-player games, also stores per-player values and rewards.
 #[derive(Debug)]
 pub struct RolloutBuffer<B: Backend> {
     /// Observations [num_steps, num_envs, obs_dim]
     pub observations: Tensor<B, 3>,
     /// Actions taken [num_steps, num_envs]
     pub actions: Tensor<B, 2, Int>,
-    /// Rewards received [num_steps, num_envs]
+    /// Rewards for acting player [num_steps, num_envs]
     pub rewards: Tensor<B, 2>,
     /// Episode done flags [num_steps, num_envs]
     pub dones: Tensor<B, 2>,
-    /// Value estimates [num_steps, num_envs]
+    /// Value estimates for acting player [num_steps, num_envs]
     pub values: Tensor<B, 2>,
     /// Log probabilities of actions [num_steps, num_envs]
     pub log_probs: Tensor<B, 2>,
+
+    // Multi-player support fields
+    /// Values for ALL players [num_steps, num_envs, num_players]
+    pub all_values: Tensor<B, 3>,
+    /// Rewards for ALL players [num_steps, num_envs, num_players]
+    pub all_rewards: Tensor<B, 3>,
+    /// Which player acted each step [num_steps, num_envs]
+    pub acting_players: Tensor<B, 2, Int>,
+    /// Number of players (max 255)
+    num_players: u8,
+
     /// GAE advantages (computed after rollout) [num_steps, num_envs]
     pub advantages: Option<Tensor<B, 2>>,
     /// Returns (values + advantages) [num_steps, num_envs]
@@ -44,7 +56,16 @@ pub struct RolloutBuffer<B: Backend> {
 
 impl<B: Backend> RolloutBuffer<B> {
     /// Create empty buffer with given dimensions
-    pub fn new(num_steps: usize, num_envs: usize, obs_dim: usize, device: &B::Device) -> Self {
+    ///
+    /// `num_players` must be <= 255 (stored as u8)
+    pub fn new(
+        num_steps: usize,
+        num_envs: usize,
+        obs_dim: usize,
+        num_players: u8,
+        device: &B::Device,
+    ) -> Self {
+        let np = num_players as usize;
         Self {
             observations: Tensor::zeros([num_steps, num_envs, obs_dim], device),
             actions: Tensor::zeros([num_steps, num_envs], device),
@@ -52,15 +73,25 @@ impl<B: Backend> RolloutBuffer<B> {
             dones: Tensor::zeros([num_steps, num_envs], device),
             values: Tensor::zeros([num_steps, num_envs], device),
             log_probs: Tensor::zeros([num_steps, num_envs], device),
+            // Multi-player fields
+            all_values: Tensor::zeros([num_steps, num_envs, np], device),
+            all_rewards: Tensor::zeros([num_steps, num_envs, np], device),
+            acting_players: Tensor::zeros([num_steps, num_envs], device),
+            num_players,
             advantages: None,
             returns: None,
         }
     }
 
+    /// Get number of players (max 255)
+    pub fn num_players(&self) -> u8 {
+        self.num_players
+    }
+
     /// Flatten buffer for minibatch processing
-    /// Returns (obs, actions, old_log_probs, advantages, returns)
+    /// Returns (obs, actions, old_log_probs, advantages, returns, acting_players)
     /// Each with shape [num_steps * num_envs, ...]
-    pub fn flatten(&self) -> (Tensor<B, 2>, Tensor<B, 1, Int>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>) {
+    pub fn flatten(&self) -> (Tensor<B, 2>, Tensor<B, 1, Int>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1>, Tensor<B, 1, Int>) {
         let [num_steps, num_envs, obs_dim] = self.observations.dims();
         let batch_size = num_steps * num_envs;
 
@@ -69,8 +100,9 @@ impl<B: Backend> RolloutBuffer<B> {
         let log_probs = self.log_probs.clone().flatten(0, 1);
         let advantages = self.advantages.as_ref().expect("Advantages not computed").clone().flatten(0, 1);
         let returns = self.returns.as_ref().expect("Returns not computed").clone().flatten(0, 1);
+        let acting_players = self.acting_players.clone().flatten(0, 1);
 
-        (obs, actions, log_probs, advantages, returns)
+        (obs, actions, log_probs, advantages, returns, acting_players)
     }
 }
 
@@ -91,19 +123,28 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 ) -> Vec<EpisodeStats> {
     profile_function!();
     let num_envs = vec_env.num_envs();
-    let obs_dim = vec_env.observation_dim();
+    let obs_dim = E::OBSERVATION_DIM;
+    let num_players = E::NUM_PLAYERS;
     let mut all_completed = Vec::new();
 
     // Pre-allocate CPU vectors for batch collection
     let mut all_obs: Vec<f32> = Vec::with_capacity(num_steps * num_envs * obs_dim);
     let mut all_actions: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
-    let mut all_rewards: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_acting_rewards: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
     let mut all_dones: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
-    let mut all_values: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_acting_values: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
     let mut all_log_probs: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+
+    // Multi-player data
+    let mut all_values_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
+    let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
+    let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
 
     for _step in 0..num_steps {
         profile_scope!("rollout_step");
+
+        // Get current players BEFORE the step (who is about to act)
+        let current_players = vec_env.get_current_players();
 
         // Get current observations and optionally normalize
         let mut obs_flat = vec_env.get_observations();
@@ -114,17 +155,18 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 
         // Model inference: forward pass, sample actions, compute log probs, sync to CPU
         // All GPU ops batched together - timing includes actual compute (sync at end)
-        let (actions_data, values_data, log_probs_data) = {
+        let (actions_data, acting_values_data, log_probs_data, values_all_data) = {
             profile_scope!("model_inference");
 
             let obs_tensor: Tensor<B, 2> =
                 Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device).reshape([num_envs, obs_dim]);
             let (logits, values) = model.forward(obs_tensor);
+            // values is [num_envs, num_players]
+
             let actions = sample_categorical(logits.clone(), rng, device);
             let log_probs = log_prob_categorical(logits, actions.clone());
 
             // Sync to CPU - this is where actual GPU compute happens
-            // Note: Convert Int tensor through float to avoid WGPU backend type mismatch
             let actions_data: Vec<i64> = actions
                 .float()
                 .into_data()
@@ -133,29 +175,57 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
                 .into_iter()
                 .map(|x| x as i64)
                 .collect();
-            let values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+
+            // Get all player values [num_envs * num_players]
+            let values_all_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+
+            // Extract acting player's value for each env
+            let acting_values_data: Vec<f32> = current_players
+                .iter()
+                .enumerate()
+                .map(|(e, &p)| values_all_data[e * num_players + p])
+                .collect();
+
             let log_probs_data: Vec<f32> = log_probs.into_data().to_vec().expect("log_probs to vec");
-            (actions_data, values_data, log_probs_data)
+            (actions_data, acting_values_data, log_probs_data, values_all_data)
         };
 
         // Convert actions to Vec<usize> for environment
         let actions_usize: Vec<usize> = actions_data.iter().map(|&a| a as usize).collect();
 
         // Step environment (CPU-bound)
-        let (rewards, dones, completed) = {
+        let (player_rewards, dones, completed) = {
             profile_scope!("env_step_cpu");
-            let (_next_obs, rewards, dones, completed) = vec_env.step(&actions_usize);
-            (rewards, dones, completed)
+            let (_next_obs, player_rewards, dones, completed) = vec_env.step(&actions_usize);
+            (player_rewards, dones, completed)
         };
         all_completed.extend(completed);
+
+        // Extract acting player's reward for backward-compat single-player path
+        let acting_rewards: Vec<f32> = player_rewards
+            .iter()
+            .zip(current_players.iter())
+            .map(|(r, &p)| r.get(p).copied().unwrap_or(0.0))
+            .collect();
+
+        // Flatten all player rewards [num_envs, num_players] -> [num_envs * num_players]
+        let rewards_flat: Vec<f32> = player_rewards.iter().flat_map(|r| {
+            // Pad with zeros if rewards vec is shorter than num_players
+            (0..num_players).map(|p| r.get(p).copied().unwrap_or(0.0))
+        }).collect();
 
         // Append to CPU buffers
         all_obs.extend_from_slice(&obs_flat);
         all_actions.extend_from_slice(&actions_data);
-        all_rewards.extend_from_slice(&rewards);
+        all_acting_rewards.extend_from_slice(&acting_rewards);
         all_dones.extend(dones.iter().map(|&d| if d { 1.0 } else { 0.0 }));
-        all_values.extend_from_slice(&values_data);
+        all_acting_values.extend_from_slice(&acting_values_data);
         all_log_probs.extend_from_slice(&log_probs_data);
+
+        // Multi-player data
+        all_values_flat.extend_from_slice(&values_all_data);
+        all_rewards_flat.extend_from_slice(&rewards_flat);
+        all_acting_players.extend(current_players.iter().map(|&p| p as i64));
     }
 
     // Batch transfer to GPU
@@ -166,13 +236,21 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         buffer.actions =
             Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device).reshape([num_steps, num_envs]);
         buffer.rewards =
-            Tensor::<B, 1>::from_floats(all_rewards.as_slice(), device).reshape([num_steps, num_envs]);
+            Tensor::<B, 1>::from_floats(all_acting_rewards.as_slice(), device).reshape([num_steps, num_envs]);
         buffer.dones =
             Tensor::<B, 1>::from_floats(all_dones.as_slice(), device).reshape([num_steps, num_envs]);
         buffer.values =
-            Tensor::<B, 1>::from_floats(all_values.as_slice(), device).reshape([num_steps, num_envs]);
+            Tensor::<B, 1>::from_floats(all_acting_values.as_slice(), device).reshape([num_steps, num_envs]);
         buffer.log_probs =
             Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device).reshape([num_steps, num_envs]);
+
+        // Multi-player data
+        buffer.all_values =
+            Tensor::<B, 1>::from_floats(all_values_flat.as_slice(), device).reshape([num_steps, num_envs, num_players]);
+        buffer.all_rewards =
+            Tensor::<B, 1>::from_floats(all_rewards_flat.as_slice(), device).reshape([num_steps, num_envs, num_players]);
+        buffer.acting_players =
+            Tensor::<B, 1, Int>::from_ints(all_acting_players.as_slice(), device).reshape([num_steps, num_envs]);
     }
 
     all_completed
@@ -234,6 +312,137 @@ pub fn compute_gae<B: Backend>(
     buffer.returns = Some(returns_tensor);
 }
 
+/// Compute Generalized Advantage Estimation for multi-player games
+///
+/// Two-pass algorithm:
+/// 1. Attribute cumulative rewards: rewards between turns are credited to last action
+/// 2. Compute GAE using per-player value chains
+///
+/// This handles games where players take turns and rewards from other players'
+/// actions should be attributed to the acting player's previous action.
+pub fn compute_gae_multiplayer<B: Backend>(
+    buffer: &mut RolloutBuffer<B>,
+    last_values: Tensor<B, 2>, // [num_envs, num_players]
+    gamma: f32,
+    gae_lambda: f32,
+    num_players: u8,
+    device: &B::Device,
+) {
+    let num_players = num_players as usize;
+    profile_function!();
+    let [num_steps, num_envs, _] = buffer.all_rewards.dims();
+
+    // Extract data from tensors
+    let all_rewards_data: Vec<f32> = buffer.all_rewards.clone().into_data().to_vec().expect("all_rewards");
+    let all_values_data: Vec<f32> = buffer.all_values.clone().into_data().to_vec().expect("all_values");
+    let dones_data: Vec<f32> = buffer.dones.clone().into_data().to_vec().expect("dones");
+    // Convert through float to avoid IntElem type mismatches between backends
+    let acting_players_data: Vec<usize> = buffer
+        .acting_players
+        .clone()
+        .float()
+        .into_data()
+        .to_vec::<f32>()
+        .expect("acting_players")
+        .into_iter()
+        .map(|x| x as usize)
+        .collect();
+    let last_values_data: Vec<f32> = last_values.into_data().to_vec().expect("last_values");
+
+    // Pass 1: Attribute cumulative rewards to acting player
+    // Walk backwards, accumulating rewards for each player until they act
+    let mut attributed_rewards = vec![0.0_f32; num_steps * num_envs];
+    let mut reward_carry = vec![vec![0.0_f32; num_players]; num_envs];
+
+    for t in (0..num_steps).rev() {
+        for e in 0..num_envs {
+            let idx = t * num_envs + e;
+            let acting_player = acting_players_data[idx];
+            let done = dones_data[idx];
+
+            // This player's immediate reward + any accumulated from other turns
+            let r_idx = (t * num_envs + e) * num_players + acting_player;
+            attributed_rewards[idx] = all_rewards_data[r_idx] + reward_carry[e][acting_player];
+            reward_carry[e][acting_player] = 0.0;
+
+            // Accumulate other players' rewards (they'll get credited when they next act)
+            for p in 0..num_players {
+                if p != acting_player {
+                    reward_carry[e][p] += all_rewards_data[(t * num_envs + e) * num_players + p];
+                }
+            }
+
+            // Reset on episode boundary
+            if done > 0.5 {
+                for p in 0..num_players {
+                    reward_carry[e][p] = 0.0;
+                }
+            }
+        }
+    }
+
+    // Pass 2: Compute GAE using per-player value chains
+    let mut advantages = vec![0.0_f32; num_steps * num_envs];
+    let mut gae_carry = vec![vec![0.0_f32; num_players]; num_envs];
+
+    // Initialize next_value from bootstrap values
+    let mut next_value: Vec<Vec<f32>> = (0..num_envs)
+        .map(|e| {
+            (0..num_players)
+                .map(|p| last_values_data[e * num_players + p])
+                .collect()
+        })
+        .collect();
+
+    for t in (0..num_steps).rev() {
+        for e in 0..num_envs {
+            let idx = t * num_envs + e;
+            let player = acting_players_data[idx];
+            let reward = attributed_rewards[idx];
+            let value = all_values_data[(t * num_envs + e) * num_players + player];
+            let done = dones_data[idx];
+
+            // TD error using this player's next value
+            let delta = reward + gamma * next_value[e][player] * (1.0 - done) - value;
+
+            // GAE for this player
+            let advantage = delta + gamma * gae_lambda * (1.0 - done) * gae_carry[e][player];
+            advantages[idx] = advantage;
+
+            // Update carry for this player
+            gae_carry[e][player] = advantage;
+            next_value[e][player] = value;
+
+            // Reset all players' GAE carry on episode boundary
+            if done > 0.5 {
+                for p in 0..num_players {
+                    gae_carry[e][p] = 0.0;
+                    next_value[e][p] = 0.0;
+                }
+            }
+        }
+    }
+
+    // Store advantages
+    let advantages_tensor: Tensor<B, 2> =
+        Tensor::<B, 1>::from_floats(advantages.as_slice(), device).reshape([num_steps, num_envs]);
+
+    // Compute returns = advantages + acting player's value
+    let values_flat: Vec<f32> = (0..num_steps * num_envs)
+        .map(|i| {
+            let t = i / num_envs;
+            let e = i % num_envs;
+            let p = acting_players_data[t * num_envs + e];
+            all_values_data[(t * num_envs + e) * num_players + p]
+        })
+        .collect();
+    let values_tensor: Tensor<B, 2> =
+        Tensor::<B, 1>::from_floats(values_flat.as_slice(), device).reshape([num_steps, num_envs]);
+
+    buffer.advantages = Some(advantages_tensor.clone());
+    buffer.returns = Some(advantages_tensor + values_tensor);
+}
+
 /// Compute explained variance: 1 - Var(returns - values) / Var(returns)
 /// Values close to 1 indicate good value function predictions
 pub fn compute_explained_variance(values: &[f32], returns: &[f32]) -> f32 {
@@ -289,7 +498,8 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
 ) -> (ActorCritic<B>, UpdateMetrics) {
     profile_function!();
     let device = model.devices()[0].clone();
-    let (obs, actions, old_log_probs, advantages, returns) = buffer.flatten();
+    let num_players = buffer.num_players() as usize;
+    let (obs, actions, old_log_probs, advantages, returns, acting_players) = buffer.flatten();
     let batch_size = obs.dims()[0];
     let minibatch_size = batch_size / config.num_minibatches;
 
@@ -326,17 +536,46 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_actions: Tensor<B, 1, Int> = actions.clone().select(0, mb_indices_tensor.clone());
             let mb_old_log_probs = old_log_probs.clone().select(0, mb_indices_tensor.clone());
             let mb_advantages_raw = advantages.clone().select(0, mb_indices_tensor.clone());
-            let mb_returns = returns.clone().select(0, mb_indices_tensor);
+            let mb_returns = returns.clone().select(0, mb_indices_tensor.clone());
+            let mb_acting_players: Tensor<B, 1, Int> = acting_players.clone().select(0, mb_indices_tensor);
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
 
             // Forward pass with GPU sync for accurate timing
-            let (logits, values) = {
+            let (logits, all_values) = {
                 profile_scope!("minibatch_forward");
                 let result = model.forward(mb_obs);
                 gpu_sync!(result.0); // Force sync to get accurate forward timing
                 result
+            };
+
+            // Extract acting player's value for each sample in minibatch
+            let mb_size = logits.dims()[0];
+            let values: Tensor<B, 1> = if num_players == 1 {
+                // Single-player: just extract player 0
+                all_values.slice([0..mb_size, 0..1]).flatten(0, 1)
+            } else {
+                // Multi-player: extract acting player's value for each sample
+                // This is done on CPU since gather operations on GPU can be slow for small tensors
+                let all_values_data: Vec<f32> = all_values.clone().into_data().to_vec().expect("values");
+                // Convert through float to avoid IntElem type mismatches between backends
+                let acting_data: Vec<usize> = mb_acting_players
+                    .clone()
+                    .float()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .expect("acting")
+                    .into_iter()
+                    .map(|x| x as usize)
+                    .collect();
+                let values_vec: Vec<f32> = (0..mb_size)
+                    .map(|i| {
+                        let player = acting_data[i];
+                        all_values_data[i * num_players + player]
+                    })
+                    .collect();
+                Tensor::<B, 1>::from_floats(values_vec.as_slice(), &device)
             };
 
             // Compute losses and backward pass (combined for accurate timing)
@@ -496,11 +735,25 @@ mod tests {
     #[test]
     fn test_rollout_buffer_creation() {
         let device = Default::default();
-        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(128, 4, 4, &device);
+        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(128, 4, 4, 1u8, &device);
 
         assert_eq!(buffer.observations.dims(), [128, 4, 4]);
         assert_eq!(buffer.actions.dims(), [128, 4]);
         assert_eq!(buffer.rewards.dims(), [128, 4]);
+        assert_eq!(buffer.all_values.dims(), [128, 4, 1]);
+        assert_eq!(buffer.all_rewards.dims(), [128, 4, 1]);
+        assert_eq!(buffer.acting_players.dims(), [128, 4]);
+    }
+
+    #[test]
+    fn test_rollout_buffer_multiplayer() {
+        let device = Default::default();
+        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(64, 8, 86, 2u8, &device);
+
+        assert_eq!(buffer.observations.dims(), [64, 8, 86]);
+        assert_eq!(buffer.all_values.dims(), [64, 8, 2]);
+        assert_eq!(buffer.all_rewards.dims(), [64, 8, 2]);
+        assert_eq!(buffer.num_players(), 2u8);
     }
 
     #[test]
@@ -508,8 +761,9 @@ mod tests {
         let device = Default::default();
         let num_steps = 4;
         let num_envs = 2;
+        let num_players = 1u8;
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(num_steps, num_envs, 1, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(num_steps, num_envs, 1, num_players, &device);
 
         // Set up simple rewards and values for testing
         buffer.rewards = Tensor::from_floats(
@@ -535,21 +789,69 @@ mod tests {
     }
 
     #[test]
+    fn test_gae_multiplayer() {
+        let device = Default::default();
+        let num_steps = 4;
+        let num_envs = 2;
+        let num_players = 2u8;
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(num_steps, num_envs, 86, num_players, &device);
+
+        // Set up multi-player data
+        // All rewards and values for both players
+        buffer.all_rewards = Tensor::from_floats(
+            [
+                [[0.0, 0.0], [0.0, 0.0]],
+                [[0.0, 0.0], [0.0, 0.0]],
+                [[0.0, 0.0], [0.0, 0.0]],
+                [[1.0, 0.0], [0.0, 1.0]], // Final rewards: env 0 P0 wins, env 1 P1 wins
+            ],
+            &device,
+        );
+        buffer.all_values = Tensor::from_floats(
+            [
+                [[0.5, 0.5], [0.5, 0.5]],
+                [[0.5, 0.5], [0.5, 0.5]],
+                [[0.5, 0.5], [0.5, 0.5]],
+                [[0.5, 0.5], [0.5, 0.5]],
+            ],
+            &device,
+        );
+        // Alternating players: P0, P1, P0, P1
+        buffer.acting_players = Tensor::from_ints([[0, 0], [1, 1], [0, 0], [1, 1]], &device);
+        buffer.dones = Tensor::from_floats(
+            [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 1.0]],
+            &device,
+        );
+
+        let last_values: Tensor<TestBackend, 2> = Tensor::from_floats(
+            [[0.0, 0.0], [0.0, 0.0]], // Terminal state, values don't matter
+            &device,
+        );
+
+        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, num_players, &device);
+
+        assert!(buffer.advantages.is_some());
+        assert!(buffer.returns.is_some());
+    }
+
+    #[test]
     fn test_buffer_flatten() {
         let device = Default::default();
-        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, &device);
+        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
 
         // Set advantages and returns
         let mut buffer = buffer;
         buffer.advantages = Some(Tensor::ones([4, 2], &device));
         buffer.returns = Some(Tensor::ones([4, 2], &device));
 
-        let (obs, actions, log_probs, advantages, returns) = buffer.flatten();
+        let (obs, actions, log_probs, advantages, returns, acting_players) = buffer.flatten();
 
         assert_eq!(obs.dims(), [8, 3]);
         assert_eq!(actions.dims(), [8]);
         assert_eq!(log_probs.dims(), [8]);
         assert_eq!(advantages.dims(), [8]);
         assert_eq!(returns.dims(), [8]);
+        assert_eq!(acting_players.dims(), [8]);
     }
 }
