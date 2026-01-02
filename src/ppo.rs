@@ -111,7 +111,7 @@ impl<B: Backend> RolloutBuffer<B> {
 /// Runs num_steps in each of num_envs environments, storing trajectories.
 /// Uses CPU collection with batch GPU transfer for performance.
 /// If normalizer is provided, observations are normalized before model inference
-/// and the normalizer's running statistics are updated.
+/// using existing (lagged) statistics, then stats are updated at end of rollout.
 pub fn collect_rollouts<B: Backend, E: Environment>(
     model: &ActorCritic<B>,
     vec_env: &mut VecEnv<E>,
@@ -140,16 +140,32 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
 
+    // Collect raw observations for normalizer stats update at end of rollout
+    // This implements "lagged" normalization: normalize with existing stats,
+    // then update stats for the NEXT rollout
+    let collect_raw_obs = normalizer.is_some();
+    let mut raw_obs_for_stats: Vec<f32> = if collect_raw_obs {
+        Vec::with_capacity(num_steps * num_envs * obs_dim)
+    } else {
+        Vec::new()
+    };
+
     for _step in 0..num_steps {
         profile_scope!("rollout_step");
 
         // Get current players BEFORE the step (who is about to act)
         let current_players = vec_env.get_current_players();
 
-        // Get current observations and optionally normalize
+        // Get current observations
         let mut obs_flat = vec_env.get_observations();
-        if let Some(norm) = normalizer.as_mut() {
-            norm.update_batch(&obs_flat, obs_dim);
+
+        // Store raw observations BEFORE normalization for stats update
+        if collect_raw_obs {
+            raw_obs_for_stats.extend_from_slice(&obs_flat);
+        }
+
+        // Normalize using EXISTING (lagged) stats - don't update stats yet
+        if let Some(ref norm) = normalizer {
             norm.normalize_batch(&mut obs_flat, obs_dim);
         }
 
@@ -251,6 +267,12 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             Tensor::<B, 1>::from_floats(all_rewards_flat.as_slice(), device).reshape([num_steps, num_envs, num_players]);
         buffer.acting_players =
             Tensor::<B, 1, Int>::from_ints(all_acting_players.as_slice(), device).reshape([num_steps, num_envs]);
+    }
+
+    // Update normalizer stats at end of rollout with all RAW observations
+    // This ensures stats are updated for the NEXT rollout, not the current one
+    if let Some(norm) = normalizer.as_mut() {
+        norm.update_batch(&raw_obs_for_stats, obs_dim);
     }
 
     all_completed

@@ -1,9 +1,25 @@
 # PPO configuration for CartPole
 # Optimized based on ablation experiments (see docs/DESIGN.md)
+#
+# SCALING NOTES:
+# PPO learns via rollout count, not just sample count. Key relationships:
+#   rollouts = total_timesteps / (num_envs * num_steps)
+#   batch_size = num_envs * num_steps
+#   minibatch_size = batch_size / num_minibatches
+#
+# When increasing num_envs for better GPU utilization:
+#   1. Scale total_timesteps proportionally to maintain rollout count
+#   2. Scale num_minibatches to keep minibatch_size ~128-256
+#   3. Keep num_epochs * num_minibatches similar for same updates/rollout
+#
+# Example scaling from 4 to 16 envs:
+#   num_envs = 16, total_timesteps = 800_000 (4x samples for same rollouts)
+#   num_minibatches = 8 (keeps minibatch_size = 256)
+#   num_epochs = 2 (keeps gradient updates per rollout similar)
 
 # Environment
 env = "cartpole"
-num_envs = "auto"    # Scales to CPU cores. Higher = smoother gradients, more memory.
+num_envs = 4         # 4 envs optimal for 200k steps. Scale with total_timesteps.
 num_steps = 128      # Steps per rollout. 64-256 typical.
 
 # PPO hyperparameters
@@ -18,11 +34,9 @@ entropy_coef = 0.01      # Entropy bonus for exploration. Range: 0.001 to 0.1.
 entropy_anneal = false   # Decay entropy coef over training. Enable with higher initial (0.05).
 value_coef = 0.5         # Value loss weight. 0.5 standard.
 max_grad_norm = 0.5      # Gradient clipping. Prevents exploding gradients.
-target_kl = 0.02         # KL early stopping threshold. Stops epoch if exceeded.
-                         # Range: 0.01-0.05. Prevents destructive policy updates.
-                         # Improves training stability.
-normalize_obs = true     # Normalize observations using running mean/std.
-                         # Improves convergence speed and stability.
+# target_kl = 0.02      # KL early stopping. Optional for CartPole.
+normalize_obs = false    # CartPole observations are already well-scaled.
+                         # Normalization can hurt simple environments.
 
 # Training
 total_timesteps = 200_000    # Sufficient for CartPole. Connect Four needs 2-5M.

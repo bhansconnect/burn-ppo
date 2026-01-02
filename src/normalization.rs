@@ -148,4 +148,115 @@ mod tests {
         assert!(extreme[0] <= 5.0);
         assert!(extreme[0] >= -5.0);
     }
+
+    #[test]
+    fn test_normalize_does_not_modify_stats() {
+        // Verify that normalize_batch doesn't change normalizer state
+        let mut norm = ObsNormalizer::new(2, 10.0);
+
+        // Pre-populate with some data
+        norm.update_batch(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2);
+
+        let count_before = norm.count;
+        let mean_before = norm.mean.clone();
+        let var_before = norm.var.clone();
+
+        // Normalize some data - should NOT modify state
+        let mut obs = vec![100.0, 200.0];
+        norm.normalize_batch(&mut obs, 2);
+
+        // Stats should be unchanged
+        assert_eq!(norm.count, count_before);
+        assert_eq!(norm.mean, mean_before);
+        assert_eq!(norm.var, var_before);
+    }
+
+    #[test]
+    fn test_normalize_with_insufficient_samples() {
+        // Verify count < 2 returns identity (unnormalized)
+        let mut norm = ObsNormalizer::new(2, 10.0);
+
+        // Only 1 sample - not enough for variance
+        norm.update_batch(&[5.0, 10.0], 2);
+        assert_eq!(norm.count, 1.0);
+
+        let mut obs = vec![3.0, 7.0];
+        let original = obs.clone();
+        norm.normalize_batch(&mut obs, 2);
+
+        // Should return unchanged (identity transform)
+        assert_eq!(obs, original);
+    }
+
+    #[test]
+    fn test_welford_correctness() {
+        // Verify Welford's algorithm computes correct mean and variance
+        let mut norm = ObsNormalizer::new(1, 10.0);
+
+        // Known data: [1, 2, 3, 4, 5] -> mean=3, population_variance=2
+        norm.update_batch(&[1.0, 2.0, 3.0, 4.0, 5.0], 1);
+
+        // Mean should be 3.0
+        assert!((norm.mean[0] - 3.0).abs() < 1e-6);
+
+        // Variance = M2/count = 2.0 (population variance)
+        let variance = norm.var[0] / norm.count;
+        assert!((variance - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_batch_update_equals_sequential() {
+        // Verify batch update gives same result as sequential updates
+        let mut norm1 = ObsNormalizer::new(1, 10.0);
+        let mut norm2 = ObsNormalizer::new(1, 10.0);
+
+        let obs = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+
+        // Update all at once
+        norm1.update_batch(&obs, 1);
+
+        // Update one by one
+        for &o in &obs {
+            norm2.update_batch(&[o], 1);
+        }
+
+        // Results should be identical (Welford's is order-independent)
+        assert!((norm1.mean[0] - norm2.mean[0]).abs() < 1e-10);
+        assert!((norm1.var[0] - norm2.var[0]).abs() < 1e-10);
+        assert_eq!(norm1.count, norm2.count);
+    }
+
+    #[test]
+    fn test_lagged_normalization_behavior() {
+        // Test that stats can be used for normalization BEFORE being updated
+        // This simulates the correct PPO behavior: normalize with old stats,
+        // then update stats for next rollout
+        let mut norm = ObsNormalizer::new(1, 10.0);
+
+        // Initial data to establish baseline stats
+        norm.update_batch(&[0.0, 10.0], 1);
+        // mean = 5.0, var = 50.0, count = 2
+
+        // Save state before new batch
+        let mean_before = norm.mean[0];
+        let var_before = norm.var[0];
+
+        // New observation to normalize
+        let new_obs_raw = 15.0;
+        let mut new_obs = vec![new_obs_raw];
+
+        // Step 1: Normalize using EXISTING stats (before update)
+        norm.normalize_batch(&mut new_obs, 1);
+
+        // Expected normalized value: (15 - 5) / sqrt(50/2) = 10/5 = 2.0
+        let expected = (new_obs_raw as f64 - mean_before) / (var_before / 2.0).sqrt();
+        assert!((new_obs[0] as f64 - expected).abs() < 0.01);
+
+        // Step 2: Update stats with raw observation (for next rollout)
+        norm.update_batch(&[new_obs_raw], 1);
+
+        // Stats should now be updated
+        assert!(norm.count > 2.0);
+        assert!((norm.mean[0] - mean_before).abs() > 0.1); // Mean changed
+    }
 }
