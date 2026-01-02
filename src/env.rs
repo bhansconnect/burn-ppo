@@ -97,6 +97,8 @@ pub struct VecEnv<E: Environment> {
     episode_rewards: Vec<Vec<f32>>,
     /// Steps taken per env (reset on episode end)
     episode_lengths: Vec<usize>,
+    /// Envs in terminal state (won't step or reset) [num_envs]
+    terminal: Vec<bool>,
 }
 
 impl<E: Environment> VecEnv<E> {
@@ -120,6 +122,7 @@ impl<E: Environment> VecEnv<E> {
             obs_buffer,
             episode_rewards: vec![vec![0.0; E::NUM_PLAYERS]; num_envs],
             episode_lengths: vec![0; num_envs],
+            terminal: vec![false; num_envs],
         }
     }
 
@@ -154,6 +157,21 @@ impl<E: Environment> VecEnv<E> {
         Some(masks)
     }
 
+    /// Mark an env as terminal (won't step or reset)
+    pub fn set_terminal(&mut self, idx: usize) {
+        self.terminal[idx] = true;
+    }
+
+    /// Get mask of terminal envs
+    pub fn terminal_mask(&self) -> &[bool] {
+        &self.terminal
+    }
+
+    /// Count of non-terminal (active) envs
+    pub fn active_count(&self) -> usize {
+        self.terminal.iter().filter(|&&t| !t).count()
+    }
+
     /// Step all environments with given actions
     ///
     /// Returns:
@@ -180,39 +198,47 @@ impl<E: Environment> VecEnv<E> {
                 .zip(self.episode_rewards.par_iter_mut())
                 .zip(self.episode_lengths.par_iter_mut())
                 .zip(self.obs_buffer.par_chunks_mut(E::OBSERVATION_DIM))
+                .zip(self.terminal.par_iter())
                 .enumerate()
-                .map(|(env_idx, ((((env, &action), ep_rewards), length), obs_chunk))| {
-                    #[cfg(feature = "tracy")]
-                    let _span = tracy_client::span!("env_step");
+                .map(
+                    |(env_idx, (((((env, &action), ep_rewards), length), obs_chunk), &is_terminal))| {
+                        #[cfg(feature = "tracy")]
+                        let _span = tracy_client::span!("env_step");
 
-                    let (new_obs, step_rewards, done) = env.step(action);
-
-                    // Accumulate per-player rewards
-                    for (i, &r) in step_rewards.iter().enumerate() {
-                        ep_rewards[i] += r;
-                    }
-                    *length += 1;
-
-                    let completed = if done {
-                        let stats = EpisodeStats {
-                            total_rewards: ep_rewards.clone(),
-                            length: *length,
-                            env_index: env_idx,
-                        };
-                        let reset_obs = env.reset();
-                        obs_chunk.copy_from_slice(&reset_obs);
-                        for r in ep_rewards.iter_mut() {
-                            *r = 0.0;
+                        // Skip terminal envs entirely
+                        if is_terminal {
+                            return (vec![0.0; num_players], true, None);
                         }
-                        *length = 0;
-                        Some(stats)
-                    } else {
-                        obs_chunk.copy_from_slice(&new_obs);
-                        None
-                    };
 
-                    (step_rewards, done, completed)
-                })
+                        let (new_obs, step_rewards, done) = env.step(action);
+
+                        // Accumulate per-player rewards
+                        for (i, &r) in step_rewards.iter().enumerate() {
+                            ep_rewards[i] += r;
+                        }
+                        *length += 1;
+
+                        let completed = if done {
+                            let stats = EpisodeStats {
+                                total_rewards: ep_rewards.clone(),
+                                length: *length,
+                                env_index: env_idx,
+                            };
+                            let reset_obs = env.reset();
+                            obs_chunk.copy_from_slice(&reset_obs);
+                            for r in ep_rewards.iter_mut() {
+                                *r = 0.0;
+                            }
+                            *length = 0;
+                            Some(stats)
+                        } else {
+                            obs_chunk.copy_from_slice(&new_obs);
+                            None
+                        };
+
+                        (step_rewards, done, completed)
+                    },
+                )
                 .collect()
         };
 

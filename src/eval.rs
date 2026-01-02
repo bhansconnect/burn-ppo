@@ -5,7 +5,6 @@
 /// - Stats mode: parallel game execution with win/loss/draw statistics
 /// - Temperature-based sampling with schedule support
 /// - ELO delta calculation for 2-player games
-
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
 use std::thread;
@@ -123,18 +122,13 @@ pub fn sample_with_temperature(
 
     // Apply temperature: softmax(logits / temp)
     let scaled: Vec<f32> = masked_logits.iter().map(|x| x / temperature).collect();
-    let max = scaled
-        .iter()
-        .cloned()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp: Vec<f32> = scaled.iter().map(|x| (x - max).exp()).collect();
     let sum: f32 = exp.iter().sum();
 
     if sum == 0.0 {
         // All actions masked or numerical issues, fall back to first valid
-        return mask
-            .and_then(|m| m.iter().position(|&v| v))
-            .unwrap_or(0);
+        return mask.and_then(|m| m.iter().position(|&v| v)).unwrap_or(0);
     }
 
     let probs: Vec<f32> = exp.iter().map(|x| x / sum).collect();
@@ -279,12 +273,7 @@ impl EvalStats {
     }
 
     /// Record a game outcome with optional rewards and length
-    pub fn record_with_rewards(
-        &mut self,
-        outcome: &GameOutcome,
-        rewards: &[f32],
-        length: usize,
-    ) {
+    pub fn record_with_rewards(&mut self, outcome: &GameOutcome, rewards: &[f32], length: usize) {
         self.game_rewards
             .push(rewards.iter().map(|&r| r as f64).collect());
         self.episode_lengths.push(length);
@@ -389,7 +378,10 @@ impl EvalStats {
         let p50 = rewards[(rewards.len() * 50 / 100).min(rewards.len() - 1)];
         let p75 = rewards[(rewards.len() * 75 / 100).min(rewards.len() - 1)];
 
-        println!("Checkpoint: {}", checkpoint_names.first().unwrap_or(&String::new()));
+        println!(
+            "Checkpoint: {}",
+            checkpoint_names.first().unwrap_or(&String::new())
+        );
         println!();
         println!("Reward Distribution:");
         println!("  Mean:   {:.1} ± {:.1} (std)", mean, std);
@@ -400,8 +392,8 @@ impl EvalStats {
 
         // Episode length stats if available
         if !self.episode_lengths.is_empty() {
-            let avg_len: f64 =
-                self.episode_lengths.iter().sum::<usize>() as f64 / self.episode_lengths.len() as f64;
+            let avg_len: f64 = self.episode_lengths.iter().sum::<usize>() as f64
+                / self.episode_lengths.len() as f64;
             let min_len = self.episode_lengths.iter().min().copied().unwrap_or(0);
             let max_len = self.episode_lengths.iter().max().copied().unwrap_or(0);
             println!();
@@ -430,10 +422,7 @@ impl EvalStats {
             } else {
                 "checkpoint 1 stronger"
             };
-            println!(
-                "\nELO Delta: {:+.0} ± {:.0} ({})",
-                delta, stderr, stronger
-            );
+            println!("\nELO Delta: {:+.0} ± {:.0} ({})", delta, stderr, stronger);
         }
     }
 
@@ -505,8 +494,8 @@ fn load_model_from_checkpoint<B: Backend>(
 ) -> Result<(ActorCritic<B>, CheckpointMetadata)> {
     // Load metadata to get network dimensions
     let metadata_path = checkpoint_path.join("metadata.json");
-    let metadata_json = std::fs::read_to_string(&metadata_path)
-        .context("Failed to read checkpoint metadata")?;
+    let metadata_json =
+        std::fs::read_to_string(&metadata_path).context("Failed to read checkpoint metadata")?;
     let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
 
     // Create config with network architecture from metadata
@@ -524,8 +513,12 @@ fn load_model_from_checkpoint<B: Backend>(
 
 /// Run evaluation based on command-line arguments
 pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result<()> {
-    // Load all checkpoints
-    let mut models = Vec::new();
+    use std::collections::HashMap;
+
+    // Load unique checkpoints with deduplication
+    let mut models: Vec<ActorCritic<B>> = Vec::new();
+    let mut path_to_model_idx: HashMap<std::path::PathBuf, usize> = HashMap::new();
+    let mut checkpoint_to_model: Vec<usize> = Vec::new();
     let mut checkpoint_names = Vec::new();
     let mut metadata_opt: Option<CheckpointMetadata> = None;
 
@@ -539,39 +532,51 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
             path.clone()
         };
 
-        let (model, metadata) = load_model_from_checkpoint::<B>(&resolved, device)?;
-
-        // Store first metadata for environment info
-        if metadata_opt.is_none() {
-            metadata_opt = Some(metadata.clone());
+        // Check if this path was already loaded (deduplication)
+        let model_idx = if let Some(&idx) = path_to_model_idx.get(&resolved) {
+            idx
         } else {
-            // Verify all checkpoints are for the same environment
-            let first = metadata_opt.as_ref().unwrap();
-            if metadata.obs_dim != first.obs_dim
-                || metadata.action_count != first.action_count
-                || metadata.num_players != first.num_players
-            {
-                anyhow::bail!(
-                    "Checkpoint {} has different dimensions than first checkpoint",
-                    path.display()
-                );
-            }
-        }
+            let (model, metadata) = load_model_from_checkpoint::<B>(&resolved, device)?;
 
-        models.push(model);
+            // Store first metadata for environment info
+            if metadata_opt.is_none() {
+                metadata_opt = Some(metadata.clone());
+            } else {
+                // Verify all checkpoints are for the same environment
+                let first = metadata_opt.as_ref().unwrap();
+                if metadata.obs_dim != first.obs_dim
+                    || metadata.action_count != first.action_count
+                    || metadata.num_players != first.num_players
+                {
+                    anyhow::bail!(
+                        "Checkpoint {} has different dimensions than first checkpoint",
+                        path.display()
+                    );
+                }
+            }
+
+            let idx = models.len();
+            models.push(model);
+            path_to_model_idx.insert(resolved, idx);
+            idx
+        };
+
+        checkpoint_to_model.push(model_idx);
         checkpoint_names.push(path.display().to_string());
     }
 
     let metadata = metadata_opt.context("No checkpoints provided")?;
 
     // Verify we have right number of checkpoints for environment
-    if metadata.num_players > 1 && models.len() != metadata.num_players {
-        if models.len() == 1 {
-            // Self-play: duplicate the model for all players
-            println!("Self-play mode: using same checkpoint for all {} players", metadata.num_players);
+    if metadata.num_players > 1 && checkpoint_to_model.len() != metadata.num_players {
+        if checkpoint_to_model.len() == 1 {
+            // Self-play: all players use the same checkpoint (no reload needed)
+            println!(
+                "Self-play mode: using same checkpoint for all {} players",
+                metadata.num_players
+            );
             for _ in 1..metadata.num_players {
-                let (model, _) = load_model_from_checkpoint::<B>(&args.checkpoints[0], device)?;
-                models.push(model);
+                checkpoint_to_model.push(0); // All point to first (and only) model
                 checkpoint_names.push(checkpoint_names[0].clone());
             }
         } else {
@@ -579,7 +584,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
                 "Expected {} checkpoints for {}-player game, got {}",
                 metadata.num_players,
                 metadata.num_players,
-                models.len()
+                checkpoint_to_model.len()
             );
         }
     }
@@ -595,6 +600,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     if watch {
         run_watch_mode::<B>(
             &models,
+            &checkpoint_to_model,
             &checkpoint_names,
             &metadata,
             num_games,
@@ -604,6 +610,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     } else {
         run_stats_mode::<B>(
             &models,
+            &checkpoint_to_model,
             &checkpoint_names,
             &metadata,
             num_games,
@@ -616,6 +623,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
 /// Run evaluation in watch mode (sequential, with rendering)
 fn run_watch_mode<B: Backend>(
     models: &[ActorCritic<B>],
+    checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     metadata: &CheckpointMetadata,
     num_games: usize,
@@ -630,6 +638,7 @@ fn run_watch_mode<B: Backend>(
     dispatch_env!(metadata.env_name, {
         run_watch_mode_env::<B, E>(
             models,
+            checkpoint_to_model,
             checkpoint_names,
             num_games,
             &temp_schedule,
@@ -645,6 +654,7 @@ fn run_watch_mode<B: Backend>(
 /// Watch mode implementation for a specific environment type
 fn run_watch_mode_env<B: Backend, E: Environment>(
     models: &[ActorCritic<B>],
+    checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     num_games: usize,
     temp_schedule: &TempSchedule,
@@ -675,7 +685,9 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
         loop {
             let frame_start = if animate { Some(Instant::now()) } else { None };
             let current_player = env.current_player();
-            let model = &models[current_player];
+            // In watch mode, checkpoint_idx == player_idx (no position swapping)
+            let model_idx = checkpoint_to_model[current_player];
+            let model = &models[model_idx];
             let mask = env.action_mask();
 
             // Get action from model
@@ -783,6 +795,7 @@ fn wait_for_enter() {
 /// Run evaluation in stats mode (parallel)
 fn run_stats_mode<B: Backend>(
     models: &[ActorCritic<B>],
+    checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     metadata: &CheckpointMetadata,
     num_games: usize,
@@ -797,6 +810,7 @@ fn run_stats_mode<B: Backend>(
     dispatch_env!(metadata.env_name, {
         run_stats_mode_env::<B, E>(
             models,
+            checkpoint_to_model,
             checkpoint_names,
             num_games,
             args.num_envs,
@@ -810,6 +824,7 @@ fn run_stats_mode<B: Backend>(
 /// Stats mode implementation for a specific environment type
 fn run_stats_mode_env<B: Backend, E: Environment>(
     models: &[ActorCritic<B>],
+    checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     num_games: usize,
     num_envs: usize,
@@ -827,7 +842,8 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
 
     // Create vectorized environment with unique seeds per env
     let base_seed = rng.next_u64();
-    let mut vec_env: VecEnv<E> = VecEnv::new(num_envs, |i| E::new(base_seed.wrapping_add(i as u64)));
+    let mut vec_env: VecEnv<E> =
+        VecEnv::new(num_envs, |i| E::new(base_seed.wrapping_add(i as u64)));
     let mut stats = EvalStats::new(num_players);
 
     // Track move counts per environment (for temperature schedule)
@@ -853,9 +869,15 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
     let mut games_completed = 0;
 
     while games_completed < num_games {
+        // Check if all envs are terminal
+        if vec_env.active_count() == 0 {
+            break;
+        }
+
         let obs_flat = vec_env.get_observations();
         let current_players = vec_env.get_current_players();
         let masks_flat = vec_env.get_action_masks();
+        let terminal_mask = vec_env.terminal_mask();
 
         // Build actions for each environment
         let mut actions = vec![0usize; num_envs];
@@ -868,6 +890,11 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
             let mut env_masks = Vec::new();
 
             for env_idx in 0..num_envs {
+                // Skip terminal envs
+                if terminal_mask[env_idx] {
+                    continue;
+                }
+
                 let current_player = current_players[env_idx];
                 // Which checkpoint controls this player position in this env?
                 let checkpoint_for_player = positions[env_idx]
@@ -875,7 +902,8 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
                     .position(|&p| p == current_player)
                     .unwrap_or(current_player);
 
-                if checkpoint_for_player == model_idx {
+                // Check if this checkpoint uses the current model (supports deduplication)
+                if checkpoint_to_model[checkpoint_for_player] == model_idx {
                     env_indices.push(env_idx);
 
                     let offset = env_idx * obs_dim;
@@ -925,8 +953,16 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
             *count += 1;
         }
 
-        // Process completed episodes
+        // Process completed episodes (cap at num_games)
+        let completed_env_indices: Vec<usize> =
+            completed_episodes.iter().map(|ep| ep.env_index).collect();
+
         for ep in completed_episodes.into_iter() {
+            // Only record up to num_games
+            if games_completed >= num_games {
+                continue;
+            }
+
             games_completed += 1;
 
             // Use the env_index from the completed episode
@@ -969,13 +1005,41 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
                 };
             }
 
-            if games_completed >= num_games {
-                break;
-            }
-
             // Progress indicator
             if games_completed % 100 == 0 {
                 println!("  {} / {} games completed", games_completed, num_games);
+            }
+        }
+
+        // Freeze excess envs to hit exact target
+        // This ensures slow games complete while hitting exact num_games
+        let remaining = num_games.saturating_sub(games_completed);
+        let active = vec_env.active_count();
+
+        if active > remaining {
+            let to_freeze = active - remaining;
+            let mut frozen = 0;
+
+            // Prefer freezing just-reset envs (preserves mid-game envs)
+            for &env_idx in &completed_env_indices {
+                if frozen >= to_freeze {
+                    break;
+                }
+                if !vec_env.terminal_mask()[env_idx] {
+                    vec_env.set_terminal(env_idx);
+                    frozen += 1;
+                }
+            }
+
+            // Fallback: freeze any remaining active
+            for i in 0..num_envs {
+                if frozen >= to_freeze {
+                    break;
+                }
+                if !vec_env.terminal_mask()[i] {
+                    vec_env.set_terminal(i);
+                    frozen += 1;
+                }
             }
         }
     }
@@ -984,7 +1048,6 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
 
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1034,6 +1097,8 @@ mod tests {
             num_envs: 64,
             watch: false,
             step: false,
+            animate: false,
+            fps: 10,
             seed: None,
             temperature: 0.5,
             temp_final: None,
@@ -1065,6 +1130,8 @@ mod tests {
             num_envs: 64,
             watch: false,
             step: false,
+            animate: false,
+            fps: 10,
             seed: None,
             temperature: 0.5,
             temp_final: Some(0.1), // final without cutoff = error
@@ -1073,7 +1140,10 @@ mod tests {
         };
         let result = TempSchedule::from_args(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--temp-final requires --temp-cutoff"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--temp-final requires --temp-cutoff"));
     }
 
     #[test]
@@ -1086,6 +1156,8 @@ mod tests {
             num_envs: 64,
             watch: false,
             step: false,
+            animate: false,
+            fps: 10,
             seed: None,
             temperature: 0.5,
             temp_final: None,
@@ -1094,7 +1166,10 @@ mod tests {
         };
         let result = TempSchedule::from_args(&args);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("--temp-decay requires --temp-cutoff"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("--temp-decay requires --temp-cutoff"));
     }
 
     #[test]
