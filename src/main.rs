@@ -5,6 +5,7 @@ mod checkpoint;
 mod config;
 mod env;
 mod envs;
+mod eval;
 mod metrics;
 mod network;
 mod normalization;
@@ -26,7 +27,7 @@ use rand::SeedableRng;
 
 use crate::backend::{init_device, backend_name, device_name, TrainingBackend};
 use crate::checkpoint::{CheckpointManager, CheckpointMetadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer, save_rng_state};
-use crate::config::{CliArgs, Config};
+use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{Environment, VecEnv};
 use crate::envs::{CartPole, ConnectFour};
 use crate::metrics::MetricsLogger;
@@ -497,7 +498,10 @@ where
                 obs_dim,
                 action_count,
                 num_players: num_players as usize,
+                hidden_size: config.hidden_size,
+                num_hidden: config.num_hidden,
                 forked_from: config.forked_from.clone(),
+                env_name: E::NAME.to_string(),
             };
 
             let checkpoint_path = checkpoint_manager.save(&model, &metadata)?;
@@ -558,8 +562,27 @@ fn main() -> Result<()> {
     #[cfg(feature = "tracy")]
     tracy_client::set_thread_name!("Main");
 
-    let args = CliArgs::parse();
+    let cli = Cli::parse();
 
+    // Dispatch based on subcommand
+    match cli.command {
+        Some(Command::Eval(eval_args)) => {
+            let device = init_device();
+            return eval::run_evaluation::<TrainingBackend>(&eval_args, &device);
+        }
+        Some(Command::Train(args)) => {
+            // Training mode with explicit subcommand
+            run_training_cli(args)
+        }
+        None => {
+            // Default: parse as training args
+            let args = CliArgs::parse();
+            run_training_cli(args)
+        }
+    }
+}
+
+fn run_training_cli(args: CliArgs) -> Result<()> {
     // Determine training mode
     let mode = if let Some(resume_path) = &args.resume {
         // Resume mode: continue existing run

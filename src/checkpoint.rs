@@ -41,14 +41,33 @@ pub struct CheckpointMetadata {
     /// Number of players (for value head dimension)
     #[serde(default = "default_num_players")]
     pub num_players: usize,
+    /// Hidden layer size (for network reconstruction)
+    #[serde(default = "default_hidden_size")]
+    pub hidden_size: usize,
+    /// Number of hidden layers (for network reconstruction)
+    #[serde(default = "default_num_hidden")]
+    pub num_hidden: usize,
     /// Parent run name if this run was forked from another
     #[serde(default)]
     pub forked_from: Option<String>,
+    /// Environment name for dispatching at eval time
+    #[serde(default)]
+    pub env_name: String,
 }
 
 /// Default num_players for backward compatibility with older checkpoints
 fn default_num_players() -> usize {
     1
+}
+
+/// Default hidden_size for backward compatibility with older checkpoints
+fn default_hidden_size() -> usize {
+    64
+}
+
+/// Default num_hidden for backward compatibility with older checkpoints
+fn default_num_hidden() -> usize {
+    2
 }
 
 
@@ -349,7 +368,10 @@ mod tests {
             obs_dim: 4,
             action_count: 2,
             num_players: 1,
+            hidden_size: 64,
+            num_hidden: 2,
             forked_from: None,
+            env_name: "cartpole".to_string(),
         };
 
         let checkpoint_path = manager.save(&model, &metadata).unwrap();
@@ -393,7 +415,10 @@ mod tests {
                     obs_dim: 4,
                     action_count: 2,
                     num_players: 1,
+                    hidden_size: 64,
+                    num_hidden: 2,
                     forked_from: None,
+                    env_name: "cartpole".to_string(),
                 },
             )
             .unwrap();
@@ -411,7 +436,10 @@ mod tests {
                     obs_dim: 4,
                     action_count: 2,
                     num_players: 1,
+                    hidden_size: 64,
+                    num_hidden: 2,
                     forked_from: None,
+                    env_name: "cartpole".to_string(),
                 },
             )
             .unwrap();
@@ -429,7 +457,10 @@ mod tests {
                     obs_dim: 4,
                     action_count: 2,
                     num_players: 1,
+                    hidden_size: 64,
+                    num_hidden: 2,
                     forked_from: None,
+                    env_name: "cartpole".to_string(),
                 },
             )
             .unwrap();
@@ -441,5 +472,93 @@ mod tests {
         // Verify latest points to step 3000
         let latest = manager.latest_checkpoint().unwrap();
         assert!(latest.to_string_lossy().contains("step_00003000"));
+    }
+
+    #[test]
+    fn test_default_hidden_size() {
+        assert_eq!(default_hidden_size(), 64);
+    }
+
+    #[test]
+    fn test_default_num_hidden() {
+        assert_eq!(default_num_hidden(), 2);
+    }
+
+    #[test]
+    fn test_backward_compat_deserialize_old_checkpoint_metadata() {
+        // Simulate old checkpoint JSON without new fields
+        let old_json = r#"{
+            "step": 5000,
+            "avg_return": 100.0,
+            "rng_seed": 42,
+            "best_avg_return": 100.0,
+            "recent_returns": [100.0],
+            "obs_dim": 4,
+            "action_count": 2,
+            "num_players": 1
+        }"#;
+
+        let metadata: CheckpointMetadata = serde_json::from_str(old_json).unwrap();
+
+        // Verify defaults are applied for missing fields
+        assert_eq!(metadata.hidden_size, 64); // default
+        assert_eq!(metadata.num_hidden, 2); // default
+        assert_eq!(metadata.env_name, ""); // default for String
+        assert!(metadata.forked_from.is_none());
+
+        // Verify existing fields loaded correctly
+        assert_eq!(metadata.step, 5000);
+        assert_eq!(metadata.obs_dim, 4);
+        assert_eq!(metadata.action_count, 2);
+    }
+
+    #[test]
+    fn test_backward_compat_with_partial_new_fields() {
+        // Simulate checkpoint with some new fields but not all
+        let partial_json = r#"{
+            "step": 5000,
+            "avg_return": 100.0,
+            "rng_seed": 42,
+            "best_avg_return": 100.0,
+            "recent_returns": [100.0],
+            "obs_dim": 4,
+            "action_count": 2,
+            "num_players": 1,
+            "hidden_size": 128
+        }"#;
+
+        let metadata: CheckpointMetadata = serde_json::from_str(partial_json).unwrap();
+
+        // Specified field should be loaded
+        assert_eq!(metadata.hidden_size, 128);
+        // Missing fields should use defaults
+        assert_eq!(metadata.num_hidden, 2);
+        assert_eq!(metadata.env_name, "");
+    }
+
+    #[test]
+    fn test_metadata_roundtrip_with_new_fields() {
+        let metadata = CheckpointMetadata {
+            step: 1000,
+            avg_return: 150.0,
+            rng_seed: 42,
+            best_avg_return: Some(150.0),
+            recent_returns: vec![140.0, 150.0],
+            obs_dim: 86,
+            action_count: 7,
+            num_players: 2,
+            hidden_size: 256,
+            num_hidden: 3,
+            forked_from: Some("parent_run".to_string()),
+            env_name: "connect_four".to_string(),
+        };
+
+        let json = serde_json::to_string(&metadata).unwrap();
+        let loaded: CheckpointMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.hidden_size, 256);
+        assert_eq!(loaded.num_hidden, 3);
+        assert_eq!(loaded.env_name, "connect_four");
+        assert_eq!(loaded.forked_from, Some("parent_run".to_string()));
     }
 }

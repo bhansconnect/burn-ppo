@@ -3,7 +3,7 @@
 /// 7x6 board game where players drop pieces to connect four in a row.
 /// True self-play: same network plays both sides, one move per step.
 
-use crate::env::Environment;
+use crate::env::{Environment, GameOutcome};
 use crate::profile::profile_function;
 
 const COLS: usize = 7;
@@ -29,14 +29,48 @@ pub struct ConnectFour {
 }
 
 impl ConnectFour {
-    /// Create new game
-    pub fn new(_seed: u64) -> Self {
-        Self {
-            board: [[Cell::Empty; COLS]; ROWS],
-            current_player: Cell::Player1,
-            game_over: false,
-            winner: None,
+    /// Render the board as ASCII art
+    pub fn render_board(&self) -> String {
+        use std::fmt::Write;
+        let mut output = String::new();
+
+        // Column numbers
+        writeln!(output, "  0 1 2 3 4 5 6").unwrap();
+        writeln!(output, " ---------------").unwrap();
+
+        // Board rows (top to bottom)
+        for row in 0..ROWS {
+            write!(output, "|").unwrap();
+            for col in 0..COLS {
+                let symbol = match self.board[row][col] {
+                    Cell::Empty => '.',
+                    Cell::Player1 => 'X',
+                    Cell::Player2 => 'O',
+                };
+                write!(output, " {}", symbol).unwrap();
+            }
+            writeln!(output, " |").unwrap();
         }
+
+        writeln!(output, " ---------------").unwrap();
+
+        // Current player
+        let turn = match self.current_player {
+            Cell::Player1 => "X (Player 0)",
+            Cell::Player2 => "O (Player 1)",
+            Cell::Empty => "N/A",
+        };
+        if self.game_over {
+            match self.winner {
+                Some(Cell::Player1) => writeln!(output, "Game Over: X (Player 0) wins!").unwrap(),
+                Some(Cell::Player2) => writeln!(output, "Game Over: O (Player 1) wins!").unwrap(),
+                _ => writeln!(output, "Game Over: Draw!").unwrap(),
+            }
+        } else {
+            writeln!(output, "Turn: {}", turn).unwrap();
+        }
+
+        output
     }
 
     /// Get current player index (0 or 1)
@@ -55,6 +89,13 @@ impl ConnectFour {
             Cell::Player2 => Cell::Player1,
             Cell::Empty => unreachable!(),
         }
+    }
+
+    /// Get list of valid action indices (non-full columns)
+    pub fn valid_actions(&self) -> Vec<usize> {
+        (0..COLS)
+            .filter(|&col| self.board[0][col] == Cell::Empty)
+            .collect()
     }
 
     /// Drop a piece in the given column
@@ -131,13 +172,6 @@ impl ConnectFour {
         true
     }
 
-    /// Get valid actions (columns that aren't full)
-    pub fn valid_actions(&self) -> Vec<usize> {
-        (0..COLS)
-            .filter(|&col| self.board[0][col] == Cell::Empty)
-            .collect()
-    }
-
     /// Multi-plane observation encoding:
     /// - P0 plane [0..42): 1.0 if Player1 piece, else 0.0
     /// - P1 plane [42..84): 1.0 if Player2 piece, else 0.0
@@ -171,6 +205,16 @@ impl Environment for ConnectFour {
     const ACTION_COUNT: usize = COLS; // 7
     const NAME: &'static str = "connect_four";
     const NUM_PLAYERS: usize = 2;
+
+    /// Create new game (seed ignored - game is deterministic)
+    fn new(_seed: u64) -> Self {
+        Self {
+            board: [[Cell::Empty; COLS]; ROWS],
+            current_player: Cell::Player1,
+            game_over: false,
+            winner: None,
+        }
+    }
 
     fn reset(&mut self) -> Vec<f32> {
         profile_function!();
@@ -234,6 +278,21 @@ impl Environment for ConnectFour {
                 .map(|col| self.board[0][col] == Cell::Empty)
                 .collect(),
         )
+    }
+
+    fn render(&self) -> Option<String> {
+        Some(self.render_board())
+    }
+
+    fn game_outcome(&self) -> Option<GameOutcome> {
+        if !self.game_over {
+            return None;
+        }
+        match self.winner {
+            Some(Cell::Player1) => Some(GameOutcome::Winner(0)),
+            Some(Cell::Player2) => Some(GameOutcome::Winner(1)),
+            _ => Some(GameOutcome::Tie),
+        }
     }
 }
 
@@ -461,5 +520,147 @@ mod tests {
         // Turn indicator: P0's turn [1, 0]
         assert_eq!(obs[84], 1.0);
         assert_eq!(obs[85], 0.0);
+    }
+
+    #[test]
+    fn test_game_outcome_none_when_not_over() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Game just started - no outcome yet
+        assert_eq!(env.game_outcome(), None);
+
+        // Make a move, still not over
+        env.step(0);
+        assert_eq!(env.game_outcome(), None);
+    }
+
+    #[test]
+    fn test_game_outcome_player0_wins() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Set up P0 with 3 in a row at bottom
+        env.board[5][0] = Cell::Player1;
+        env.board[5][1] = Cell::Player1;
+        env.board[5][2] = Cell::Player1;
+
+        // Winning move for P0
+        env.step(3);
+
+        assert!(env.game_over);
+        assert_eq!(env.game_outcome(), Some(GameOutcome::Winner(0)));
+    }
+
+    #[test]
+    fn test_game_outcome_player1_wins() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Set up board: P1 has 3 in a row, P0 plays elsewhere
+        env.board[5][0] = Cell::Player2;
+        env.board[5][1] = Cell::Player2;
+        env.board[5][2] = Cell::Player2;
+        // P0's pieces elsewhere (so it's valid game state)
+        env.board[4][0] = Cell::Player1;
+        env.board[4][1] = Cell::Player1;
+        env.board[4][2] = Cell::Player1;
+
+        // Switch to P1's turn
+        env.current_player = Cell::Player2;
+
+        // P1 wins with column 3
+        env.step(3);
+
+        assert!(env.game_over);
+        assert_eq!(env.game_outcome(), Some(GameOutcome::Winner(1)));
+    }
+
+    #[test]
+    fn test_game_outcome_tie() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Fill board without winner (same pattern as test_draw)
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                if row < 3 {
+                    env.board[row][col] = if col % 2 == 0 {
+                        Cell::Player1
+                    } else {
+                        Cell::Player2
+                    };
+                } else {
+                    env.board[row][col] = if col % 2 == 0 {
+                        Cell::Player2
+                    } else {
+                        Cell::Player1
+                    };
+                }
+            }
+        }
+
+        // Leave one cell empty to trigger draw on final move
+        env.board[0][0] = Cell::Empty;
+        env.step(0);
+
+        assert!(env.game_over);
+        assert_eq!(env.game_outcome(), Some(GameOutcome::Tie));
+    }
+
+    #[test]
+    fn test_render_board_empty() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        let rendered = env.render_board();
+
+        // Check column headers
+        assert!(rendered.contains("0 1 2 3 4 5 6"));
+        // Check empty board has dots
+        assert!(rendered.contains(". . . . . . ."));
+        // Check turn indicator
+        assert!(rendered.contains("Turn: X (Player 0)"));
+    }
+
+    #[test]
+    fn test_render_board_with_pieces() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Place some pieces
+        env.board[5][0] = Cell::Player1;
+        env.board[5][1] = Cell::Player2;
+
+        let rendered = env.render_board();
+
+        // Check pieces are rendered
+        assert!(rendered.contains("X O"));
+    }
+
+    #[test]
+    fn test_render_board_game_over() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // Set up and trigger P0 win
+        env.board[5][0] = Cell::Player1;
+        env.board[5][1] = Cell::Player1;
+        env.board[5][2] = Cell::Player1;
+        env.step(3);
+
+        let rendered = env.render_board();
+        assert!(rendered.contains("Game Over: X (Player 0) wins!"));
+    }
+
+    #[test]
+    fn test_render_trait_method() {
+        let mut env = ConnectFour::new(42);
+        env.reset();
+
+        // The Environment::render() method should return Some(String)
+        let rendered = env.render();
+        assert!(rendered.is_some());
+        assert!(rendered.unwrap().contains("0 1 2 3 4 5 6"));
     }
 }

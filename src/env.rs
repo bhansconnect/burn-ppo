@@ -4,8 +4,19 @@ use rayon::prelude::*;
 
 use crate::profile::{profile_function, profile_scope};
 
+/// Game outcome for evaluation - who won/placed where
+#[derive(Debug, Clone, PartialEq)]
+pub enum GameOutcome {
+    /// Single winner (player index)
+    Winner(usize),
+    /// All players tied
+    Tie,
+    /// N-player rankings (1-indexed: 1=first, 2=second, etc.)
+    Placements(Vec<usize>),
+}
+
 /// Minimal environment interface - just what PPO needs
-pub trait Environment: Send + Sync + 'static {
+pub trait Environment: Send + Sync + Sized + 'static {
     /// Dimension of observation vector
     const OBSERVATION_DIM: usize;
 
@@ -17,6 +28,10 @@ pub trait Environment: Send + Sync + 'static {
 
     /// Number of players (1 for single-agent, 2+ for multi-player)
     const NUM_PLAYERS: usize = 1;
+
+    /// Create a new environment with the given seed.
+    /// For deterministic games, the seed may be ignored.
+    fn new(seed: u64) -> Self;
 
     /// Reset environment and return initial observation
     fn reset(&mut self) -> Vec<f32>;
@@ -38,6 +53,19 @@ pub trait Environment: Send + Sync + 'static {
     fn action_mask(&self) -> Option<Vec<bool>> {
         None
     }
+
+    /// Return explicit game outcome when episode is done.
+    /// Override this if using reward shaping where total_rewards doesn't reflect outcome.
+    /// Default: None (infer from total_rewards via argmax)
+    fn game_outcome(&self) -> Option<GameOutcome> {
+        None
+    }
+
+    /// Render the current state as a string for visualization.
+    /// Used in eval watch mode. Default: None (no rendering support).
+    fn render(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Episode statistics for completed episodes
@@ -46,6 +74,8 @@ pub struct EpisodeStats {
     /// Total reward per player [NUM_PLAYERS]
     pub total_rewards: Vec<f32>,
     pub length: usize,
+    /// Which environment index this episode came from
+    pub env_index: usize,
 }
 
 impl EpisodeStats {
@@ -150,7 +180,8 @@ impl<E: Environment> VecEnv<E> {
                 .zip(self.episode_rewards.par_iter_mut())
                 .zip(self.episode_lengths.par_iter_mut())
                 .zip(self.obs_buffer.par_chunks_mut(E::OBSERVATION_DIM))
-                .map(|((((env, &action), ep_rewards), length), obs_chunk)| {
+                .enumerate()
+                .map(|(env_idx, ((((env, &action), ep_rewards), length), obs_chunk))| {
                     #[cfg(feature = "tracy")]
                     let _span = tracy_client::span!("env_step");
 
@@ -166,6 +197,7 @@ impl<E: Environment> VecEnv<E> {
                         let stats = EpisodeStats {
                             total_rewards: ep_rewards.clone(),
                             length: *length,
+                            env_index: env_idx,
                         };
                         let reset_obs = env.reset();
                         obs_chunk.copy_from_slice(&reset_obs);
@@ -209,22 +241,19 @@ impl<E: Environment> VecEnv<E> {
 mod tests {
     use super::*;
 
-    /// Simple test environment: counter that terminates at max_steps
-    struct CounterEnv {
+    /// Simple test environment: counter that terminates at MAX_STEPS
+    struct CounterEnv<const MAX_STEPS: usize> {
         count: usize,
-        max_steps: usize,
     }
 
-    impl CounterEnv {
-        fn new(max_steps: usize) -> Self {
-            Self { count: 0, max_steps }
-        }
-    }
-
-    impl Environment for CounterEnv {
+    impl<const MAX_STEPS: usize> Environment for CounterEnv<MAX_STEPS> {
         const OBSERVATION_DIM: usize = 1;
         const ACTION_COUNT: usize = 2;
         const NAME: &'static str = "counter";
+
+        fn new(_seed: u64) -> Self {
+            Self { count: 0 }
+        }
 
         fn reset(&mut self) -> Vec<f32> {
             self.count = 0;
@@ -233,23 +262,23 @@ mod tests {
 
         fn step(&mut self, _action: usize) -> (Vec<f32>, Vec<f32>, bool) {
             self.count += 1;
-            let done = self.count >= self.max_steps;
+            let done = self.count >= MAX_STEPS;
             (vec![self.count as f32], vec![1.0], done)
         }
     }
 
     #[test]
     fn test_vec_env_creation() {
-        let vec_env: VecEnv<CounterEnv> = VecEnv::new(4, |_| CounterEnv::new(3));
+        let vec_env: VecEnv<CounterEnv<3>> = VecEnv::new(4, |i| CounterEnv::<3>::new(i as u64));
 
         assert_eq!(vec_env.num_envs(), 4);
-        assert_eq!(CounterEnv::OBSERVATION_DIM, 1);
-        assert_eq!(CounterEnv::ACTION_COUNT, 2);
+        assert_eq!(CounterEnv::<3>::OBSERVATION_DIM, 1);
+        assert_eq!(CounterEnv::<3>::ACTION_COUNT, 2);
     }
 
     #[test]
     fn test_vec_env_step() {
-        let mut vec_env: VecEnv<CounterEnv> = VecEnv::new(2, |_| CounterEnv::new(3));
+        let mut vec_env: VecEnv<CounterEnv<3>> = VecEnv::new(2, |i| CounterEnv::<3>::new(i as u64));
 
         let actions = vec![0, 1];
         let (obs, all_rewards, dones, completed) = vec_env.step(&actions);
@@ -262,7 +291,7 @@ mod tests {
 
     #[test]
     fn test_vec_env_auto_reset() {
-        let mut vec_env: VecEnv<CounterEnv> = VecEnv::new(1, |_| CounterEnv::new(2));
+        let mut vec_env: VecEnv<CounterEnv<2>> = VecEnv::new(1, |i| CounterEnv::<2>::new(i as u64));
 
         // Step 1
         vec_env.step(&[0]);
@@ -280,7 +309,7 @@ mod tests {
 
     #[test]
     fn test_episode_stats() {
-        let mut vec_env: VecEnv<CounterEnv> = VecEnv::new(1, |_| CounterEnv::new(5));
+        let mut vec_env: VecEnv<CounterEnv<5>> = VecEnv::new(1, |i| CounterEnv::<5>::new(i as u64));
 
         // Run 5 steps to complete episode
         for _ in 0..4 {

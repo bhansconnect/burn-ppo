@@ -100,6 +100,11 @@ impl<B: Backend> ActorCritic<B> {
         }
     }
 
+    /// Get number of players (value head output dimension)
+    pub fn num_players(&self) -> usize {
+        self.num_players
+    }
+
     /// Forward pass returning action logits and N player values
     ///
     /// Input: observations [batch, obs_dim]
@@ -132,11 +137,6 @@ impl<B: Backend> ActorCritic<B> {
         };
 
         (logits, values)
-    }
-
-    /// Get number of players (value head output dimension)
-    pub fn num_players(&self) -> usize {
-        self.num_players
     }
 }
 

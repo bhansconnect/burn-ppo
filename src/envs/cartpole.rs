@@ -41,21 +41,9 @@ pub struct CartPole {
 }
 
 impl CartPole {
-    /// Create new CartPole with seeded RNG
-    pub fn new(seed: u64) -> Self {
-        use rand::SeedableRng;
-        let rng = rand::rngs::StdRng::seed_from_u64(seed);
-        let mut env = Self {
-            x: 0.0,
-            x_dot: 0.0,
-            theta: 0.0,
-            theta_dot: 0.0,
-            steps: 0,
-            rng,
-        };
-        // Initialize to random state
-        let _ = env.reset();
-        env
+    /// Get current state for rendering: [x, x_dot, theta, theta_dot]
+    pub fn state(&self) -> [f32; 4] {
+        [self.x, self.x_dot, self.theta, self.theta_dot]
     }
 
     /// Physics step using semi-implicit Euler integration
@@ -93,6 +81,32 @@ impl Environment for CartPole {
     const OBSERVATION_DIM: usize = 4;
     const ACTION_COUNT: usize = 2;
     const NAME: &'static str = "cartpole";
+
+    fn new(seed: u64) -> Self {
+        use rand::SeedableRng;
+        let rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let mut env = Self {
+            x: 0.0,
+            x_dot: 0.0,
+            theta: 0.0,
+            theta_dot: 0.0,
+            steps: 0,
+            rng,
+        };
+        // Initialize to random state
+        let _ = env.reset();
+        env
+    }
+
+    fn render(&self) -> Option<String> {
+        Some(format!(
+            "x={:.3} | v={:.3} | \u{03b8}={:.1}\u{00b0} | \u{03c9}={:.2}",
+            self.x,
+            self.x_dot,
+            self.theta.to_degrees(),
+            self.theta_dot
+        ))
+    }
 
     fn reset(&mut self) -> Vec<f32> {
         profile_function!();
@@ -229,5 +243,58 @@ mod tests {
         assert_eq!(obs1, obs2);
         assert_eq!(rewards1, rewards2);
         assert_eq!(d1, d2);
+    }
+
+    #[test]
+    fn test_cartpole_state() {
+        let mut env = CartPole::new(42);
+        env.reset();
+
+        // Set known state values
+        env.x = 0.5;
+        env.x_dot = 1.0;
+        env.theta = 0.1;
+        env.theta_dot = -0.5;
+
+        let state = env.state();
+        assert_eq!(state, [0.5, 1.0, 0.1, -0.5]);
+    }
+
+    #[test]
+    fn test_cartpole_render() {
+        let mut env = CartPole::new(42);
+        env.reset();
+
+        // Set known state for predictable output
+        env.x = 1.5;
+        env.x_dot = 0.25;
+        env.theta = 0.1; // ~5.7 degrees
+        env.theta_dot = -0.3;
+
+        let rendered = env.render();
+        assert!(rendered.is_some());
+
+        let output = rendered.unwrap();
+        // Check that state values appear in output
+        assert!(output.contains("x=1.500"));
+        assert!(output.contains("v=0.250"));
+        // Theta should be converted to degrees (~5.7)
+        assert!(output.contains("θ="));
+        assert!(output.contains("ω="));
+    }
+
+    #[test]
+    fn test_cartpole_render_format() {
+        let mut env = CartPole::new(42);
+        env.reset();
+
+        env.x = 0.0;
+        env.x_dot = 0.0;
+        env.theta = std::f32::consts::PI / 6.0; // 30 degrees
+        env.theta_dot = 0.0;
+
+        let output = env.render().unwrap();
+        // Should show ~30 degrees
+        assert!(output.contains("30.0°") || output.contains("30°"));
     }
 }

@@ -1,13 +1,28 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-/// PPO training for discrete games
+/// PPO training and evaluation for discrete games
 #[derive(Parser, Debug)]
 #[command(name = "burn-ppo", version, about)]
-pub struct CliArgs {
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Train a model (default if no subcommand given)
+    Train(TrainArgs),
+    /// Evaluate trained models
+    Eval(EvalArgs),
+}
+
+/// Arguments for training
+#[derive(Parser, Debug)]
+pub struct TrainArgs {
     /// Path to TOML config file
     #[arg(short, long, default_value = "configs/cartpole.toml")]
     pub config: PathBuf,
@@ -42,6 +57,53 @@ pub struct CliArgs {
     #[arg(long)]
     pub activation: Option<String>,
 }
+
+/// Arguments for evaluation
+#[derive(Parser, Debug)]
+pub struct EvalArgs {
+    /// Checkpoint paths (one per player)
+    #[arg(required = true)]
+    pub checkpoints: Vec<PathBuf>,
+
+    /// Number of games to play
+    #[arg(short = 'n', long, default_value = "100")]
+    pub num_games: usize,
+
+    /// Number of parallel environments for stats mode
+    #[arg(long, default_value = "64")]
+    pub num_envs: usize,
+
+    /// Show per-step output (watch mode)
+    #[arg(long)]
+    pub watch: bool,
+
+    /// Step mode: press Enter to advance each move (implies --watch)
+    #[arg(long)]
+    pub step: bool,
+
+    /// Random seed for reproducibility
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Initial softmax temperature (0.0 = deterministic argmax)
+    #[arg(long, default_value = "0.3")]
+    pub temperature: f32,
+
+    /// Temperature after cutoff (requires --temp-cutoff)
+    #[arg(long)]
+    pub temp_final: Option<f32>,
+
+    /// Move number to switch from initial to final temperature
+    #[arg(long)]
+    pub temp_cutoff: Option<usize>,
+
+    /// Gradually decay temperature over cutoff moves (requires --temp-cutoff)
+    #[arg(long)]
+    pub temp_decay: bool,
+}
+
+/// Legacy alias for backward compatibility
+pub type CliArgs = TrainArgs;
 
 /// Number of parallel environments - either auto-detected or explicit
 #[derive(Debug, Clone, Serialize, Deserialize)]
