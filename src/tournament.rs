@@ -13,18 +13,72 @@ use anyhow::{bail, Context, Result};
 use burn::tensor::backend::Backend;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Serialize;
-use skillratings::weng_lin::{weng_lin, WengLinConfig, WengLinRating};
-use skillratings::Outcomes;
+use skillratings::weng_lin::{weng_lin_multi_team, WengLinConfig, WengLinRating};
+use skillratings::MultiTeamOutcome;
 
 use crate::checkpoint::CheckpointMetadata;
 use crate::config::TournamentArgs;
 use crate::dispatch_env;
-use crate::env::Environment;
+use crate::env::{Environment, GameOutcome};
 use crate::eval::{load_model_from_checkpoint, run_stats_mode_env, PlayerSource, TempSchedule};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
+
+/// Single game result with placements for all participants
+#[derive(Debug, Clone)]
+pub struct GamePlacement {
+    /// Placement for each contestant (1-indexed, 1=first place)
+    pub placements: Vec<usize>,
+}
+
+/// Results of a matchup between contestants with per-game data
+#[derive(Debug, Clone)]
+pub struct MatchupGames {
+    /// Indices of contestants in this matchup
+    pub contestants: Vec<usize>,
+    /// Individual game results
+    pub games: Vec<GamePlacement>,
+}
+
+impl MatchupGames {
+    /// Get wins for contestant at index 0 (for 2-player matchups)
+    pub fn wins_a(&self) -> usize {
+        self.games
+            .iter()
+            .filter(|g| g.placements.len() >= 2 && g.placements[0] < g.placements[1])
+            .count()
+    }
+
+    /// Get wins for contestant at index 1 (for 2-player matchups)
+    pub fn wins_b(&self) -> usize {
+        self.games
+            .iter()
+            .filter(|g| g.placements.len() >= 2 && g.placements[1] < g.placements[0])
+            .count()
+    }
+
+    /// Get draw count (for 2-player matchups)
+    pub fn draws(&self) -> usize {
+        self.games
+            .iter()
+            .filter(|g| g.placements.len() >= 2 && g.placements[0] == g.placements[1])
+            .count()
+    }
+
+    /// Convert to legacy `MatchupResult` format
+    pub fn to_matchup_result(&self) -> MatchupResult {
+        MatchupResult {
+            contestant_a: self.contestants.first().copied().unwrap_or(0),
+            contestant_b: self.contestants.get(1).copied().unwrap_or(0),
+            wins_a: self.wins_a(),
+            wins_b: self.wins_b(),
+            draws: self.draws(),
+        }
+    }
+}
 
 /// A contestant in the tournament
 #[derive(Clone, Debug)]
@@ -37,10 +91,12 @@ pub struct Contestant {
     pub rating: WengLinRating,
     /// Indices of opponents already faced
     pub opponents_faced: Vec<usize>,
-    /// Win/loss/draw stats
-    pub wins: usize,
-    pub losses: usize,
-    pub draws: usize,
+    /// Placement counts: [placement-1] = count (1st place at index 0)
+    pub placement_counts: Vec<usize>,
+    /// Total games played
+    pub games_played: usize,
+    /// Draw count (ties where all players got same placement)
+    pub draw_count: usize,
 }
 
 impl Contestant {
@@ -50,10 +106,33 @@ impl Contestant {
             source,
             rating: WengLinRating::new(),
             opponents_faced: Vec::new(),
-            wins: 0,
-            losses: 0,
-            draws: 0,
+            placement_counts: Vec::new(),
+            games_played: 0,
+            draw_count: 0,
         }
+    }
+
+    /// Get wins (1st place finishes, excluding draws) for 2-player compatibility
+    pub fn wins(&self) -> usize {
+        self.placement_counts
+            .first()
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(self.draw_count)
+    }
+
+    /// Get losses (last place finishes) for 2-player compatibility
+    pub fn losses(&self) -> usize {
+        if self.placement_counts.len() >= 2 {
+            self.placement_counts.last().copied().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    /// Get draws (ties)
+    pub fn draws(&self) -> usize {
+        self.draw_count
     }
 }
 
@@ -319,56 +398,82 @@ fn round_robin_pairings(n: usize) -> Vec<(usize, usize)> {
     pairings
 }
 
-/// Update ratings after a matchup using Weng-Lin
-fn update_ratings(contestants: &mut [Contestant], result: &MatchupResult, config: &WengLinConfig) {
-    let a = result.contestant_a;
-    let b = result.contestant_b;
-
-    // Process each game outcome
-    for _ in 0..result.wins_a {
-        let (new_a, new_b) = weng_lin(
-            &contestants[a].rating,
-            &contestants[b].rating,
-            &Outcomes::WIN,
-            config,
-        );
-        contestants[a].rating = new_a;
-        contestants[b].rating = new_b;
+/// Update ratings from per-game placements using `weng_lin_multi_team` (N-player compatible)
+/// Games are shuffled to avoid bias from completion order (shorter games finish first)
+fn update_ratings_from_games(
+    contestants: &mut [Contestant],
+    matchup: &MatchupGames,
+    config: &WengLinConfig,
+) {
+    if matchup.games.is_empty() {
+        return;
     }
 
-    for _ in 0..result.wins_b {
-        let (new_a, new_b) = weng_lin(
-            &contestants[a].rating,
-            &contestants[b].rating,
-            &Outcomes::LOSS,
-            config,
-        );
-        contestants[a].rating = new_a;
-        contestants[b].rating = new_b;
+    // Shuffle games to avoid bias from completion order
+    let mut games = matchup.games.clone();
+    let seed = games.len() as u64;
+    let mut rng = StdRng::seed_from_u64(seed);
+    games.shuffle(&mut rng);
+
+    let num_players = matchup.contestants.len();
+
+    for game in &games {
+        // Build rating groups for weng_lin_multi_team
+        // Each "team" is a single player
+        let ratings: Vec<WengLinRating> = matchup
+            .contestants
+            .iter()
+            .map(|&idx| contestants[idx].rating)
+            .collect();
+
+        let rating_refs: Vec<[WengLinRating; 1]> = ratings.iter().map(|r| [*r]).collect();
+
+        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_refs
+            .iter()
+            .enumerate()
+            .map(|(i, rating_arr)| {
+                let placement = game.placements[i];
+                (rating_arr.as_slice(), MultiTeamOutcome::new(placement))
+            })
+            .collect();
+
+        let new_ratings = weng_lin_multi_team(&rating_groups, config);
+
+        // Update contestant ratings
+        for (i, &contestant_idx) in matchup.contestants.iter().enumerate() {
+            contestants[contestant_idx].rating = new_ratings[i][0];
+        }
+
+        // Check if this is a draw (all placements equal)
+        let is_draw = game.placements.windows(2).all(|w| w[0] == w[1]);
+
+        // Update placement counts and games played
+        for (i, &contestant_idx) in matchup.contestants.iter().enumerate() {
+            let placement = game.placements[i];
+            // Ensure placement_counts is large enough
+            if contestants[contestant_idx].placement_counts.len() < num_players {
+                contestants[contestant_idx]
+                    .placement_counts
+                    .resize(num_players, 0);
+            }
+            if placement > 0 && placement <= num_players {
+                contestants[contestant_idx].placement_counts[placement - 1] += 1;
+            }
+            // Track draws
+            if is_draw {
+                contestants[contestant_idx].draw_count += 1;
+            }
+            contestants[contestant_idx].games_played += 1;
+        }
     }
 
-    for _ in 0..result.draws {
-        let (new_a, new_b) = weng_lin(
-            &contestants[a].rating,
-            &contestants[b].rating,
-            &Outcomes::DRAW,
-            config,
-        );
-        contestants[a].rating = new_a;
-        contestants[b].rating = new_b;
+    // Track opponents faced (only for 2-player matchups for now)
+    if matchup.contestants.len() == 2 {
+        let a = matchup.contestants[0];
+        let b = matchup.contestants[1];
+        contestants[a].opponents_faced.push(b);
+        contestants[b].opponents_faced.push(a);
     }
-
-    // Update stats
-    contestants[a].wins += result.wins_a;
-    contestants[a].losses += result.wins_b;
-    contestants[a].draws += result.draws;
-    contestants[b].wins += result.wins_b;
-    contestants[b].losses += result.wins_a;
-    contestants[b].draws += result.draws;
-
-    // Track opponents faced
-    contestants[a].opponents_faced.push(b);
-    contestants[b].opponents_faced.push(a);
 }
 
 /// Print current standings
@@ -436,9 +541,9 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
             c.rating.rating,
             low,
             high,
-            c.wins,
-            c.losses,
-            c.draws
+            c.wins(),
+            c.losses(),
+            c.draws()
         );
     }
 
@@ -480,10 +585,10 @@ fn build_results(
                 uncertainty: sigma,
                 rating_low: c.rating.rating - 2.0 * sigma,
                 rating_high: c.rating.rating + 2.0 * sigma,
-                wins: c.wins,
-                losses: c.losses,
-                draws: c.draws,
-                games_played: c.wins + c.losses + c.draws,
+                wins: c.wins(),
+                losses: c.losses(),
+                draws: c.draws(),
+                games_played: c.games_played,
             }
         })
         .collect();
@@ -543,7 +648,7 @@ fn run_matchup<B: Backend, E: Environment>(
     temp_schedule: &TempSchedule,
     rng: &mut StdRng,
     device: &B::Device,
-) -> MatchupResult {
+) -> MatchupGames {
     // For this matchup, we need exactly 2 "checkpoints" for run_stats_mode_env
     // Build models/normalizers arrays for just these two
     let mut matchup_models: Vec<ActorCritic<B>> = Vec::new();
@@ -609,12 +714,24 @@ fn run_matchup<B: Backend, E: Environment>(
         true, // silent
     );
 
-    MatchupResult {
-        contestant_a: idx_a,
-        contestant_b: idx_b,
-        wins_a: stats.wins[0],
-        wins_b: stats.wins[1],
-        draws: stats.draws,
+    // Convert game_outcomes to GamePlacement
+    let games: Vec<GamePlacement> = stats
+        .game_outcomes
+        .iter()
+        .filter_map(|outcome| {
+            if let GameOutcome::Placements(p) = outcome {
+                Some(GamePlacement {
+                    placements: p.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    MatchupGames {
+        contestants: vec![idx_a, idx_b],
+        games,
     }
 }
 
@@ -624,13 +741,10 @@ fn run_matchup_with_random<E: Environment>(
     idx_b: usize,
     num_games: usize,
     rng: &mut StdRng,
-) -> MatchupResult {
-    use crate::env::GameOutcome;
+) -> MatchupGames {
     use rand::Rng;
 
-    let mut wins_a = 0;
-    let mut wins_b = 0;
-    let mut draws = 0;
+    let mut games = Vec::with_capacity(num_games);
 
     for _ in 0..num_games {
         let mut env = E::new(rng.gen());
@@ -660,34 +774,25 @@ fn run_matchup_with_random<E: Environment>(
             }
         }
 
-        // Determine outcome
-        match env.game_outcome() {
+        // Convert outcome to placements
+        let placements = match env.game_outcome() {
             Some(GameOutcome::Winner(w)) => {
                 if w == 0 {
-                    wins_a += 1;
+                    vec![1, 2] // A wins
                 } else {
-                    wins_b += 1;
+                    vec![2, 1] // B wins
                 }
             }
-            Some(GameOutcome::Placements(p)) => {
-                if p[0] < p[1] {
-                    wins_a += 1;
-                } else if p[1] < p[0] {
-                    wins_b += 1;
-                } else {
-                    draws += 1;
-                }
-            }
-            Some(GameOutcome::Tie) | None => draws += 1,
-        }
+            Some(GameOutcome::Placements(p)) => p,
+            Some(GameOutcome::Tie) | None => vec![1, 1], // Draw
+        };
+
+        games.push(GamePlacement { placements });
     }
 
-    MatchupResult {
-        contestant_a: idx_a,
-        contestant_b: idx_b,
-        wins_a,
-        wins_b,
-        draws,
+    MatchupGames {
+        contestants: vec![idx_a, idx_b],
+        games,
     }
 }
 
@@ -850,9 +955,9 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
                 // Suspend progress bar to print result
                 round_pb.suspend(|| {
-                    let winner = if result.wins_a > result.wins_b {
+                    let winner = if result.wins_a() > result.wins_b() {
                         &contestants[idx_a].name
-                    } else if result.wins_b > result.wins_a {
+                    } else if result.wins_b() > result.wins_a() {
                         &contestants[idx_b].name
                     } else {
                         "draw"
@@ -861,15 +966,15 @@ fn run_tournament_env<B: Backend, E: Environment>(
                         "  {} vs {}: {}-{}-{} ({})",
                         contestants[idx_a].name,
                         contestants[idx_b].name,
-                        result.wins_a,
-                        result.wins_b,
-                        result.draws,
+                        result.wins_a(),
+                        result.wins_b(),
+                        result.draws(),
                         winner
                     );
                 });
 
-                update_ratings(contestants, &result, &wl_config);
-                all_matches.push((round, result));
+                update_ratings_from_games(contestants, &result, &wl_config);
+                all_matches.push((round, result.to_matchup_result()));
                 round_pb.inc(1);
             }
 
@@ -907,9 +1012,9 @@ fn run_tournament_env<B: Backend, E: Environment>(
             );
 
             pb.suspend(|| {
-                let winner = if result.wins_a > result.wins_b {
+                let winner = if result.wins_a() > result.wins_b() {
                     &contestants[idx_a].name
-                } else if result.wins_b > result.wins_a {
+                } else if result.wins_b() > result.wins_a() {
                     &contestants[idx_b].name
                 } else {
                     "draw"
@@ -918,15 +1023,15 @@ fn run_tournament_env<B: Backend, E: Environment>(
                     "  {} vs {}: {}-{}-{} ({})",
                     contestants[idx_a].name,
                     contestants[idx_b].name,
-                    result.wins_a,
-                    result.wins_b,
-                    result.draws,
+                    result.wins_a(),
+                    result.wins_b(),
+                    result.draws(),
                     winner
                 );
             });
 
-            update_ratings(contestants, &result, &wl_config);
-            all_matches.push((1, result));
+            update_ratings_from_games(contestants, &result, &wl_config);
+            all_matches.push((1, result.to_matchup_result()));
             pb.inc(1);
         }
 
@@ -964,9 +1069,9 @@ mod tests {
         assert_eq!(contestant.name, "TestPlayer");
         assert!(matches!(contestant.source, PlayerSource::Random));
         assert!(contestant.opponents_faced.is_empty());
-        assert_eq!(contestant.wins, 0);
-        assert_eq!(contestant.losses, 0);
-        assert_eq!(contestant.draws, 0);
+        assert_eq!(contestant.wins(), 0);
+        assert_eq!(contestant.losses(), 0);
+        assert_eq!(contestant.draws(), 0);
         // Default WengLin rating should be 25.0
         assert!((contestant.rating.rating - 25.0).abs() < 0.1);
     }
@@ -1080,25 +1185,25 @@ mod tests {
         let initial_rating_a = contestants[0].rating.rating;
         let initial_rating_b = contestants[1].rating.rating;
 
-        let result = MatchupResult {
-            contestant_a: 0,
-            contestant_b: 1,
-            wins_a: 1,
-            wins_b: 0,
-            draws: 0,
+        // Player A wins (1st place), Player B loses (2nd place)
+        let matchup = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![GamePlacement {
+                placements: vec![1, 2],
+            }],
         };
 
-        update_ratings(&mut contestants, &result, &wl_config);
+        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
 
         // Winner's rating should increase
         assert!(contestants[0].rating.rating > initial_rating_a);
         // Loser's rating should decrease
         assert!(contestants[1].rating.rating < initial_rating_b);
         // Stats updated
-        assert_eq!(contestants[0].wins, 1);
-        assert_eq!(contestants[0].losses, 0);
-        assert_eq!(contestants[1].wins, 0);
-        assert_eq!(contestants[1].losses, 1);
+        assert_eq!(contestants[0].wins(), 1);
+        assert_eq!(contestants[0].losses(), 0);
+        assert_eq!(contestants[1].wins(), 0);
+        assert_eq!(contestants[1].losses(), 1);
     }
 
     #[test]
@@ -1109,18 +1214,18 @@ mod tests {
             Contestant::new("B".to_string(), PlayerSource::Random),
         ];
 
-        let result = MatchupResult {
-            contestant_a: 0,
-            contestant_b: 1,
-            wins_a: 0,
-            wins_b: 1,
-            draws: 0,
+        // Player A loses (2nd place), Player B wins (1st place)
+        let matchup = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![GamePlacement {
+                placements: vec![2, 1],
+            }],
         };
 
-        update_ratings(&mut contestants, &result, &wl_config);
+        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
 
-        assert_eq!(contestants[0].losses, 1);
-        assert_eq!(contestants[1].wins, 1);
+        assert_eq!(contestants[0].losses(), 1);
+        assert_eq!(contestants[1].wins(), 1);
     }
 
     #[test]
@@ -1134,21 +1239,21 @@ mod tests {
         let initial_rating_a = contestants[0].rating.rating;
         let initial_rating_b = contestants[1].rating.rating;
 
-        let result = MatchupResult {
-            contestant_a: 0,
-            contestant_b: 1,
-            wins_a: 0,
-            wins_b: 0,
-            draws: 1,
+        // Draw: both players get same placement
+        let matchup = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![GamePlacement {
+                placements: vec![1, 1],
+            }],
         };
 
-        update_ratings(&mut contestants, &result, &wl_config);
+        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
 
         // Ratings should stay approximately the same for equal-rated players
         assert!((contestants[0].rating.rating - initial_rating_a).abs() < 1.0);
         assert!((contestants[1].rating.rating - initial_rating_b).abs() < 1.0);
-        assert_eq!(contestants[0].draws, 1);
-        assert_eq!(contestants[1].draws, 1);
+        assert_eq!(contestants[0].draws(), 1);
+        assert_eq!(contestants[1].draws(), 1);
     }
 
     #[test]
@@ -1159,15 +1264,14 @@ mod tests {
             Contestant::new("B".to_string(), PlayerSource::Random),
         ];
 
-        let result = MatchupResult {
-            contestant_a: 0,
-            contestant_b: 1,
-            wins_a: 1,
-            wins_b: 0,
-            draws: 0,
+        let matchup = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![GamePlacement {
+                placements: vec![1, 2],
+            }],
         };
 
-        update_ratings(&mut contestants, &result, &wl_config);
+        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
 
         assert!(contestants[0].opponents_faced.contains(&1));
         assert!(contestants[1].opponents_faced.contains(&0));
@@ -1181,24 +1285,38 @@ mod tests {
             Contestant::new("B".to_string(), PlayerSource::Random),
         ];
 
-        let result = MatchupResult {
-            contestant_a: 0,
-            contestant_b: 1,
-            wins_a: 3,
-            wins_b: 1,
-            draws: 1,
+        // 3 wins for A, 1 win for B, 1 draw
+        let matchup = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![
+                GamePlacement {
+                    placements: vec![1, 2],
+                }, // A wins
+                GamePlacement {
+                    placements: vec![1, 2],
+                }, // A wins
+                GamePlacement {
+                    placements: vec![1, 2],
+                }, // A wins
+                GamePlacement {
+                    placements: vec![2, 1],
+                }, // B wins
+                GamePlacement {
+                    placements: vec![1, 1],
+                }, // Draw
+            ],
         };
 
-        update_ratings(&mut contestants, &result, &wl_config);
+        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
 
         // A won more, should have higher rating
         assert!(contestants[0].rating.rating > contestants[1].rating.rating);
-        assert_eq!(contestants[0].wins, 3);
-        assert_eq!(contestants[0].losses, 1);
-        assert_eq!(contestants[0].draws, 1);
-        assert_eq!(contestants[1].wins, 1);
-        assert_eq!(contestants[1].losses, 3);
-        assert_eq!(contestants[1].draws, 1);
+        assert_eq!(contestants[0].wins(), 3);
+        assert_eq!(contestants[0].losses(), 1);
+        assert_eq!(contestants[0].draws(), 1);
+        assert_eq!(contestants[1].wins(), 1);
+        assert_eq!(contestants[1].losses(), 3);
+        assert_eq!(contestants[1].draws(), 1);
     }
 
     #[test]
@@ -1434,11 +1552,11 @@ mod tests {
         ];
 
         contestants[0].rating.rating = 28.0;
-        contestants[0].wins = 3;
-        contestants[0].losses = 0;
+        contestants[0].placement_counts = vec![3, 0]; // 3 wins (1st place), 0 losses (2nd place)
+        contestants[0].games_played = 3;
         contestants[1].rating.rating = 22.0;
-        contestants[1].wins = 0;
-        contestants[1].losses = 3;
+        contestants[1].placement_counts = vec![0, 3]; // 0 wins, 3 losses
+        contestants[1].games_played = 3;
 
         let matches = vec![(
             1,
@@ -1712,10 +1830,13 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let result = run_matchup_with_random::<ConnectFour>(0, 1, 10, &mut rng);
 
-        assert_eq!(result.contestant_a, 0);
-        assert_eq!(result.contestant_b, 1);
-        // Total should equal num_games
-        assert_eq!(result.wins_a + result.wins_b + result.draws, 10);
+        assert_eq!(result.contestants, vec![0, 1]);
+        // Total games should equal num_games
+        assert_eq!(result.games.len(), 10);
+        // Each game should have proper placements for 2 players
+        for game in &result.games {
+            assert_eq!(game.placements.len(), 2);
+        }
     }
 
     #[test]
@@ -1730,9 +1851,9 @@ mod tests {
         let mut rng2 = StdRng::seed_from_u64(12345);
         let result2 = run_matchup_with_random::<ConnectFour>(0, 1, 5, &mut rng2);
 
-        assert_eq!(result1.wins_a, result2.wins_a);
-        assert_eq!(result1.wins_b, result2.wins_b);
-        assert_eq!(result1.draws, result2.draws);
+        assert_eq!(result1.wins_a(), result2.wins_a());
+        assert_eq!(result1.wins_b(), result2.wins_b());
+        assert_eq!(result1.draws(), result2.draws());
     }
 
     #[test]
@@ -1752,9 +1873,10 @@ mod tests {
             "step_100".to_string(),
             PlayerSource::Checkpoint(checkpoint_path.clone()),
         )];
-        contestants[0].wins = 5;
-        contestants[0].losses = 2;
-        contestants[0].draws = 1;
+        // Set up placement counts: 5 wins (1st place), 2 losses (2nd place), 1 draw
+        contestants[0].placement_counts = vec![5, 2]; // 5 first places, 2 second places
+        contestants[0].draw_count = 1;
+        contestants[0].games_played = 8;
 
         let args = TournamentArgs {
             sources: vec![],
@@ -1789,9 +1911,8 @@ mod tests {
         let result = run_matchup_with_random::<CartPole>(0, 1, 5, &mut rng);
 
         // CartPole is single player, so outcomes are based on episode length/reward
-        assert_eq!(result.contestant_a, 0);
-        assert_eq!(result.contestant_b, 1);
-        assert_eq!(result.wins_a + result.wins_b + result.draws, 5);
+        assert_eq!(result.contestants, vec![0, 1]);
+        assert_eq!(result.games.len(), 5);
     }
 
     #[test]

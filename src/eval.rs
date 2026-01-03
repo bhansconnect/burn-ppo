@@ -19,10 +19,10 @@ use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-
-use skillratings::weng_lin::{weng_lin, WengLinConfig, WengLinRating};
-use skillratings::Outcomes;
+use skillratings::weng_lin::{weng_lin, weng_lin_multi_team, WengLinConfig, WengLinRating};
+use skillratings::{MultiTeamOutcome, Outcomes};
 
 use crate::checkpoint::{load_normalizer, CheckpointManager, CheckpointMetadata};
 use crate::config::{Config, EvalArgs};
@@ -265,6 +265,8 @@ pub struct EvalStats {
     game_rewards: Vec<Vec<f64>>,
     /// Episode lengths
     episode_lengths: Vec<usize>,
+    /// Individual game outcomes for rating calculations
+    pub game_outcomes: Vec<GameOutcome>,
 }
 
 impl EvalStats {
@@ -278,6 +280,7 @@ impl EvalStats {
             total_games: 0,
             game_rewards: Vec::new(),
             episode_lengths: Vec::new(),
+            game_outcomes: Vec::new(),
         }
     }
 
@@ -292,6 +295,22 @@ impl EvalStats {
     /// Record a game outcome (backward-compatible)
     pub fn record(&mut self, outcome: &GameOutcome) {
         self.total_games += 1;
+
+        // Store the outcome for rating calculations
+        // Convert to Placements format for consistency
+        let placements_outcome = match outcome {
+            GameOutcome::Winner(winner) => {
+                let mut placements = vec![2; self.num_players];
+                placements[*winner] = 1;
+                GameOutcome::Placements(placements)
+            }
+            GameOutcome::Tie => {
+                // All players tied for 1st
+                GameOutcome::Placements(vec![1; self.num_players])
+            }
+            GameOutcome::Placements(p) => GameOutcome::Placements(p.clone()),
+        };
+        self.game_outcomes.push(placements_outcome);
 
         match outcome {
             GameOutcome::Winner(winner) => {
@@ -423,42 +442,53 @@ impl EvalStats {
             );
         }
 
-        // Compute Weng-Lin ratings (both start at 0)
+        // Compute Weng-Lin ratings using per-game outcomes
         let wl_config = WengLinConfig::new();
-        let mut p0 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-        let mut p1 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
+        let mut ratings = [
+            WengLinRating {
+                rating: 0.0,
+                uncertainty: 25.0 / 3.0,
+            },
+            WengLinRating {
+                rating: 0.0,
+                uncertainty: 25.0 / 3.0,
+            },
+        ];
 
-        // Process all game outcomes
-        for _ in 0..self.wins[0] {
-            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
-            p0 = new_p0;
-            p1 = new_p1;
-        }
-        for _ in 0..self.wins[1] {
-            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
-            p0 = new_p0;
-            p1 = new_p1;
-        }
-        for _ in 0..self.draws {
-            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::DRAW, &wl_config);
-            p0 = new_p0;
-            p1 = new_p1;
+        // Shuffle games to avoid completion-order bias
+        let mut outcomes = self.game_outcomes.clone();
+        let seed = outcomes.len() as u64;
+        let mut rng = StdRng::seed_from_u64(seed);
+        outcomes.shuffle(&mut rng);
+
+        // Process each game outcome with weng_lin_multi_team
+        for outcome in &outcomes {
+            if let GameOutcome::Placements(placements) = outcome {
+                let rating_arrs: Vec<[WengLinRating; 1]> = ratings.iter().map(|r| [*r]).collect();
+
+                let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_arrs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arr)| (arr.as_slice(), MultiTeamOutcome::new(placements[i])))
+                    .collect();
+
+                let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
+                for (i, new_rating) in new_ratings.iter().enumerate() {
+                    if !new_rating.is_empty() {
+                        ratings[i] = new_rating[0];
+                    }
+                }
+            }
         }
 
-        let stronger = if p0.rating > p1.rating {
+        let stronger = if ratings[0].rating > ratings[1].rating {
             "checkpoint 0 stronger"
         } else {
             "checkpoint 1 stronger"
         };
         println!(
             "\nRating: P0={:.1}±{:.1}, P1={:.1}±{:.1} ({stronger})",
-            p0.rating, p0.uncertainty, p1.rating, p1.uncertainty
+            ratings[0].rating, ratings[0].uncertainty, ratings[1].rating, ratings[1].uncertainty
         );
     }
 
@@ -675,6 +705,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     // Compute Weng-Lin ratings (challenger inherits best's rating as starting point)
     let wl_config = WengLinConfig::new();
 
+    // For challenger eval, current starts with best's rating, best is anchored
     let mut current = WengLinRating {
         rating: best_rating,
         uncertainty: best_uncertainty,
@@ -684,18 +715,27 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         uncertainty: best_uncertainty,
     };
 
+    // Shuffle games to avoid completion-order bias
+    let mut outcomes = stats.game_outcomes.clone();
+    let seed = outcomes.len() as u64;
+    let mut shuffle_rng = StdRng::seed_from_u64(seed);
+    outcomes.shuffle(&mut shuffle_rng);
+
     // Process each game - best is anchor (doesn't update)
-    for _ in 0..current_wins {
-        let (new_current, _) = weng_lin(&current, &best, &Outcomes::WIN, &wl_config);
-        current = new_current;
-    }
-    for _ in 0..best_wins {
-        let (new_current, _) = weng_lin(&current, &best, &Outcomes::LOSS, &wl_config);
-        current = new_current;
-    }
-    for _ in 0..draws {
-        let (new_current, _) = weng_lin(&current, &best, &Outcomes::DRAW, &wl_config);
-        current = new_current;
+    // Use weng_lin for efficiency since best is anchored
+    for outcome in &outcomes {
+        if let GameOutcome::Placements(placements) = outcome {
+            // For 2-player: placements[0] is current, placements[1] is best
+            let game_outcome = if placements[0] < placements[1] {
+                Outcomes::WIN // current won
+            } else if placements[0] > placements[1] {
+                Outcomes::LOSS // current lost
+            } else {
+                Outcomes::DRAW
+            };
+            let (new_current, _) = weng_lin(&current, &best, &game_outcome, &wl_config);
+            current = new_current;
+        }
     }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
