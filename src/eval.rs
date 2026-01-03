@@ -274,7 +274,10 @@ pub fn determine_outcome<E: Environment>(env: &E, total_rewards: &[f32]) -> Game
     if first_place_count == placements.len() {
         GameOutcome::Tie
     } else if first_place_count == 1 {
-        let winner = placements.iter().position(|&p| p == 1).unwrap();
+        let winner = placements
+            .iter()
+            .position(|&p| p == 1)
+            .expect("first_place_count == 1 guarantees a winner");
         GameOutcome::Winner(winner)
     } else {
         GameOutcome::Placements(placements)
@@ -637,7 +640,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         &mut rng,
         device,
         true, // silent
-    )?;
+    );
 
     // Extract stats for checkpoint 0 (the "new" model)
     let current_wins = stats.wins[0];
@@ -852,7 +855,9 @@ fn run_interactive_evaluation<B: Backend>(
                         load_model_from_checkpoint::<B>(&resolved, device)?;
                     path_to_model.insert(resolved.clone(), (model, normalizer));
                 }
-                let (model, normalizer) = path_to_model.get(&resolved).unwrap();
+                let (model, normalizer) = path_to_model
+                    .get(&resolved)
+                    .expect("just inserted if missing");
                 models.push(Some(model.clone()));
                 normalizers.push(normalizer.clone());
             }
@@ -896,7 +901,8 @@ fn run_interactive_evaluation<B: Backend>(
             &temp_schedule,
             &mut rng,
             device,
-        )
+        );
+        Ok(())
     })
 }
 
@@ -916,7 +922,7 @@ fn run_watch_mode<B: Backend>(
     let temp_schedule = TempSchedule::from_args(args)?;
 
     // Dispatch based on env_name stored in checkpoint metadata
-    dispatch_env!(metadata.env_name, {
+    crate::dispatch_env_ok!(metadata.env_name, {
         run_watch_mode_env::<B, E>(
             models,
             normalizers,
@@ -929,7 +935,7 @@ fn run_watch_mode<B: Backend>(
             args.fps,
             &mut rng,
             device,
-        )
+        );
     })
 }
 
@@ -946,7 +952,7 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
     fps: u32,
     rng: &mut StdRng,
     device: &B::Device,
-) -> Result<()> {
+) {
     use rand::RngCore;
     let mut stats = EvalStats::new(E::NUM_PLAYERS);
 
@@ -983,7 +989,10 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
             let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
                 .reshape([1, E::OBSERVATION_DIM]);
             let (logits, _) = model.forward(obs_tensor);
-            let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
+            let logits_vec: Vec<f32> = logits
+                .to_data()
+                .to_vec()
+                .expect("tensor data to vec conversion");
 
             let temp = temp_schedule.get_temp(move_num);
             let action = sample_with_temperature(&logits_vec, mask.as_deref(), temp, rng);
@@ -1007,7 +1016,7 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                     if let Some(start) = frame_start {
                         let elapsed = start.elapsed();
                         if elapsed < frame_duration {
-                            thread::sleep(frame_duration.checked_sub(elapsed).unwrap());
+                            thread::sleep(frame_duration.saturating_sub(elapsed));
                         }
                     }
                 } else {
@@ -1063,8 +1072,6 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
     if num_games > 1 {
         stats.print_summary(checkpoint_names);
     }
-
-    Ok(())
 }
 
 /// Wait for user to press Enter
@@ -1087,7 +1094,7 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
     temp_schedule: &TempSchedule,
     rng: &mut StdRng,
     device: &B::Device,
-) -> Result<()> {
+) {
     use rand::RngCore;
 
     let num_players = E::NUM_PLAYERS;
@@ -1184,7 +1191,10 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                         Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
                             .reshape([1, E::OBSERVATION_DIM]);
                     let (logits, _) = model.forward(obs_tensor);
-                    let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
+                    let logits_vec: Vec<f32> = logits
+                        .to_data()
+                        .to_vec()
+                        .expect("tensor data to vec conversion");
 
                     let temp = temp_schedule.get_temp(move_num);
                     let action = sample_with_temperature(&logits_vec, mask.as_deref(), temp, rng);
@@ -1239,8 +1249,6 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
     if num_games > 1 {
         stats.print_summary(&player_names);
     }
-
-    Ok(())
 }
 
 /// Build a hint closure from any available network model
@@ -1267,7 +1275,10 @@ fn build_hint_closure<'a, B: Backend, E: Environment>(
     let obs_tensor: Tensor<B, 2> =
         Tensor::<B, 1>::from_floats(&obs_for_model[..], device).reshape([1, E::OBSERVATION_DIM]);
     let (logits, _) = model.forward(obs_tensor);
-    let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
+    let logits_vec: Vec<f32> = logits
+        .to_data()
+        .to_vec()
+        .expect("tensor data to vec conversion");
 
     // Use temperature 0 for deterministic hint
     let mut temp_rng = StdRng::seed_from_u64(0);
@@ -1293,7 +1304,7 @@ fn run_stats_mode<B: Backend>(
 
     // Dispatch based on env_name stored in checkpoint metadata
     // Stats are printed inside run_stats_mode_env when not silent
-    dispatch_env!(metadata.env_name, {
+    crate::dispatch_env_ok!(metadata.env_name, {
         run_stats_mode_env::<B, E>(
             models,
             normalizers,
@@ -1305,8 +1316,7 @@ fn run_stats_mode<B: Backend>(
             &mut rng,
             device,
             false, // not silent - print progress and summary
-        )
-        .map(|_| ()) // Discard stats, they were already printed
+        );
     })
 }
 
@@ -1325,7 +1335,7 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
     rng: &mut StdRng,
     device: &B::Device,
     silent: bool,
-) -> Result<EvalStats> {
+) -> EvalStats {
     use rand::RngCore;
     let num_players = E::NUM_PLAYERS;
     let num_checkpoints = checkpoint_to_model.len();
@@ -1418,7 +1428,10 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
             let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
                 .reshape([batch_size, obs_dim]);
             let (logits_tensor, _) = model.forward(obs_tensor.clone());
-            let logits_flat: Vec<f32> = logits_tensor.to_data().to_vec().unwrap();
+            let logits_flat: Vec<f32> = logits_tensor
+                .to_data()
+                .to_vec()
+                .expect("tensor data to vec conversion");
 
             // Sample actions
             for (i, &env_idx) in env_indices.iter().enumerate() {
@@ -1477,7 +1490,10 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
                 if first_count == placements.len() {
                     GameOutcome::Tie
                 } else if first_count == 1 {
-                    let winner = placements.iter().position(|&p| p == 1).unwrap();
+                    let winner = placements
+                        .iter()
+                        .position(|&p| p == 1)
+                        .expect("first_count == 1 guarantees a winner");
                     GameOutcome::Winner(winner)
                 } else {
                     GameOutcome::Placements(placements)
@@ -1533,7 +1549,7 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
         stats.print_summary(checkpoint_names);
     }
 
-    Ok(stats)
+    stats
 }
 
 #[cfg(test)]

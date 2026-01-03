@@ -29,47 +29,48 @@ pub struct ConnectFour {
 
 impl ConnectFour {
     /// Render the board as ASCII art
-    #[expect(clippy::unwrap_used, reason = "write! to String never fails")]
     pub fn render_board(&self) -> String {
         use std::fmt::Write;
-        let mut output = String::new();
 
-        // Column numbers
-        writeln!(output, "  0 1 2 3 4 5 6").unwrap();
-        writeln!(output, " ---------------").unwrap();
+        // Inner closure uses ? operator; writing to String is infallible
+        let format = |output: &mut String| -> std::fmt::Result {
+            writeln!(output, "  0 1 2 3 4 5 6")?;
+            writeln!(output, " ---------------")?;
 
-        // Board rows (top to bottom)
-        for row in 0..ROWS {
-            write!(output, "|").unwrap();
-            for col in 0..COLS {
-                let symbol = match self.board[row][col] {
-                    Cell::Empty => '.',
-                    Cell::Player1 => 'X',
-                    Cell::Player2 => 'O',
-                };
-                write!(output, " {symbol}").unwrap();
+            for row in 0..ROWS {
+                write!(output, "|")?;
+                for col in 0..COLS {
+                    let symbol = match self.board[row][col] {
+                        Cell::Empty => '.',
+                        Cell::Player1 => 'X',
+                        Cell::Player2 => 'O',
+                    };
+                    write!(output, " {symbol}")?;
+                }
+                writeln!(output, " |")?;
             }
-            writeln!(output, " |").unwrap();
-        }
 
-        writeln!(output, " ---------------").unwrap();
+            writeln!(output, " ---------------")?;
 
-        // Current player
-        let turn = match self.current_player {
-            Cell::Player1 => "X (Player 0)",
-            Cell::Player2 => "O (Player 1)",
-            Cell::Empty => "N/A",
+            let turn = match self.current_player {
+                Cell::Player1 => "X (Player 0)",
+                Cell::Player2 => "O (Player 1)",
+                Cell::Empty => "N/A",
+            };
+            if self.game_over {
+                match self.winner {
+                    Some(Cell::Player1) => writeln!(output, "Game Over: X (Player 0) wins!")?,
+                    Some(Cell::Player2) => writeln!(output, "Game Over: O (Player 1) wins!")?,
+                    _ => writeln!(output, "Game Over: Draw!")?,
+                }
+            } else {
+                writeln!(output, "Turn: {turn}")?;
+            }
+            Ok(())
         };
-        if self.game_over {
-            match self.winner {
-                Some(Cell::Player1) => writeln!(output, "Game Over: X (Player 0) wins!").unwrap(),
-                Some(Cell::Player2) => writeln!(output, "Game Over: O (Player 1) wins!").unwrap(),
-                _ => writeln!(output, "Game Over: Draw!").unwrap(),
-            }
-        } else {
-            writeln!(output, "Turn: {turn}").unwrap();
-        }
 
+        let mut output = String::new();
+        let _ = format(&mut output);
         output
     }
 
@@ -117,6 +118,11 @@ impl ConnectFour {
     }
 
     /// Check if a player has won
+    #[expect(
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss,
+        reason = "board dimensions are small fixed constants"
+    )]
     fn check_winner(&self, row: usize, col: usize, player: Cell) -> bool {
         let directions: [(i32, i32); 4] = [
             (0, 1),  // Horizontal

@@ -59,6 +59,7 @@ warnings = "deny"
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
+allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 dbg_macro = "warn"
 todo = "warn"

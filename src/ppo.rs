@@ -24,6 +24,17 @@ use crate::utils::{
     entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical,
 };
 
+/// Flattened buffer data for minibatch processing:
+/// `(obs, actions, old_log_probs, advantages, returns, acting_players)`
+type FlattenedBuffer<B> = (
+    Tensor<B, 2>,
+    Tensor<B, 1, Int>,
+    Tensor<B, 1>,
+    Tensor<B, 1>,
+    Tensor<B, 1>,
+    Tensor<B, 1, Int>,
+);
+
 /// Stores trajectory data from environment rollouts
 ///
 /// Shape: [`num_steps`, `num_envs`] for most fields
@@ -99,16 +110,7 @@ impl<B: Backend> RolloutBuffer<B> {
     ///
     /// # Panics
     /// Panics if `compute_gae` was not called first (advantages/returns not set)
-    pub fn flatten(
-        &self,
-    ) -> (
-        Tensor<B, 2>,
-        Tensor<B, 1, Int>,
-        Tensor<B, 1>,
-        Tensor<B, 1>,
-        Tensor<B, 1>,
-        Tensor<B, 1, Int>,
-    ) {
+    pub fn flatten(&self) -> FlattenedBuffer<B> {
         let [num_steps, num_envs, obs_dim] = self.observations.dims();
         let batch_size = num_steps * num_envs;
 
@@ -139,6 +141,11 @@ impl<B: Backend> RolloutBuffer<B> {
 /// Uses CPU collection with batch GPU transfer for performance.
 /// If normalizer is provided, observations are normalized before model inference
 /// using existing (lagged) statistics, then stats are updated at end of rollout.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "action indices and player counts are small positive values"
+)]
 pub fn collect_rollouts<B: Backend, E: Environment>(
     model: &ActorCritic<B>,
     vec_env: &mut VecEnv<E>,
@@ -384,6 +391,7 @@ pub fn compute_gae<B: Backend>(
 ///
 /// This handles games where players take turns and rewards from other players'
 /// actions should be attributed to the acting player's previous action.
+#[expect(clippy::cast_sign_loss, reason = "tensor indices are non-negative")]
 pub fn compute_gae_multiplayer<B: Backend>(
     buffer: &mut RolloutBuffer<B>,
     last_values: Tensor<B, 2>, // [num_envs, num_players]
@@ -562,6 +570,11 @@ pub struct UpdateMetrics {
 /// Perform PPO update on collected rollouts
 ///
 /// Implements clipped surrogate objective with value clipping
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "tensor indices and minibatch sizes are non-negative"
+)]
 pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     model: ActorCritic<B>,
     buffer: &RolloutBuffer<B>,
@@ -624,7 +637,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_advantages = normalize_advantages(mb_advantages_raw);
 
             // Forward pass with GPU sync for accurate timing
-            #[allow(clippy::let_and_return, reason = "scoped for profiling")]
+            #[expect(clippy::let_and_return, reason = "scoped for profiling")]
             let (logits, all_values) = {
                 profile_scope!("minibatch_forward");
                 let result = model.forward(mb_obs);
@@ -756,7 +769,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             };
 
             // Optimizer step with GPU sync for accurate timing
-            #[allow(clippy::let_and_return, reason = "scoped for profiling")]
+            #[expect(clippy::let_and_return, reason = "scoped for profiling")]
             {
                 model = {
                     profile_scope!("optimizer_step");

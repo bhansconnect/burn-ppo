@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the full training pipeline including CLI parsing,
 //! checkpoint saving, resume/fork logic, and error handling.
-#![deny(warnings)]
+#![allow(clippy::unwrap_used, reason = "test code uses unwrap for simplicity")]
 
 use std::fs;
 use std::path::Path;

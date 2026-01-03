@@ -37,6 +37,31 @@ macro_rules! dispatch_env {
     }};
 }
 
+/// Like [`dispatch_env!`] but for callbacks that return `T` instead of `Result<T>`.
+/// Wraps the callback result in `Ok()` automatically.
+#[macro_export]
+macro_rules! dispatch_env_ok {
+    ($env_name:expr, $callback:expr) => {{
+        let name: &str = $env_name.as_str();
+        match name {
+            "cartpole" => {
+                type E = $crate::envs::CartPole;
+                Ok($callback)
+            }
+            "connect_four" => {
+                type E = $crate::envs::ConnectFour;
+                Ok($callback)
+            }
+            _ => {
+                anyhow::bail!(
+                    "Unknown environment: '{}'. Supported: cartpole, connect_four",
+                    name
+                )
+            }
+        }
+    }};
+}
+
 #[cfg(test)]
 mod tests {
     use crate::env::Environment;
@@ -65,14 +90,14 @@ mod tests {
         crate::dispatch_env!(name, Ok(get_obs_dim::<E>()))
     }
 
-    fn dispatch_unknown() -> anyhow::Result<()> {
+    fn dispatch_unknown() -> anyhow::Result<&'static str> {
         let name = "unknown_env".to_string();
-        crate::dispatch_env!(name, Ok(()))
+        crate::dispatch_env!(name, Ok(E::NAME))
     }
 
-    fn dispatch_case_sensitive() -> anyhow::Result<()> {
+    fn dispatch_case_sensitive() -> anyhow::Result<&'static str> {
         let name = "CartPole".to_string();
-        crate::dispatch_env!(name, Ok(()))
+        crate::dispatch_env!(name, Ok(E::NAME))
     }
 
     #[test]

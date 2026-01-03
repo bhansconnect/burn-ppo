@@ -1,5 +1,14 @@
 #![cfg_attr(not(test), deny(warnings))]
-#![cfg_attr(test, allow(clippy::unwrap_used))]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::float_cmp,
+        clippy::default_trait_access,
+        clippy::single_range_in_vec_init,
+        clippy::allow_attributes_without_reason,
+    )
+)]
 #![recursion_limit = "256"]
 
 mod backend;
@@ -17,7 +26,7 @@ mod profile;
 mod progress;
 mod utils;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -93,6 +102,8 @@ fn count_checkpoints(run_dir: &std::path::Path) -> usize {
 /// Returns Ok(true) if we should proceed (either didn't exist or user confirmed deletion)
 /// Returns Ok(false) if user declined deletion
 fn check_run_exists_and_prompt(run_dir: &std::path::Path) -> Result<bool> {
+    use std::io::Write;
+
     if !run_dir.exists() {
         return Ok(true);
     }
@@ -101,16 +112,18 @@ fn check_run_exists_and_prompt(run_dir: &std::path::Path) -> Result<bool> {
 
     eprintln!();
     eprintln!(
-        "Warning: Run '{}' already exists at {:?}",
-        run_dir.file_name().unwrap().to_string_lossy(),
+        "Warning: Run '{}' already exists at {}",
         run_dir
+            .file_name()
+            .expect("run_dir has filename")
+            .to_string_lossy(),
+        run_dir.display()
     );
     eprintln!("This run contains {checkpoint_count} checkpoint(s).");
     eprintln!();
     eprint!("Delete existing run and continue? [y/N]: ");
 
     // Flush stderr to ensure prompt is displayed
-    use std::io::Write;
     std::io::stderr().flush()?;
 
     // Read user input
@@ -146,12 +159,12 @@ enum TrainingMode {
 /// This is the core training function, generic over the environment type.
 /// Full static dispatch - `VecEnv`<CartPole> and `VecEnv`<ConnectFour> are separate types.
 fn run_training<E, F>(
-    mode: TrainingMode,
-    config: Config,
-    run_dir: PathBuf,
-    resumed_metadata: Option<CheckpointMetadata>,
+    mode: &TrainingMode,
+    config: &Config,
+    run_dir: &Path,
+    resumed_metadata: Option<&CheckpointMetadata>,
     device: &<TrainingBackend as burn::tensor::backend::Backend>::Device,
-    running: Arc<AtomicBool>,
+    running: &Arc<AtomicBool>,
     env_factory: F,
 ) -> Result<()>
 where
@@ -192,16 +205,16 @@ where
         )));
 
     // Initialize model and optimizer based on mode
-    let (mut model, mut optimizer, mut global_step, mut recent_returns, best_return) = match &mode {
+    let (mut model, mut optimizer, mut global_step, mut recent_returns, best_return) = match mode {
         TrainingMode::Fresh => {
             let model: ActorCritic<TrainingBackend> =
-                ActorCritic::new(obs_dim, action_count, num_players as usize, &config, device);
+                ActorCritic::new(obs_dim, action_count, num_players as usize, config, device);
             let optimizer = optimizer_config.init();
             println!("Created ActorCritic network");
             (model, optimizer, 0, Vec::new(), f32::NEG_INFINITY)
         }
         TrainingMode::Resume { checkpoint_dir, .. } | TrainingMode::Fork { checkpoint_dir } => {
-            let metadata = resumed_metadata.as_ref().unwrap();
+            let metadata = resumed_metadata.expect("resumed_metadata required for Resume/Fork");
 
             // Check for training completion
             if metadata.step >= config.total_timesteps {
@@ -214,9 +227,12 @@ where
 
             // Load model from checkpoint
             let (model, _) =
-                CheckpointManager::load::<TrainingBackend>(checkpoint_dir, &config, device)
+                CheckpointManager::load::<TrainingBackend>(checkpoint_dir, config, device)
                     .with_context(|| {
-                        format!("Failed to load checkpoint from {checkpoint_dir:?}")
+                        format!(
+                            "Failed to load checkpoint from {}",
+                            checkpoint_dir.display()
+                        )
                     })?;
 
             // Create optimizer and try to load saved state
@@ -281,15 +297,15 @@ where
         RolloutBuffer::new(config.num_steps, num_envs, obs_dim, num_players, device);
 
     // Create metrics logger
-    let mut logger = MetricsLogger::new(&run_dir)?;
+    let mut logger = MetricsLogger::new(run_dir)?;
     // Log hyperparameters for new runs (Fresh and Fork create new run directories)
     if matches!(mode, TrainingMode::Fresh | TrainingMode::Fork { .. }) {
-        logger.log_hparams(&config)?;
+        logger.log_hparams(config)?;
     }
     logger.flush()?;
 
     // Create checkpoint manager
-    let mut checkpoint_manager = CheckpointManager::new(&run_dir)?;
+    let mut checkpoint_manager = CheckpointManager::new(run_dir)?;
     checkpoint_manager.set_best_avg_return(best_return);
     let mut last_checkpoint_step = global_step;
     let mut last_checkpoint_time = std::time::Instant::now();
@@ -461,7 +477,7 @@ where
             model,
             &buffer,
             &mut optimizer,
-            &config,
+            config,
             lr,
             ent_coef,
             &mut rng,
@@ -572,8 +588,8 @@ where
                 let return_min = returns.iter().copied().fold(f32::INFINITY, f32::min);
 
                 let length_mean = lengths.iter().sum::<usize>() as f32 / lengths.len() as f32;
-                let length_max = *lengths.iter().max().unwrap() as f32;
-                let length_min = *lengths.iter().min().unwrap() as f32;
+                let length_max = *lengths.iter().max().expect("lengths non-empty") as f32;
+                let length_min = *lengths.iter().min().expect("lengths non-empty") as f32;
 
                 logger.log_scalar("episode/return_mean", return_mean, global_step)?;
                 logger.log_scalar("episode/return_max", return_max, global_step)?;
@@ -736,7 +752,7 @@ where
                         &best_path,
                         config.challenger_games,
                         config.challenger_threshold,
-                        &config,
+                        config,
                         device,
                         config.seed.wrapping_add(global_step as u64),
                     ) {
@@ -821,18 +837,24 @@ where
             // Log checkpoint save message
             let checkpoint_msg = if let Some(win_rate) = challenger_win_rate {
                 format!(
-                    "Saved checkpoint at step {} (avg return: {:.1}, vs best: {:.1}%) -> {:?}",
+                    "Saved checkpoint at step {} (avg return: {:.1}, vs best: {:.1}%) -> {}",
                     global_step,
                     avg_return,
                     win_rate * 100.0,
-                    checkpoint_path.file_name().unwrap()
+                    checkpoint_path
+                        .file_name()
+                        .expect("checkpoint has filename")
+                        .to_string_lossy()
                 )
             } else {
                 format!(
-                    "Saved checkpoint at step {} (avg return: {:.1}) -> {:?}",
+                    "Saved checkpoint at step {} (avg return: {:.1}) -> {}",
                     global_step,
                     avg_return,
-                    checkpoint_path.file_name().unwrap()
+                    checkpoint_path
+                        .file_name()
+                        .expect("checkpoint has filename")
+                        .to_string_lossy()
                 )
             };
             progress.println(&checkpoint_msg);
@@ -883,24 +905,27 @@ fn main() -> Result<()> {
         }
         Some(Command::Train(args)) => {
             // Training mode with explicit subcommand
-            run_training_cli(args)
+            run_training_cli(&args)
         }
         None => {
             // Default: parse as training args
             let args = CliArgs::parse();
-            run_training_cli(args)
+            run_training_cli(&args)
         }
     }
 }
 
-fn run_training_cli(args: CliArgs) -> Result<()> {
+fn run_training_cli(args: &CliArgs) -> Result<()> {
     // Determine training mode
     let mode = if let Some(resume_path) = &args.resume {
         // Resume mode: continue existing run
         let run_dir = resume_path.clone();
         let checkpoint_dir = run_dir.join("checkpoints/latest");
         if !checkpoint_dir.exists() {
-            bail!("No checkpoint found at {checkpoint_dir:?}. Cannot resume.");
+            bail!(
+                "No checkpoint found at {}. Cannot resume.",
+                checkpoint_dir.display()
+            );
         }
         TrainingMode::Resume {
             run_dir,
@@ -910,7 +935,10 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
         // Fork mode: new run from checkpoint
         let checkpoint_dir = fork_path.clone();
         if !checkpoint_dir.exists() {
-            bail!("Checkpoint not found at {checkpoint_dir:?}. Cannot fork.");
+            bail!(
+                "Checkpoint not found at {}. Cannot fork.",
+                checkpoint_dir.display()
+            );
         }
         TrainingMode::Fork { checkpoint_dir }
     } else {
@@ -920,7 +948,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
     // Load config based on mode
     let (config, run_dir, resumed_metadata) = match &mode {
         TrainingMode::Fresh => {
-            let config = Config::load(&args, None)?;
+            let config = Config::load(args, None)?;
             let run_dir = config.run_path();
 
             // Check if run directory already exists
@@ -937,15 +965,15 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
             // Load config from the run directory
             let config_path = run_dir.join("config.toml");
             let mut config = Config::load_from_path(&config_path)
-                .with_context(|| format!("Failed to load config from {config_path:?}"))?;
+                .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
             // Apply limited resume overrides (only total_timesteps allowed)
-            config.apply_resume_overrides(&args);
+            config.apply_resume_overrides(args);
 
             // Load checkpoint metadata
             let metadata_path = checkpoint_dir.join("metadata.json");
             let metadata_json = std::fs::read_to_string(&metadata_path)
-                .with_context(|| format!("Failed to read {metadata_path:?}"))?;
+                .with_context(|| format!("Failed to read {}", metadata_path.display()))?;
             let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
 
             (config, run_dir.clone(), Some(metadata))
@@ -955,7 +983,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
             let parent_run_name = extract_run_name_from_checkpoint_path(checkpoint_dir);
 
             // Use new config from CLI with forked_from set
-            let config = Config::load(&args, parent_run_name)?;
+            let config = Config::load(args, parent_run_name.as_deref())?;
             let run_dir = config.run_path();
 
             // Check if run directory already exists
@@ -966,7 +994,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
             // Load checkpoint metadata
             let metadata_path = checkpoint_dir.join("metadata.json");
             let metadata_json = std::fs::read_to_string(&metadata_path)
-                .with_context(|| format!("Failed to read {metadata_path:?}"))?;
+                .with_context(|| format!("Failed to read {}", metadata_path.display()))?;
             let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
 
             (config, run_dir, Some(metadata))
@@ -980,7 +1008,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
         TrainingMode::Fresh => println!("Mode: Fresh training"),
         TrainingMode::Resume { .. } => println!("Mode: Resuming from checkpoint"),
         TrainingMode::Fork { checkpoint_dir } => {
-            println!("Mode: Forking from {checkpoint_dir:?}");
+            println!("Mode: Forking from {}", checkpoint_dir.display());
         }
     }
     println!("Environment: {}", config.env);
@@ -993,7 +1021,10 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
         config.num_envs()
     );
     println!("Seed: {}", config.seed);
-    println!("Run: {}", config.run_name.as_ref().unwrap());
+    println!(
+        "Run: {}",
+        config.run_name.as_ref().expect("run_name is set")
+    );
 
     // Set up graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
@@ -1024,21 +1055,21 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
     let seed = config.seed;
     match config.env.as_str() {
         "cartpole" => run_training::<CartPole, _>(
-            mode,
-            config,
-            run_dir,
-            resumed_metadata,
+            &mode,
+            &config,
+            &run_dir,
+            resumed_metadata.as_ref(),
             &device,
-            running,
+            &running,
             move |i| CartPole::new(seed + i as u64),
         ),
         "connect_four" => run_training::<ConnectFour, _>(
-            mode,
-            config,
-            run_dir,
-            resumed_metadata,
+            &mode,
+            &config,
+            &run_dir,
+            resumed_metadata.as_ref(),
             &device,
-            running,
+            &running,
             move |i| ConnectFour::new(seed + i as u64),
         ),
         _ => bail!(

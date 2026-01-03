@@ -97,6 +97,11 @@ impl Environment for CartPole {
         env
     }
 
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "display coordinates are small positive values"
+    )]
     fn render(&self) -> Option<String> {
         // ASCII visualization of CartPole
         //
@@ -112,14 +117,13 @@ impl Environment for CartPole {
         const WIDTH: usize = 60;
         const CART_WIDTH: usize = 9;
         const POLE_HEIGHT: usize = 5;
-
-        // Buffer rows: 0=pole_top, 4=pole_bottom, 5=cart_top, 6=cart_bottom, 7=track
-        let mut buffer = vec![vec![' '; WIDTH]; 8];
-
         // Row indices in buffer
         const CART_TOP: usize = 5;
         const CART_BOTTOM: usize = 6;
         const TRACK: usize = 7;
+
+        // Buffer rows: 0=pole_top, 4=pole_bottom, 5=cart_top, 6=cart_bottom, 7=track
+        let mut buffer = vec![vec![' '; WIDTH]; 8];
 
         // Calculate cart center position
         // x ranges from -2.4 to 2.4, map to screen coordinates
@@ -306,6 +310,7 @@ impl Environment for CartPole {
 }
 
 #[cfg(test)]
+#[expect(clippy::cast_possible_wrap, reason = "test display values are small")]
 mod tests {
     use super::*;
 

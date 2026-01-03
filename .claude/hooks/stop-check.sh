@@ -46,21 +46,21 @@ $check_output
     exit 2
 fi
 
-# # 3. Run cargo clippy
-# echo "Running cargo clippy..." >&2
-# if ! clippy_output=$(cargo clippy --all-targets -- -D warnings 2>&1); then
-#     echo "## Clippy Warnings
+# 3. Run cargo clippy
+echo "Running cargo clippy..." >&2
+if ! clippy_output=$(cargo clippy --all-targets -- -D warnings 2>&1); then
+    echo "## Clippy Warnings
 
-# Clippy found issues that should be fixed:
+Clippy found issues that should be fixed:
 
-# \`\`\`
-# $clippy_output
-# \`\`\`
+\`\`\`
+$clippy_output
+\`\`\`
 
-# **To fix:** Follow the suggested code changes from clippy. Run \`cargo clippy --fix\` to auto-fix some issues.
-# " >&2
-#     exit 2
-# fi
+**To fix:** Follow the suggested code changes from clippy. Run \`cargo clippy --fix\` to auto-fix some issues.
+" >&2
+    exit 2
+fi
 
 # 4. Run tests (prefer nextest, fallback to cargo test)
 echo "Running tests..." >&2

@@ -60,6 +60,10 @@ pub struct TrainArgs {
 
 /// Arguments for evaluation
 #[derive(Parser, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI args naturally use bool flags"
+)]
 pub struct EvalArgs {
     /// Checkpoint paths (one per player, use with --human and --random for mixed games)
     #[arg(long = "checkpoint", short = 'c')]
@@ -151,6 +155,10 @@ impl NumEnvs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config flags naturally use bools"
+)]
 pub struct Config {
     // Environment (required - must be specified in TOML config)
     pub env: String,
@@ -372,7 +380,7 @@ impl Config {
     /// Load config from TOML file, apply CLI overrides
     ///
     /// The `forked_from` parameter is set when forking from another run
-    pub fn load(args: &CliArgs, forked_from: Option<String>) -> Result<Self> {
+    pub fn load(args: &CliArgs, forked_from: Option<&str>) -> Result<Self> {
         // Load base config - fail if file doesn't exist
         let config_path = args.config.display();
         let content = fs::read_to_string(&args.config)
@@ -384,7 +392,7 @@ impl Config {
         config.apply_cli_overrides(args);
 
         // Store forked_from relationship
-        config.forked_from.clone_from(&forked_from);
+        config.forked_from = forked_from.map(String::from);
 
         // For fork mode, always generate child name (ignore --run-name if specified)
         if forked_from.is_some() {
@@ -393,7 +401,7 @@ impl Config {
                     "Warning: --run-name is ignored when forking; using auto-generated child name"
                 );
             }
-            config.run_name = Some(generate_run_name(&config, forked_from.as_deref()));
+            config.run_name = Some(generate_run_name(&config, forked_from));
         } else if config.run_name.is_none() {
             // Generate run name if not specified (fresh training)
             config.run_name = Some(generate_run_name(&config, None));

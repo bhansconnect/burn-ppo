@@ -48,7 +48,7 @@ pub fn prompt_human_action<E: Environment>(
                 player_count
             );
         }
-        io::stdout().flush().unwrap();
+        io::stdout().flush().expect("stdout flush");
 
         let mut input = String::new();
         if io::stdin().read_line(&mut input).is_err() {
@@ -60,7 +60,6 @@ pub fn prompt_human_action<E: Environment>(
         match input.as_str() {
             "help" | "h" | "?" => {
                 show_actions(env);
-                continue;
             }
             "render" | "r" | "board" => {
                 if let Some(render) = env.render() {
@@ -68,7 +67,6 @@ pub fn prompt_human_action<E: Environment>(
                 } else {
                     println!("(No render available for this environment)");
                 }
-                continue;
             }
             "random" | "rand" => {
                 let action = random_valid_action(env, rng);
@@ -82,7 +80,6 @@ pub fn prompt_human_action<E: Environment>(
                 } else {
                     println!("No network available for hints");
                 }
-                continue;
             }
             "quit" | "q" => {
                 println!("Goodbye!");
