@@ -482,9 +482,9 @@ impl EvalStats {
         }
 
         let stronger = if ratings[0].rating > ratings[1].rating {
-            "checkpoint 0 stronger"
+            format!("{} stronger", checkpoint_names[0])
         } else {
-            "checkpoint 1 stronger"
+            format!("{} stronger", checkpoint_names[1])
         };
         println!(
             "\nRating: P0={:.1}±{:.1}, P1={:.1}±{:.1} ({stronger})",
@@ -1089,10 +1089,11 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                     let frame_lines = rendered.lines().count();
                     // Move cursor up to overwrite previous frame
                     if !is_first_frame {
-                        // +1 for the action line
-                        print!("\x1b[{}A", last_frame_lines + 1);
+                        // +1 for the action line; \r moves to column 1; \x1b[J clears to end of screen
+                        print!("\x1b[{}A\r\x1b[J", last_frame_lines + 1);
+                        io::stdout().flush().ok();
                     }
-                    println!("{rendered}");
+                    print!("{rendered}");
                     // Trailing spaces clear any leftover characters from previous longer text
                     println!("Action: {action} (temp={temp:.2})                    ");
                     io::stdout().flush().ok();
@@ -1130,8 +1131,9 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                 if let Some(rendered) = env.render() {
                     if animate {
                         // Overwrite the animation frame with final state
-                        print!("\x1b[{}A", last_frame_lines + 1);
-                        println!("{rendered}");
+                        print!("\x1b[{}A\r\x1b[J", last_frame_lines + 1);
+                        io::stdout().flush().ok();
+                        print!("{rendered}");
                         println!(); // Extra line to separate from outcome
                     } else {
                         println!("{rendered}");
