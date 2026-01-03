@@ -1561,10 +1561,7 @@ mod tests {
 
         assert_eq!(contestants.len(), 1);
         assert_eq!(contestants[0].name, "step_100");
-        assert!(matches!(
-            contestants[0].source,
-            PlayerSource::Checkpoint(_)
-        ));
+        assert!(matches!(contestants[0].source, PlayerSource::Checkpoint(_)));
     }
 
     #[test]
@@ -1740,9 +1737,7 @@ mod tests {
 
     #[test]
     fn test_select_evenly_spaced_zero() {
-        let paths: Vec<PathBuf> = (0..5)
-            .map(|i| PathBuf::from(format!("step_{i}")))
-            .collect();
+        let paths: Vec<PathBuf> = (0..5).map(|i| PathBuf::from(format!("step_{i}"))).collect();
 
         let selected = select_evenly_spaced(&paths, 0);
         assert!(selected.is_empty());
