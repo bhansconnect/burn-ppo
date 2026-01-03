@@ -115,3 +115,47 @@ impl TrainingProgress {
         self.main_bar.abandon_with_message("Interrupted");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_training_progress_creation_single_player() {
+        let progress = TrainingProgress::new_with_players(1000, 1);
+        assert_eq!(progress.num_players, 1);
+    }
+
+    #[test]
+    fn test_training_progress_creation_multiplayer() {
+        let progress = TrainingProgress::new_with_players(1000, 2);
+        assert_eq!(progress.num_players, 2);
+
+        let progress3 = TrainingProgress::new_with_players(1000, 3);
+        assert_eq!(progress3.num_players, 3);
+    }
+
+    #[test]
+    fn test_training_progress_update_no_panic() {
+        let progress = TrainingProgress::new_with_players(1000, 1);
+        // Should not panic
+        progress.update(500, 125.5);
+        progress.finish();
+    }
+
+    #[test]
+    fn test_training_progress_update_multiplayer_no_panic() {
+        let progress = TrainingProgress::new_with_players(1000, 2);
+        // Should not panic with 2-player format
+        progress.update_multiplayer(500, &[0.5, 0.5], &[0.45, 0.45], 0.1);
+        progress.finish();
+    }
+
+    #[test]
+    fn test_training_progress_update_multiplayer_3player_no_panic() {
+        let progress = TrainingProgress::new_with_players(1000, 3);
+        // Should not panic with N-player format
+        progress.update_multiplayer(500, &[0.33, 0.33, 0.34], &[0.3, 0.3, 0.3], 0.1);
+        progress.finish();
+    }
+}

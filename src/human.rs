@@ -218,4 +218,30 @@ mod tests {
         // Out of bounds still invalid
         assert!(!is_valid_action::<MockEnv>(&env, 10));
     }
+
+    #[test]
+    fn test_random_valid_action_single_valid() {
+        // Edge case: only one action is valid
+        let env = MockEnv {
+            mask: Some(vec![false, false, true, false]), // Only action 2 valid
+        };
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..10 {
+            let action = random_valid_action(&env, &mut rng);
+            assert_eq!(action, 2, "Should always pick the only valid action");
+        }
+    }
+
+    #[test]
+    fn test_random_valid_action_all_invalid() {
+        // Edge case: no valid actions (shouldn't happen in practice, but test fallback)
+        let env = MockEnv {
+            mask: Some(vec![false, false, false, false]),
+        };
+        let mut rng = rand::thread_rng();
+
+        let action = random_valid_action(&env, &mut rng);
+        assert_eq!(action, 0, "Fallback should return 0");
+    }
 }

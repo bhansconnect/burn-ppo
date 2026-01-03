@@ -415,4 +415,162 @@ mod tests {
         assert_eq!(completed[0].total_reward(), 5.0);
         assert_eq!(completed[0].length, 5);
     }
+
+    // =========================================
+    // compute_outcome_rates Tests
+    // =========================================
+
+    #[test]
+    fn test_compute_outcome_rates_empty() {
+        let outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        let (win_rates, draw_rate) = compute_outcome_rates(&outcomes, 2);
+
+        assert_eq!(win_rates, vec![0.0, 0.0]);
+        assert_eq!(draw_rate, 0.0);
+    }
+
+    #[test]
+    fn test_compute_outcome_rates_all_wins_p0() {
+        let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        for _ in 0..10 {
+            outcomes.push_back(GameOutcome::Winner(0));
+        }
+        let (win_rates, draw_rate) = compute_outcome_rates(&outcomes, 2);
+
+        assert_eq!(win_rates, vec![1.0, 0.0]);
+        assert_eq!(draw_rate, 0.0);
+    }
+
+    #[test]
+    fn test_compute_outcome_rates_all_wins_p1() {
+        let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        for _ in 0..10 {
+            outcomes.push_back(GameOutcome::Winner(1));
+        }
+        let (win_rates, draw_rate) = compute_outcome_rates(&outcomes, 2);
+
+        assert_eq!(win_rates, vec![0.0, 1.0]);
+        assert_eq!(draw_rate, 0.0);
+    }
+
+    #[test]
+    fn test_compute_outcome_rates_all_ties() {
+        let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        for _ in 0..10 {
+            outcomes.push_back(GameOutcome::Tie);
+        }
+        let (win_rates, draw_rate) = compute_outcome_rates(&outcomes, 2);
+
+        assert_eq!(win_rates, vec![0.0, 0.0]);
+        assert_eq!(draw_rate, 1.0);
+    }
+
+    #[test]
+    fn test_compute_outcome_rates_mixed() {
+        let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        // 4 wins for P0, 3 wins for P1, 3 draws = 10 games
+        for _ in 0..4 {
+            outcomes.push_back(GameOutcome::Winner(0));
+        }
+        for _ in 0..3 {
+            outcomes.push_back(GameOutcome::Winner(1));
+        }
+        for _ in 0..3 {
+            outcomes.push_back(GameOutcome::Tie);
+        }
+        let (win_rates, draw_rate) = compute_outcome_rates(&outcomes, 2);
+
+        assert!((win_rates[0] - 0.4).abs() < 0.001);
+        assert!((win_rates[1] - 0.3).abs() < 0.001);
+        assert!((draw_rate - 0.3).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compute_outcome_rates_placements_sole_winner() {
+        let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        // 3-player game: P0 wins, P1 second, P2 third
+        outcomes.push_back(GameOutcome::Placements(vec![1, 2, 3]));
+        // P1 wins
+        outcomes.push_back(GameOutcome::Placements(vec![2, 1, 3]));
+        // P2 wins
+        outcomes.push_back(GameOutcome::Placements(vec![3, 2, 1]));
+
+        let (win_rates, draw_rate) = compute_outcome_rates(&outcomes, 3);
+
+        // Each player won once out of 3 games
+        assert!((win_rates[0] - 1.0 / 3.0).abs() < 0.001);
+        assert!((win_rates[1] - 1.0 / 3.0).abs() < 0.001);
+        assert!((win_rates[2] - 1.0 / 3.0).abs() < 0.001);
+        assert_eq!(draw_rate, 0.0);
+    }
+
+    #[test]
+    fn test_compute_outcome_rates_placements_all_tied() {
+        let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        // 3-player game: all tied for first
+        outcomes.push_back(GameOutcome::Placements(vec![1, 1, 1]));
+        outcomes.push_back(GameOutcome::Placements(vec![1, 1, 1]));
+
+        let (win_rates, draw_rate) = compute_outcome_rates(&outcomes, 3);
+
+        assert_eq!(win_rates, vec![0.0, 0.0, 0.0]);
+        assert_eq!(draw_rate, 1.0); // All games were ties
+    }
+
+    // =========================================
+    // VecEnv Terminal Operations Tests
+    // =========================================
+
+    #[test]
+    fn test_vec_env_set_terminal() {
+        let mut vec_env: VecEnv<CounterEnv<10>> =
+            VecEnv::new(3, |i| CounterEnv::<10>::new(i as u64));
+
+        // Initially all active
+        assert_eq!(vec_env.terminal_mask(), &[false, false, false]);
+
+        // Mark env 1 as terminal
+        vec_env.set_terminal(1);
+        assert_eq!(vec_env.terminal_mask(), &[false, true, false]);
+
+        // Mark env 0 as terminal
+        vec_env.set_terminal(0);
+        assert_eq!(vec_env.terminal_mask(), &[true, true, false]);
+    }
+
+    #[test]
+    fn test_vec_env_active_count() {
+        let mut vec_env: VecEnv<CounterEnv<10>> =
+            VecEnv::new(5, |i| CounterEnv::<10>::new(i as u64));
+
+        assert_eq!(vec_env.active_count(), 5);
+
+        vec_env.set_terminal(0);
+        assert_eq!(vec_env.active_count(), 4);
+
+        vec_env.set_terminal(2);
+        vec_env.set_terminal(4);
+        assert_eq!(vec_env.active_count(), 2);
+    }
+
+    #[test]
+    fn test_vec_env_terminal_skips_step() {
+        let mut vec_env: VecEnv<CounterEnv<10>> =
+            VecEnv::new(2, |i| CounterEnv::<10>::new(i as u64));
+
+        // Mark env 0 as terminal
+        vec_env.set_terminal(0);
+
+        // Step - env 0 should be skipped
+        let (obs, all_rewards, dones, _) = vec_env.step(&[0, 0]);
+
+        // Env 0 was terminal: returns zeroed rewards and done=true
+        assert_eq!(all_rewards[0], vec![0.0]);
+        assert!(dones[0]);
+
+        // Env 1 was active: stepped normally
+        assert_eq!(all_rewards[1], vec![1.0]);
+        assert!(!dones[1]);
+        assert_eq!(obs[1], 1.0); // Env 1 advanced to count=1
+    }
 }

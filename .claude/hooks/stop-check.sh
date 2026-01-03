@@ -90,15 +90,15 @@ fi
 # 5. Run code coverage (use nextest if available)
 echo "Running coverage..." >&2
 if command -v cargo-nextest &> /dev/null; then
-    cov_cmd="cargo llvm-cov nextest --fail-under-regions 50"
+    cov_cmd="cargo llvm-cov nextest --fail-under-regions 80"
 else
-    cov_cmd="cargo llvm-cov --fail-under-regions 50"
+    cov_cmd="cargo llvm-cov --fail-under-regions 80"
 fi
 
 if ! cov_output=$($cov_cmd 2>&1); then
-    echo "## Code Coverage Below 50%
+    echo "## Code Coverage Below 80%
 
-Coverage is below the required 50% region coverage threshold:
+Coverage is below the required 80% region coverage threshold:
 
 \`\`\`
 $cov_output

@@ -372,6 +372,266 @@ fn test_eval_subcommand_help() {
 }
 
 // ============================================================================
+// Evaluation Tests
+// ============================================================================
+
+#[test]
+fn test_eval_stats_mode() {
+    let dir = tempdir().unwrap();
+
+    // First: train a model
+    let output1 = run_binary(&[], dir.path());
+    assert!(
+        output1.status.success(),
+        "Training failed: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+
+    let run_dir = get_first_run_dir(dir.path()).unwrap();
+    let best_checkpoint = run_dir.join("checkpoints/best");
+
+    // Run eval with stats mode (default)
+    let output = run_binary_raw(&[
+        "eval",
+        "--checkpoint",
+        best_checkpoint.to_str().unwrap(),
+        "--num-games",
+        "10",
+        "--num-envs",
+        "2",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "Eval stats mode failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Should show game results
+    assert!(
+        stdout.contains("games") || stdout.contains("Reward") || stdout.contains("Mean"),
+        "Eval output should show game statistics"
+    );
+}
+
+#[test]
+fn test_eval_with_temperature() {
+    let dir = tempdir().unwrap();
+
+    // Train a model
+    let output1 = run_binary(&[], dir.path());
+    assert!(output1.status.success());
+
+    let run_dir = get_first_run_dir(dir.path()).unwrap();
+    let best_checkpoint = run_dir.join("checkpoints/best");
+
+    // Run eval with temperature options
+    let output = run_binary_raw(&[
+        "eval",
+        "--checkpoint",
+        best_checkpoint.to_str().unwrap(),
+        "--num-games",
+        "5",
+        "--temperature",
+        "0.5",
+        "--temp-cutoff",
+        "10",
+        "--temp-final",
+        "0.0",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "Eval with temperature failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ============================================================================
+// Checkpoint Metadata Tests
+// ============================================================================
+
+#[test]
+fn test_checkpoint_metadata_structure() {
+    let dir = tempdir().unwrap();
+    let output = run_binary(&[], dir.path());
+
+    assert!(output.status.success());
+
+    let run_dir = get_first_run_dir(dir.path()).unwrap();
+    let checkpoints_dir = run_dir.join("checkpoints");
+
+    // Find first step_* directory
+    let step_dir = fs::read_dir(&checkpoints_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("step_"))
+        });
+
+    assert!(step_dir.is_some(), "Should have a step checkpoint");
+
+    let metadata_path = step_dir.unwrap().path().join("metadata.json");
+    assert!(metadata_path.exists(), "metadata.json should exist");
+
+    let metadata_content = fs::read_to_string(&metadata_path).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_content).unwrap();
+
+    // Verify all required fields exist
+    assert!(metadata.get("step").is_some(), "metadata should have step");
+    assert!(
+        metadata.get("avg_return").is_some(),
+        "metadata should have avg_return"
+    );
+    assert!(
+        metadata.get("obs_dim").is_some(),
+        "metadata should have obs_dim"
+    );
+    assert!(
+        metadata.get("action_count").is_some(),
+        "metadata should have action_count"
+    );
+    assert!(
+        metadata.get("hidden_size").is_some(),
+        "metadata should have hidden_size"
+    );
+    assert!(
+        metadata.get("env_name").is_some(),
+        "metadata should have env_name"
+    );
+}
+
+#[test]
+fn test_checkpoint_symlinks_exist() {
+    let dir = tempdir().unwrap();
+    let output = run_binary(&[], dir.path());
+
+    assert!(output.status.success());
+
+    let run_dir = get_first_run_dir(dir.path()).unwrap();
+    let checkpoints_dir = run_dir.join("checkpoints");
+
+    // Check that latest symlink exists
+    let latest = checkpoints_dir.join("latest");
+    assert!(latest.exists(), "latest symlink should exist");
+
+    // Check that best symlink exists
+    let best = checkpoints_dir.join("best");
+    assert!(best.exists(), "best symlink should exist");
+}
+
+// ============================================================================
+// Metrics File Tests
+// ============================================================================
+
+#[test]
+fn test_metrics_file_format() {
+    let dir = tempdir().unwrap();
+    let output = run_binary(&[], dir.path());
+
+    assert!(output.status.success());
+
+    let run_dir = get_first_run_dir(dir.path()).unwrap();
+    let metrics_path = run_dir.join("metrics.jsonl");
+
+    let content = fs::read_to_string(&metrics_path).unwrap();
+
+    // Each line should be valid JSON
+    for (i, line) in content.lines().enumerate() {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
+        assert!(
+            parsed.is_ok(),
+            "Line {} should be valid JSON: {}",
+            i + 1,
+            line
+        );
+
+        let value = parsed.unwrap();
+        // Each line should have either "hparams" or "step" field
+        assert!(
+            value.get("hparams").is_some() || value.get("step").is_some(),
+            "Line {} should have hparams or step field",
+            i + 1
+        );
+    }
+}
+
+// ============================================================================
+// Observation Normalization Tests
+// ============================================================================
+
+#[test]
+fn test_training_with_normalize_obs() {
+    let dir = tempdir().unwrap();
+
+    // Create config with normalize_obs enabled
+    let config_content = format!(
+        r#"
+env = "cartpole"
+num_envs = 2
+num_steps = 8
+total_timesteps = 64
+num_epochs = 1
+num_minibatches = 1
+hidden_size = 16
+num_hidden = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 32
+log_freq = 1000
+seed = 42
+normalize_obs = true
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("norm_config.toml");
+    fs::write(&config_path, config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "Training with normalize_obs failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify normalizer was saved
+    let run_dir = get_first_run_dir(dir.path()).unwrap();
+    let checkpoints_dir = run_dir.join("checkpoints");
+
+    let step_dir = fs::read_dir(&checkpoints_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("step_"))
+        });
+
+    assert!(step_dir.is_some());
+    let normalizer_path = step_dir.unwrap().path().join("normalizer.json");
+    assert!(
+        normalizer_path.exists(),
+        "normalizer.json should be saved when normalize_obs=true"
+    );
+}
+
+// ============================================================================
 // Connect Four Environment Tests
 // ============================================================================
 

@@ -540,4 +540,88 @@ mod tests {
         assert_eq!(loaded.env_name, "connect_four");
         assert_eq!(loaded.forked_from, Some("parent_run".to_string()));
     }
+
+    // =========================================
+    // Normalizer and RNG State Tests
+    // =========================================
+
+    #[test]
+    fn test_save_load_normalizer_roundtrip() {
+        use crate::normalization::ObsNormalizer;
+
+        let dir = tempdir().unwrap();
+        let checkpoint_dir = dir.path();
+
+        // Create and update a normalizer
+        let mut normalizer = ObsNormalizer::new(4, 10.0);
+        normalizer.update_batch(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 4);
+
+        // Save it
+        save_normalizer(&normalizer, checkpoint_dir).unwrap();
+
+        // Load it back
+        let loaded = load_normalizer(checkpoint_dir).unwrap();
+        assert!(loaded.is_some(), "Normalizer should be loaded");
+
+        let loaded = loaded.unwrap();
+        // Verify by normalizing some data
+        let test_data = vec![1.0, 2.0, 3.0, 4.0];
+        let norm1 = normalizer.normalize(&test_data);
+        let norm2 = loaded.normalize(&test_data);
+        assert_eq!(norm1, norm2, "Loaded normalizer should produce same results");
+    }
+
+    #[test]
+    fn test_load_normalizer_missing_file() {
+        let dir = tempdir().unwrap();
+        // No normalizer saved
+        let loaded = load_normalizer(dir.path()).unwrap();
+        assert!(
+            loaded.is_none(),
+            "Loading from dir without normalizer should return None"
+        );
+    }
+
+    #[test]
+    fn test_save_load_rng_state_roundtrip() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = tempdir().unwrap();
+        let checkpoint_dir = dir.path();
+
+        // Create RNG and advance it
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let _: f32 = rng.gen();
+        let _: f32 = rng.gen();
+
+        // Save state - this advances the RNG
+        save_rng_state(&mut rng, checkpoint_dir).unwrap();
+
+        // Load state - should produce the same sequence as a fresh load
+        let loaded1 = load_rng_state(checkpoint_dir).unwrap();
+        assert!(loaded1.is_some(), "RNG state should be loaded");
+
+        // Load again - both should produce identical sequences
+        let loaded2 = load_rng_state(checkpoint_dir).unwrap();
+        assert!(loaded2.is_some());
+
+        let mut rng1 = loaded1.unwrap();
+        let mut rng2 = loaded2.unwrap();
+
+        // Both loaded RNGs should produce identical sequences
+        for _ in 0..10 {
+            assert_eq!(rng1.gen::<f32>(), rng2.gen::<f32>());
+        }
+    }
+
+    #[test]
+    fn test_load_rng_state_missing_file() {
+        let dir = tempdir().unwrap();
+        // No RNG state saved
+        let loaded = load_rng_state(dir.path()).unwrap();
+        assert!(
+            loaded.is_none(),
+            "Loading from dir without rng_state should return None"
+        );
+    }
 }

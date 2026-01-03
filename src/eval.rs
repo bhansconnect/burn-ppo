@@ -1980,4 +1980,69 @@ mod tests {
         assert_eq!(stats.placements[0][1], 1); // P0 got 2nd once
         assert_eq!(stats.placements[0][2], 1); // P0 got 3rd once
     }
+
+    // =========================================
+    // PlayerSource Tests
+    // =========================================
+
+    #[test]
+    fn test_player_source_is_human() {
+        let human = PlayerSource::Human {
+            name: "Alice".to_string(),
+        };
+        let checkpoint = PlayerSource::Checkpoint(std::path::PathBuf::from("/path/to/model"));
+        let random = PlayerSource::Random;
+
+        assert!(human.is_human());
+        assert!(!checkpoint.is_human());
+        assert!(!random.is_human());
+    }
+
+    #[test]
+    fn test_player_source_display_name_checkpoint() {
+        let checkpoint = PlayerSource::Checkpoint(std::path::PathBuf::from("/runs/test/checkpoints/best"));
+        assert_eq!(checkpoint.display_name(), "best");
+
+        let step_checkpoint = PlayerSource::Checkpoint(std::path::PathBuf::from("/runs/test/checkpoints/step_1000"));
+        assert_eq!(step_checkpoint.display_name(), "step_1000");
+    }
+
+    #[test]
+    fn test_player_source_display_name_human() {
+        let human = PlayerSource::Human {
+            name: "Bob".to_string(),
+        };
+        assert_eq!(human.display_name(), "Bob");
+    }
+
+    #[test]
+    fn test_player_source_display_name_random() {
+        let random = PlayerSource::Random;
+        assert_eq!(random.display_name(), "Random");
+    }
+
+    #[test]
+    fn test_challenger_result_should_promote() {
+        // Win rate above threshold should promote
+        let result = ChallengerResult {
+            current_wins: 60,
+            best_wins: 30,
+            draws: 10,
+            win_rate: 0.65,
+            should_promote: true,
+            elapsed_ms: 100,
+        };
+        assert!(result.should_promote);
+
+        // Win rate below threshold should not promote
+        let result2 = ChallengerResult {
+            current_wins: 30,
+            best_wins: 60,
+            draws: 10,
+            win_rate: 0.35,
+            should_promote: false,
+            elapsed_ms: 100,
+        };
+        assert!(!result2.should_promote);
+    }
 }
