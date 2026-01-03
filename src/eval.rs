@@ -531,8 +531,6 @@ pub struct ChallengerResult {
     pub best_rating: f64,
     /// Best model's skill uncertainty (Weng-Lin sigma) after evaluation
     pub best_uncertainty: f64,
-    /// Rating delta (current.mu - best.mu at start), positive means current is stronger
-    pub rating_delta: f64,
     /// Whether current model should be promoted to best
     pub should_promote: bool,
     /// Time taken for evaluation in milliseconds
@@ -676,35 +674,30 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
 
     // Compute Weng-Lin ratings (challenger inherits best's rating as starting point)
     let wl_config = WengLinConfig::new();
-    let initial_best_rating = best_rating;
 
     let mut current = WengLinRating {
         rating: best_rating,
         uncertainty: best_uncertainty,
     };
-    let mut best = WengLinRating {
+    let best = WengLinRating {
         rating: best_rating,
         uncertainty: best_uncertainty,
     };
 
-    // Process each game outcome individually (matches tournament.rs pattern)
+    // Process each game - best is anchor (doesn't update)
     for _ in 0..current_wins {
-        let (new_current, new_best) = weng_lin(&current, &best, &Outcomes::WIN, &wl_config);
+        let (new_current, _) = weng_lin(&current, &best, &Outcomes::WIN, &wl_config);
         current = new_current;
-        best = new_best;
     }
     for _ in 0..best_wins {
-        let (new_current, new_best) = weng_lin(&current, &best, &Outcomes::LOSS, &wl_config);
+        let (new_current, _) = weng_lin(&current, &best, &Outcomes::LOSS, &wl_config);
         current = new_current;
-        best = new_best;
     }
     for _ in 0..draws {
-        let (new_current, new_best) = weng_lin(&current, &best, &Outcomes::DRAW, &wl_config);
+        let (new_current, _) = weng_lin(&current, &best, &Outcomes::DRAW, &wl_config);
         current = new_current;
-        best = new_best;
     }
 
-    let rating_delta = current.rating - initial_best_rating;
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(ChallengerResult {
@@ -713,10 +706,9 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         draw_rate,
         win_rate,
         current_rating: current.rating,
-        current_uncertainty: current.uncertainty,
+        current_uncertainty: 25.0 / 3.0, // Reset sigma for new checkpoint
         best_rating: best.rating,
         best_uncertainty: best.uncertainty,
-        rating_delta,
         should_promote: win_rate > threshold,
         elapsed_ms,
     })
@@ -2059,12 +2051,10 @@ mod tests {
             current_uncertainty: 6.0,
             best_rating: -5.0,
             best_uncertainty: 6.0,
-            rating_delta: 5.0,
             should_promote: true,
             elapsed_ms: 100,
         };
         assert!(result.should_promote);
-        assert!(result.rating_delta > 0.0);
 
         // Win rate below threshold should not promote
         // 30 wins, 60 losses, 10 draws out of 100 games
@@ -2077,12 +2067,10 @@ mod tests {
             current_uncertainty: 6.0,
             best_rating: 5.0,
             best_uncertainty: 6.0,
-            rating_delta: -5.0,
             should_promote: false,
             elapsed_ms: 100,
         };
         assert!(!result2.should_promote);
-        assert!(result2.rating_delta < 0.0);
     }
 
     #[test]

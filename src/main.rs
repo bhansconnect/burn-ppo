@@ -831,11 +831,6 @@ where
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/rating_delta",
-                                result.rating_delta as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
                                 "challenger/current_rating",
                                 result.current_rating as f32,
                                 global_step,
