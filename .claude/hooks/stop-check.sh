@@ -1,13 +1,32 @@
 #!/bin/bash
 set -euo pipefail
 
-# Parse input from Claude
-input=$(cat)
-stop_hook_active=$(echo "$input" | jq -r '.stop_hook_active // false')
+# Retry counter to prevent infinite loops while ensuring all checks run
+MAX_RETRIES=10
+COUNTER_FILE="/tmp/claude-stop-check-$(echo "$PWD" | md5 | cut -c1-8)"
 
-# Prevent infinite loops - if we're already in a continuing loop, allow stop
-if [ "$stop_hook_active" = "true" ]; then
-    exit 0
+# Read current retry count
+retry_count=0
+if [ -f "$COUNTER_FILE" ]; then
+    # Check if file is stale (older than 30 minutes)
+    file_age=$(( $(date +%s) - $(stat -f %m "$COUNTER_FILE" 2>/dev/null || stat -c %Y "$COUNTER_FILE") ))
+    if [ "$file_age" -gt 1800 ]; then
+        rm -f "$COUNTER_FILE"
+    else
+        retry_count=$(cat "$COUNTER_FILE")
+    fi
+fi
+
+# Increment and save
+retry_count=$((retry_count + 1))
+echo "$retry_count" > "$COUNTER_FILE"
+
+# Safety valve: after max retries, warn and allow stop
+if [ "$retry_count" -gt "$MAX_RETRIES" ]; then
+    echo "Error: Exceeded $MAX_RETRIES retry attempts. Allowing stop despite possible failures." >&2
+    echo "Tell Claude to continue if it should keep trying."
+    rm -f "$COUNTER_FILE"
+    exit 1
 fi
 
 # 1. Run cargo fmt --check
@@ -113,5 +132,6 @@ $cov_output
     exit 2
 fi
 
-# All checks passed
+# All checks passed - clean up counter
+rm -f "$COUNTER_FILE"
 exit 0
