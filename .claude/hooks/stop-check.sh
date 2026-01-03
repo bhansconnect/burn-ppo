@@ -1,6 +1,27 @@
 #!/bin/bash
 set -euo pipefail
 
+# Read JSON input from stdin
+INPUT=$(cat)
+
+# Skip checks if in plan mode
+permission_mode=$(echo "$INPUT" | jq -r '.permission_mode // "default"')
+if [ "$permission_mode" = "plan" ]; then
+  echo "Skipping checks (plan mode)" >&2
+  exit 0
+fi
+
+# Skip checks if Claude just asked a question
+transcript_path=$(echo "$INPUT" | jq -r '.transcript_path // ""')
+if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
+    # Get the name of the last tool_use in the transcript
+    last_tool=$(grep '"tool_use"' "$transcript_path" | tail -1 | jq -r '.name // empty' 2>/dev/null)
+    if [ "$last_tool" = "AskUserQuestion" ]; then
+        echo "Skipping checks (asked question)" >&2
+        exit 0
+    fi
+fi
+
 # Retry counter to prevent infinite loops while ensuring all checks run
 MAX_RETRIES=10
 COUNTER_FILE="/tmp/claude-stop-check-$(echo "$PWD" | md5 | cut -c1-8)"
