@@ -1,0 +1,14 @@
+#!/bin/bash
+set -euo pipefail
+
+input=$(cat)
+file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
+
+# Require approval for protected files
+if [[ "$file_path" == *"Cargo.toml" ]] || [[ "$file_path" == *".claude/"* ]]; then
+  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"Protected file requires manual approval"}}'
+  exit 0
+fi
+
+# Allow other edits
+exit 0
