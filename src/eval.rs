@@ -524,14 +524,20 @@ impl EvalStats {
 /// Result of challenger evaluation between current model and best checkpoint
 #[derive(Debug, Clone)]
 pub struct ChallengerResult {
-    /// Wins for the current (challenger) model
-    pub current_wins: usize,
-    /// Wins for the best checkpoint model
-    pub best_wins: usize,
-    /// Draw count
-    pub draws: usize,
-    /// Win rate for current model (0.0 - 1.0)
+    /// Win rate for current (challenger) model (0.0 - 1.0)
+    pub current_win_rate: f64,
+    /// Win rate for best checkpoint model (0.0 - 1.0)
+    pub best_win_rate: f64,
+    /// Draw rate (0.0 - 1.0)
+    pub draw_rate: f64,
+    /// Win rate for current model (0.0 - 1.0), accounting for draws
     pub win_rate: f64,
+    /// ELO delta (current - best), positive means current is stronger
+    pub elo_delta: f64,
+    /// Current model ELO (equals elo_delta since best is anchored to 0)
+    pub current_elo: f64,
+    /// Best model ELO (anchored to 0)
+    pub best_elo: f64,
     /// Whether current model should be promoted to best
     pub should_promote: bool,
     /// Time taken for evaluation in milliseconds
@@ -647,22 +653,41 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     let best_wins = stats.losses[0];
     let draws = stats.draws;
 
+    // Compute rates from counts
+    let total = (current_wins + best_wins + draws) as f64;
+    let (current_win_rate, best_win_rate, draw_rate) = if total > 0.0 {
+        (
+            current_wins as f64 / total,
+            best_wins as f64 / total,
+            draws as f64 / total,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
     // Tie value = 1/N for N-player games
     let tie_value = 1.0 / num_players as f64;
-    let total = (current_wins + best_wins + draws) as f64;
     let win_rate = if total > 0.0 {
         (current_wins as f64 + tie_value * draws as f64) / total
     } else {
         tie_value // Expected value if no games played
     };
 
+    // Compute ELO delta (current vs best), anchored with best = 0
+    let (elo_delta, _stderr) = elo_delta_2p(current_wins, best_wins, draws);
+    let best_elo = 0.0;
+    let current_elo = elo_delta;
+
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(ChallengerResult {
-        current_wins,
-        best_wins,
-        draws,
+        current_win_rate,
+        best_win_rate,
+        draw_rate,
         win_rate,
+        elo_delta,
+        current_elo,
+        best_elo,
         should_promote: win_rate > threshold,
         elapsed_ms,
     })
@@ -2000,10 +2025,12 @@ mod tests {
 
     #[test]
     fn test_player_source_display_name_checkpoint() {
-        let checkpoint = PlayerSource::Checkpoint(std::path::PathBuf::from("/runs/test/checkpoints/best"));
+        let checkpoint =
+            PlayerSource::Checkpoint(std::path::PathBuf::from("/runs/test/checkpoints/best"));
         assert_eq!(checkpoint.display_name(), "best");
 
-        let step_checkpoint = PlayerSource::Checkpoint(std::path::PathBuf::from("/runs/test/checkpoints/step_1000"));
+        let step_checkpoint =
+            PlayerSource::Checkpoint(std::path::PathBuf::from("/runs/test/checkpoints/step_1000"));
         assert_eq!(step_checkpoint.display_name(), "step_1000");
     }
 
@@ -2024,22 +2051,30 @@ mod tests {
     #[test]
     fn test_challenger_result_should_promote() {
         // Win rate above threshold should promote
+        // 60 wins, 30 losses, 10 draws out of 100 games
         let result = ChallengerResult {
-            current_wins: 60,
-            best_wins: 30,
-            draws: 10,
+            current_win_rate: 0.60,
+            best_win_rate: 0.30,
+            draw_rate: 0.10,
             win_rate: 0.65,
+            elo_delta: 112.0, // approximate ELO for 65% win rate
+            current_elo: 112.0,
+            best_elo: 0.0,
             should_promote: true,
             elapsed_ms: 100,
         };
         assert!(result.should_promote);
 
         // Win rate below threshold should not promote
+        // 30 wins, 60 losses, 10 draws out of 100 games
         let result2 = ChallengerResult {
-            current_wins: 30,
-            best_wins: 60,
-            draws: 10,
+            current_win_rate: 0.30,
+            best_win_rate: 0.60,
+            draw_rate: 0.10,
             win_rate: 0.35,
+            elo_delta: -112.0, // approximate ELO for 35% win rate
+            current_elo: -112.0,
+            best_elo: 0.0,
             should_promote: false,
             elapsed_ms: 100,
         };

@@ -568,7 +568,10 @@ mod tests {
         let test_data = vec![1.0, 2.0, 3.0, 4.0];
         let norm1 = normalizer.normalize(&test_data);
         let norm2 = loaded.normalize(&test_data);
-        assert_eq!(norm1, norm2, "Loaded normalizer should produce same results");
+        assert_eq!(
+            norm1, norm2,
+            "Loaded normalizer should produce same results"
+        );
     }
 
     #[test]

@@ -769,18 +769,33 @@ where
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/current_wins",
-                                result.current_wins as f32,
+                                "challenger/current_win_rate",
+                                result.current_win_rate as f32,
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/best_wins",
-                                result.best_wins as f32,
+                                "challenger/best_win_rate",
+                                result.best_win_rate as f32,
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/draws",
-                                result.draws as f32,
+                                "challenger/draw_rate",
+                                result.draw_rate as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/elo_delta",
+                                result.elo_delta as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/current_elo",
+                                result.current_elo as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/best_elo",
+                                result.best_elo as f32,
                                 global_step,
                             )?;
 
