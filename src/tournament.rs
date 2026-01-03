@@ -1894,7 +1894,7 @@ mod tests {
     #[test]
     fn test_contestant_debug_impl() {
         let contestant = Contestant::new("Test".to_string(), PlayerSource::Random);
-        let debug_str = format!("{:?}", contestant);
+        let debug_str = format!("{contestant:?}");
         assert!(debug_str.contains("Test"));
         assert!(debug_str.contains("Random"));
     }
