@@ -956,6 +956,362 @@ fn run_tournament_env<B: Backend, E: Environment>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_contestant_new() {
+        let contestant = Contestant::new("TestPlayer".to_string(), PlayerSource::Random);
+        assert_eq!(contestant.name, "TestPlayer");
+        assert!(matches!(contestant.source, PlayerSource::Random));
+        assert!(contestant.opponents_faced.is_empty());
+        assert_eq!(contestant.wins, 0);
+        assert_eq!(contestant.losses, 0);
+        assert_eq!(contestant.draws, 0);
+        // Default WengLin rating should be 25.0
+        assert!((contestant.rating.rating - 25.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_is_checkpoint_dir_valid() {
+        let temp = TempDir::new().unwrap();
+        let checkpoint_dir = temp.path().join("step_100");
+        std::fs::create_dir(&checkpoint_dir).unwrap();
+        std::fs::write(checkpoint_dir.join("metadata.json"), "{}").unwrap();
+
+        assert!(is_checkpoint_dir(&checkpoint_dir));
+    }
+
+    #[test]
+    fn test_is_checkpoint_dir_no_metadata() {
+        let temp = TempDir::new().unwrap();
+        let checkpoint_dir = temp.path().join("step_100");
+        std::fs::create_dir(&checkpoint_dir).unwrap();
+        // No metadata.json
+
+        assert!(!is_checkpoint_dir(&checkpoint_dir));
+    }
+
+    #[test]
+    fn test_is_checkpoint_dir_not_dir() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("not_a_dir");
+        std::fs::write(&file_path, "content").unwrap();
+
+        assert!(!is_checkpoint_dir(&file_path));
+    }
+
+    #[test]
+    fn test_is_run_checkpoints_dir_valid() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("step_100")).unwrap();
+        std::fs::create_dir(temp.path().join("step_200")).unwrap();
+
+        assert!(is_run_checkpoints_dir(temp.path()));
+    }
+
+    #[test]
+    fn test_is_run_checkpoints_dir_no_steps() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("other_dir")).unwrap();
+
+        assert!(!is_run_checkpoints_dir(temp.path()));
+    }
+
+    #[test]
+    fn test_is_run_checkpoints_dir_not_dir() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("file");
+        std::fs::write(&file_path, "content").unwrap();
+
+        assert!(!is_run_checkpoints_dir(&file_path));
+    }
+
+    #[test]
+    fn test_checkpoint_name() {
+        let path = PathBuf::from("/some/path/step_12345");
+        assert_eq!(checkpoint_name(&path), "step_12345");
+
+        let path2 = PathBuf::from("/another/checkpoint");
+        assert_eq!(checkpoint_name(&path2), "checkpoint");
+    }
+
+    #[test]
+    fn test_enumerate_checkpoints() {
+        let temp = TempDir::new().unwrap();
+
+        // Create step directories in non-sorted order
+        std::fs::create_dir(temp.path().join("step_300")).unwrap();
+        std::fs::create_dir(temp.path().join("step_100")).unwrap();
+        std::fs::create_dir(temp.path().join("step_200")).unwrap();
+        std::fs::create_dir(temp.path().join("other")).unwrap(); // should be ignored
+
+        let checkpoints = enumerate_checkpoints(temp.path()).unwrap();
+
+        assert_eq!(checkpoints.len(), 3);
+        assert!(checkpoints[0].ends_with("step_100"));
+        assert!(checkpoints[1].ends_with("step_200"));
+        assert!(checkpoints[2].ends_with("step_300"));
+    }
+
+    #[test]
+    fn test_enumerate_checkpoints_empty() {
+        let temp = TempDir::new().unwrap();
+        let checkpoints = enumerate_checkpoints(temp.path()).unwrap();
+        assert!(checkpoints.is_empty());
+    }
+
+    #[test]
+    fn test_chrono_lite_now() {
+        let timestamp = chrono_lite_now();
+        assert!(timestamp.starts_with("unix:"));
+        // Should be a valid number after "unix:"
+        let num_str = timestamp.strip_prefix("unix:").unwrap();
+        let _: u64 = num_str.parse().expect("should be a valid unix timestamp");
+    }
+
+    #[test]
+    fn test_update_ratings_win() {
+        let wl_config = WengLinConfig::new();
+        let mut contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        let initial_rating_a = contestants[0].rating.rating;
+        let initial_rating_b = contestants[1].rating.rating;
+
+        let result = MatchupResult {
+            contestant_a: 0,
+            contestant_b: 1,
+            wins_a: 1,
+            wins_b: 0,
+            draws: 0,
+        };
+
+        update_ratings(&mut contestants, &result, &wl_config);
+
+        // Winner's rating should increase
+        assert!(contestants[0].rating.rating > initial_rating_a);
+        // Loser's rating should decrease
+        assert!(contestants[1].rating.rating < initial_rating_b);
+        // Stats updated
+        assert_eq!(contestants[0].wins, 1);
+        assert_eq!(contestants[0].losses, 0);
+        assert_eq!(contestants[1].wins, 0);
+        assert_eq!(contestants[1].losses, 1);
+    }
+
+    #[test]
+    fn test_update_ratings_loss() {
+        let wl_config = WengLinConfig::new();
+        let mut contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        let result = MatchupResult {
+            contestant_a: 0,
+            contestant_b: 1,
+            wins_a: 0,
+            wins_b: 1,
+            draws: 0,
+        };
+
+        update_ratings(&mut contestants, &result, &wl_config);
+
+        assert_eq!(contestants[0].losses, 1);
+        assert_eq!(contestants[1].wins, 1);
+    }
+
+    #[test]
+    fn test_update_ratings_draw() {
+        let wl_config = WengLinConfig::new();
+        let mut contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        let initial_rating_a = contestants[0].rating.rating;
+        let initial_rating_b = contestants[1].rating.rating;
+
+        let result = MatchupResult {
+            contestant_a: 0,
+            contestant_b: 1,
+            wins_a: 0,
+            wins_b: 0,
+            draws: 1,
+        };
+
+        update_ratings(&mut contestants, &result, &wl_config);
+
+        // Ratings should stay approximately the same for equal-rated players
+        assert!((contestants[0].rating.rating - initial_rating_a).abs() < 1.0);
+        assert!((contestants[1].rating.rating - initial_rating_b).abs() < 1.0);
+        assert_eq!(contestants[0].draws, 1);
+        assert_eq!(contestants[1].draws, 1);
+    }
+
+    #[test]
+    fn test_update_ratings_tracks_opponents() {
+        let wl_config = WengLinConfig::new();
+        let mut contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        let result = MatchupResult {
+            contestant_a: 0,
+            contestant_b: 1,
+            wins_a: 1,
+            wins_b: 0,
+            draws: 0,
+        };
+
+        update_ratings(&mut contestants, &result, &wl_config);
+
+        assert!(contestants[0].opponents_faced.contains(&1));
+        assert!(contestants[1].opponents_faced.contains(&0));
+    }
+
+    #[test]
+    fn test_update_ratings_multiple_games() {
+        let wl_config = WengLinConfig::new();
+        let mut contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        let result = MatchupResult {
+            contestant_a: 0,
+            contestant_b: 1,
+            wins_a: 3,
+            wins_b: 1,
+            draws: 1,
+        };
+
+        update_ratings(&mut contestants, &result, &wl_config);
+
+        // A won more, should have higher rating
+        assert!(contestants[0].rating.rating > contestants[1].rating.rating);
+        assert_eq!(contestants[0].wins, 3);
+        assert_eq!(contestants[0].losses, 1);
+        assert_eq!(contestants[0].draws, 1);
+        assert_eq!(contestants[1].wins, 1);
+        assert_eq!(contestants[1].losses, 3);
+        assert_eq!(contestants[1].draws, 1);
+    }
+
+    #[test]
+    fn test_matchup_result_creation() {
+        let result = MatchupResult {
+            contestant_a: 0,
+            contestant_b: 1,
+            wins_a: 5,
+            wins_b: 3,
+            draws: 2,
+        };
+
+        assert_eq!(result.contestant_a, 0);
+        assert_eq!(result.contestant_b, 1);
+        assert_eq!(result.wins_a, 5);
+        assert_eq!(result.wins_b, 3);
+        assert_eq!(result.draws, 2);
+    }
+
+    #[test]
+    fn test_ranking_entry_serialization() {
+        let entry = RankingEntry {
+            rank: 1,
+            name: "Champion".to_string(),
+            source: Some("/path/to/checkpoint".to_string()),
+            rating: 28.5,
+            uncertainty: 4.2,
+            rating_low: 20.1,
+            rating_high: 36.9,
+            wins: 10,
+            losses: 2,
+            draws: 1,
+            games_played: 13,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"rank\":1"));
+        assert!(json.contains("\"name\":\"Champion\""));
+        assert!(json.contains("\"source\":\"/path/to/checkpoint\""));
+    }
+
+    #[test]
+    fn test_ranking_entry_serialization_no_source() {
+        let entry = RankingEntry {
+            rank: 1,
+            name: "Random".to_string(),
+            source: None, // Should be skipped in serialization
+            rating: 25.0,
+            uncertainty: 8.333,
+            rating_low: 8.334,
+            rating_high: 41.666,
+            wins: 5,
+            losses: 5,
+            draws: 0,
+            games_played: 10,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        // source should NOT be present since it's None
+        assert!(!json.contains("\"source\""));
+    }
+
+    #[test]
+    fn test_tournament_results_serialization() {
+        let results = TournamentResults {
+            rankings: vec![],
+            matches: vec![],
+            config: TournamentConfigSummary {
+                num_games_per_matchup: 10,
+                num_rounds: 3,
+                format: "swiss".to_string(),
+                temperature: 1.0,
+                seed: Some(42),
+            },
+            environment: "connect_four".to_string(),
+            timestamp: "unix:1234567890".to_string(),
+        };
+
+        let json = serde_json::to_string(&results).unwrap();
+        assert!(json.contains("\"environment\":\"connect_four\""));
+        assert!(json.contains("\"format\":\"swiss\""));
+        assert!(json.contains("\"seed\":42"));
+    }
+
+    #[test]
+    fn test_tournament_config_summary_no_seed() {
+        let config = TournamentConfigSummary {
+            num_games_per_matchup: 5,
+            num_rounds: 2,
+            format: "round-robin".to_string(),
+            temperature: 0.5,
+            seed: None,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("\"seed\""));
+    }
+
+    #[test]
+    fn test_match_summary_serialization() {
+        let summary = MatchSummary {
+            round: 1,
+            contestant_a: "Player1".to_string(),
+            contestant_b: "Player2".to_string(),
+            wins_a: 3,
+            wins_b: 2,
+            draws: 0,
+        };
+
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"round\":1"));
+        assert!(json.contains("\"contestant_a\":\"Player1\""));
+    }
 
     #[test]
     fn test_select_evenly_spaced() {
@@ -1012,5 +1368,595 @@ mod tests {
             seen[*a] = true;
             seen[*b] = true;
         }
+    }
+
+    #[test]
+    fn test_swiss_pairings_with_different_ratings() {
+        let mut contestants = vec![
+            Contestant::new("High".to_string(), PlayerSource::Random),
+            Contestant::new("Low".to_string(), PlayerSource::Random),
+            Contestant::new("Medium".to_string(), PlayerSource::Random),
+        ];
+
+        // Modify ratings
+        contestants[0].rating.rating = 30.0;
+        contestants[1].rating.rating = 15.0;
+        contestants[2].rating.rating = 25.0;
+
+        let pairings = swiss_pairings(&contestants);
+        // With 3 contestants, only 1 pairing (one gets a bye)
+        assert_eq!(pairings.len(), 1);
+    }
+
+    #[test]
+    fn test_swiss_pairings_prefers_unfaced_opponents() {
+        let mut contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+            Contestant::new("C".to_string(), PlayerSource::Random),
+            Contestant::new("D".to_string(), PlayerSource::Random),
+        ];
+
+        // A has already faced B
+        contestants[0].opponents_faced.push(1);
+        contestants[1].opponents_faced.push(0);
+
+        let pairings = swiss_pairings(&contestants);
+
+        // A should be paired with C or D (not B since they've already faced)
+        let a_pairing = pairings.iter().find(|(a, b)| *a == 0 || *b == 0);
+        if let Some((a, b)) = a_pairing {
+            let opponent = if *a == 0 { *b } else { *a };
+            assert!(opponent == 2 || opponent == 3); // C or D, not B
+        }
+    }
+
+    #[test]
+    fn test_swiss_pairings_odd_number() {
+        let contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+            Contestant::new("C".to_string(), PlayerSource::Random),
+        ];
+
+        let pairings = swiss_pairings(&contestants);
+        // With 3 contestants, only 1 pairing (one gets a bye)
+        assert_eq!(pairings.len(), 1);
+    }
+
+    #[test]
+    fn test_build_results() {
+        use crate::config::TournamentArgs;
+
+        let mut contestants = vec![
+            Contestant::new("Winner".to_string(), PlayerSource::Random),
+            Contestant::new("Loser".to_string(), PlayerSource::Random),
+        ];
+
+        contestants[0].rating.rating = 28.0;
+        contestants[0].wins = 3;
+        contestants[0].losses = 0;
+        contestants[1].rating.rating = 22.0;
+        contestants[1].wins = 0;
+        contestants[1].losses = 3;
+
+        let matches = vec![(
+            1,
+            MatchupResult {
+                contestant_a: 0,
+                contestant_b: 1,
+                wins_a: 3,
+                wins_b: 0,
+                draws: 0,
+            },
+        )];
+
+        let args = TournamentArgs {
+            sources: vec![],
+            num_games: 3,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: Some(1),
+            output: None,
+            seed: Some(42),
+            random: false,
+        };
+
+        let results = build_results(&contestants, &matches, 1, &args, "connect_four");
+
+        assert_eq!(results.rankings.len(), 2);
+        assert_eq!(results.rankings[0].name, "Winner"); // Higher rating is first
+        assert_eq!(results.rankings[0].rank, 1);
+        assert_eq!(results.rankings[1].name, "Loser");
+        assert_eq!(results.rankings[1].rank, 2);
+        assert_eq!(results.matches.len(), 1);
+        assert_eq!(results.environment, "connect_four");
+        assert_eq!(results.config.num_games_per_matchup, 3);
+        assert_eq!(results.config.seed, Some(42));
+    }
+
+    #[test]
+    fn test_build_results_round_robin_format() {
+        use crate::config::TournamentArgs;
+
+        let contestants: Vec<Contestant> = (0..4)
+            .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random))
+            .collect();
+
+        let args = TournamentArgs {
+            sources: vec![],
+            num_games: 5,
+            num_envs: 1,
+            temperature: 0.5,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let results = build_results(&contestants, &[], 1, &args, "cartpole");
+
+        // 4 contestants = round-robin format
+        assert_eq!(results.config.format, "round-robin");
+    }
+
+    #[test]
+    fn test_build_results_swiss_format() {
+        use crate::config::TournamentArgs;
+
+        // 10 contestants > 8 = swiss format
+        let contestants: Vec<Contestant> = (0..10)
+            .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random))
+            .collect();
+
+        let args = TournamentArgs {
+            sources: vec![],
+            num_games: 5,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: Some(3),
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let results = build_results(&contestants, &[], 3, &args, "connect_four");
+
+        assert_eq!(results.config.format, "swiss");
+    }
+
+    #[test]
+    fn test_discover_contestants_single_checkpoint() {
+        use crate::config::TournamentArgs;
+
+        let temp = TempDir::new().unwrap();
+        let checkpoint = temp.path().join("step_100");
+        std::fs::create_dir(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("metadata.json"), "{}").unwrap();
+
+        let args = TournamentArgs {
+            sources: vec![checkpoint.clone()],
+            num_games: 1,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let contestants = discover_contestants(&args).unwrap();
+
+        assert_eq!(contestants.len(), 1);
+        assert_eq!(contestants[0].name, "step_100");
+        assert!(matches!(
+            contestants[0].source,
+            PlayerSource::Checkpoint(_)
+        ));
+    }
+
+    #[test]
+    fn test_discover_contestants_with_random() {
+        use crate::config::TournamentArgs;
+
+        let temp = TempDir::new().unwrap();
+        let checkpoint = temp.path().join("step_100");
+        std::fs::create_dir(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("metadata.json"), "{}").unwrap();
+
+        let args = TournamentArgs {
+            sources: vec![checkpoint],
+            num_games: 1,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: None,
+            output: None,
+            seed: None,
+            random: true, // Add random player
+        };
+
+        let contestants = discover_contestants(&args).unwrap();
+
+        assert_eq!(contestants.len(), 2);
+        assert!(contestants.iter().any(|c| c.name == "Random"));
+    }
+
+    #[test]
+    fn test_discover_contestants_from_checkpoints_dir() {
+        use crate::config::TournamentArgs;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create a checkpoints directory with step_ subdirs
+        std::fs::create_dir(temp.path().join("step_100")).unwrap();
+        std::fs::create_dir(temp.path().join("step_200")).unwrap();
+        std::fs::create_dir(temp.path().join("step_300")).unwrap();
+
+        let args = TournamentArgs {
+            sources: vec![temp.path().to_path_buf()],
+            num_games: 1,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None, // No limit
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let contestants = discover_contestants(&args).unwrap();
+
+        assert_eq!(contestants.len(), 3);
+    }
+
+    #[test]
+    fn test_discover_contestants_with_limit() {
+        use crate::config::TournamentArgs;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create 10 checkpoint directories
+        for i in 0..10 {
+            std::fs::create_dir(temp.path().join(format!("step_{}", i * 100))).unwrap();
+        }
+
+        let args = TournamentArgs {
+            sources: vec![temp.path().to_path_buf()],
+            num_games: 1,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: Some(3), // Limit to 3
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let contestants = discover_contestants(&args).unwrap();
+
+        assert_eq!(contestants.len(), 3);
+    }
+
+    #[test]
+    fn test_discover_contestants_invalid_path() {
+        use crate::config::TournamentArgs;
+
+        let args = TournamentArgs {
+            sources: vec![PathBuf::from("/nonexistent/path/to/checkpoint")],
+            num_games: 1,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let result = discover_contestants(&args);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_discover_contestants_empty_checkpoints_dir() {
+        use crate::config::TournamentArgs;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create a checkpoints directory but with NO step_ subdirs
+        // but with some step_ dirs to make it pass is_run_checkpoints_dir
+        // Actually, an empty dir won't pass is_run_checkpoints_dir, so this is invalid
+        let args = TournamentArgs {
+            sources: vec![temp.path().to_path_buf()],
+            num_games: 1,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        // Empty dir isn't a valid checkpoint or checkpoints dir
+        let result = discover_contestants(&args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_matchup_with_random_produces_results() {
+        use crate::envs::connect_four::ConnectFour;
+        use rand::SeedableRng;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let result = run_matchup_with_random::<ConnectFour>(0, 1, 10, &mut rng);
+
+        assert_eq!(result.contestant_a, 0);
+        assert_eq!(result.contestant_b, 1);
+        // Total should equal num_games
+        assert_eq!(result.wins_a + result.wins_b + result.draws, 10);
+    }
+
+    #[test]
+    fn test_run_matchup_with_random_deterministic() {
+        use crate::envs::connect_four::ConnectFour;
+        use rand::SeedableRng;
+
+        // Same seed should produce same results
+        let mut rng1 = StdRng::seed_from_u64(12345);
+        let result1 = run_matchup_with_random::<ConnectFour>(0, 1, 5, &mut rng1);
+
+        let mut rng2 = StdRng::seed_from_u64(12345);
+        let result2 = run_matchup_with_random::<ConnectFour>(0, 1, 5, &mut rng2);
+
+        assert_eq!(result1.wins_a, result2.wins_a);
+        assert_eq!(result1.wins_b, result2.wins_b);
+        assert_eq!(result1.draws, result2.draws);
+    }
+
+    #[test]
+    fn test_select_evenly_spaced_zero() {
+        let paths: Vec<PathBuf> = (0..5)
+            .map(|i| PathBuf::from(format!("step_{i}")))
+            .collect();
+
+        let selected = select_evenly_spaced(&paths, 0);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_build_results_with_checkpoint_source() {
+        use crate::config::TournamentArgs;
+
+        let checkpoint_path = PathBuf::from("/path/to/step_100");
+        let mut contestants = vec![Contestant::new(
+            "step_100".to_string(),
+            PlayerSource::Checkpoint(checkpoint_path.clone()),
+        )];
+        contestants[0].wins = 5;
+        contestants[0].losses = 2;
+        contestants[0].draws = 1;
+
+        let args = TournamentArgs {
+            sources: vec![],
+            num_games: 8,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let results = build_results(&contestants, &[], 1, &args, "test_env");
+
+        assert_eq!(results.rankings.len(), 1);
+        assert_eq!(
+            results.rankings[0].source,
+            Some("/path/to/step_100".to_string())
+        );
+        assert_eq!(results.rankings[0].games_played, 8);
+    }
+
+    #[test]
+    fn test_run_matchup_with_random_cartpole() {
+        use crate::envs::cartpole::CartPole;
+        use rand::SeedableRng;
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let result = run_matchup_with_random::<CartPole>(0, 1, 5, &mut rng);
+
+        // CartPole is single player, so outcomes are based on episode length/reward
+        assert_eq!(result.contestant_a, 0);
+        assert_eq!(result.contestant_b, 1);
+        assert_eq!(result.wins_a + result.wins_b + result.draws, 5);
+    }
+
+    #[test]
+    fn test_print_standings_does_not_panic() {
+        let contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        // Just verify it doesn't panic
+        print_standings(&contestants, "Test Header");
+    }
+
+    #[test]
+    fn test_print_final_summary_does_not_panic() {
+        let contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        // Just verify it doesn't panic
+        print_final_summary(&contestants, 3, 10);
+    }
+
+    #[test]
+    fn test_build_results_match_summaries() {
+        use crate::config::TournamentArgs;
+
+        let contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+        ];
+
+        let matches = vec![
+            (
+                1,
+                MatchupResult {
+                    contestant_a: 0,
+                    contestant_b: 1,
+                    wins_a: 2,
+                    wins_b: 1,
+                    draws: 0,
+                },
+            ),
+            (
+                2,
+                MatchupResult {
+                    contestant_a: 0,
+                    contestant_b: 1,
+                    wins_a: 1,
+                    wins_b: 2,
+                    draws: 1,
+                },
+            ),
+        ];
+
+        let args = TournamentArgs {
+            sources: vec![],
+            num_games: 3,
+            num_envs: 1,
+            temperature: 1.0,
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: Some(2),
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let results = build_results(&contestants, &matches, 2, &args, "test");
+
+        assert_eq!(results.matches.len(), 2);
+        assert_eq!(results.matches[0].round, 1);
+        assert_eq!(results.matches[0].wins_a, 2);
+        assert_eq!(results.matches[1].round, 2);
+        assert_eq!(results.matches[1].draws, 1);
+    }
+
+    #[test]
+    fn test_swiss_pairings_all_faced() {
+        let mut contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random),
+            Contestant::new("B".to_string(), PlayerSource::Random),
+            Contestant::new("C".to_string(), PlayerSource::Random),
+            Contestant::new("D".to_string(), PlayerSource::Random),
+        ];
+
+        // All have faced each other
+        contestants[0].opponents_faced = vec![1, 2, 3];
+        contestants[1].opponents_faced = vec![0, 2, 3];
+        contestants[2].opponents_faced = vec![0, 1, 3];
+        contestants[3].opponents_faced = vec![0, 1, 2];
+
+        let pairings = swiss_pairings(&contestants);
+        // Should still produce pairings even when all faced
+        assert_eq!(pairings.len(), 2);
+    }
+
+    #[test]
+    fn test_contestant_debug_impl() {
+        let contestant = Contestant::new("Test".to_string(), PlayerSource::Random);
+        let debug_str = format!("{:?}", contestant);
+        assert!(debug_str.contains("Test"));
+        assert!(debug_str.contains("Random"));
+    }
+
+    #[test]
+    fn test_matchup_result_clone() {
+        let result = MatchupResult {
+            contestant_a: 0,
+            contestant_b: 1,
+            wins_a: 5,
+            wins_b: 3,
+            draws: 2,
+        };
+
+        let cloned = result.clone();
+        assert_eq!(cloned.wins_a, 5);
+        assert_eq!(cloned.wins_b, 3);
+    }
+
+    #[test]
+    fn test_ranking_entry_clone() {
+        let entry = RankingEntry {
+            rank: 1,
+            name: "Test".to_string(),
+            source: None,
+            rating: 25.0,
+            uncertainty: 8.333,
+            rating_low: 8.334,
+            rating_high: 41.666,
+            wins: 0,
+            losses: 0,
+            draws: 0,
+            games_played: 0,
+        };
+
+        let cloned = entry.clone();
+        assert_eq!(cloned.rank, 1);
+        assert_eq!(cloned.name, "Test");
+    }
+
+    #[test]
+    fn test_tournament_results_clone() {
+        let results = TournamentResults {
+            rankings: vec![],
+            matches: vec![],
+            config: TournamentConfigSummary {
+                num_games_per_matchup: 5,
+                num_rounds: 1,
+                format: "round-robin".to_string(),
+                temperature: 1.0,
+                seed: None,
+            },
+            environment: "test".to_string(),
+            timestamp: "unix:0".to_string(),
+        };
+
+        let cloned = results.clone();
+        assert_eq!(cloned.environment, "test");
     }
 }
