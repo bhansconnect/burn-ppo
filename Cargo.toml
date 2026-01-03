@@ -65,17 +65,9 @@ todo = "warn"
 unimplemented = "warn"
 unwrap_used = "warn"
 
-# Allowed restriction lints (used carefully in ML code)
-unwrap_in_result = "allow"  # tensor ops use unwrap for internal invariants
-
 # Allowed pedantic lints
-too_many_arguments = "allow"
 cast_possible_truncation = "allow"  # frequent in ML code with tensor dimensions
 cast_precision_loss = "allow"       # frequent f64 -> f32 conversions
-cast_sign_loss = "allow"            # we use usize/i32 conversions carefully
-cast_possible_wrap = "allow"        # 32-bit targets not a concern
-too_many_lines = "allow"
-unnecessary_wraps = "allow"         # Result<()> is conventional for fallible ops
-items_after_statements = "allow"    # constants near usage aids readability
 comparison_chain = "allow"          # if-else chains can be clearer than match
-needless_pass_by_value = "allow"    # sometimes cleaner API
+too_many_arguments = "allow"
+too_many_lines = "allow"
