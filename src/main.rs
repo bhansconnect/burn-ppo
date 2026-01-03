@@ -24,6 +24,7 @@ mod normalization;
 mod ppo;
 mod profile;
 mod progress;
+mod tournament;
 mod utils;
 
 use std::path::{Path, PathBuf};
@@ -39,8 +40,8 @@ use rand::SeedableRng;
 
 use crate::backend::{backend_name, device_name, init_device, TrainingBackend};
 use crate::checkpoint::{
-    load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer,
-    save_rng_state, CheckpointManager, CheckpointMetadata,
+    load_metadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer,
+    save_optimizer, save_rng_state, update_training_rating, CheckpointManager, CheckpointMetadata,
 };
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_outcome_rates, Environment, GameOutcome, VecEnv};
@@ -310,6 +311,35 @@ where
     let mut last_checkpoint_step = global_step;
     let mut last_checkpoint_time = std::time::Instant::now();
     let mut warned_challenger_eval_time = false;
+
+    // Create initial checkpoint at step 0 for fresh training
+    if matches!(mode, TrainingMode::Fresh) {
+        let metadata = CheckpointMetadata {
+            step: 0,
+            avg_return: 0.0, // No episodes completed yet
+            rng_seed: config.seed,
+            best_avg_return: None,
+            recent_returns: Vec::new(),
+            forked_from: None,
+            obs_dim,
+            action_count,
+            num_players: num_players as usize,
+            hidden_size: config.hidden_size,
+            num_hidden: config.num_hidden,
+            activation: config.activation.clone(),
+            env_name: E::NAME.to_string(),
+            training_rating: 0.0,
+            training_uncertainty: 25.0 / 3.0,
+        };
+
+        checkpoint_manager.save(&model, &metadata, true)?;
+
+        // Log initial challenger metrics for aim_watcher
+        logger.log_scalar("challenger/best_step", 0.0, 0)?;
+        logger.log_scalar("challenger/current_rating", 0.0, 0)?;
+        logger.log_scalar("challenger/best_rating", 0.0, 0)?;
+        logger.flush()?;
+    }
 
     // Training state
     let steps_per_update = config.num_steps * num_envs;
@@ -715,6 +745,8 @@ where
                 num_hidden: config.num_hidden,
                 activation: config.activation.clone(),
                 env_name: E::NAME.to_string(),
+                training_rating: 0.0, // Updated after challenger eval via update_training_rating
+                training_uncertainty: 25.0 / 3.0,
             };
 
             // Disable auto-best when using challenger evaluation for multiplayer
@@ -745,11 +777,18 @@ where
             let challenger_win_rate: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1 {
                 let best_path = checkpoint_manager.best_checkpoint_path();
                 if best_path.exists() {
+                    // Load best checkpoint's training rating for accumulating skill
+                    let (best_rating, best_uncertainty) = load_metadata(&best_path)
+                        .map(|m| (m.training_rating, m.training_uncertainty))
+                        .unwrap_or((0.0, 25.0 / 3.0));
+
                     // Run challenger evaluation
                     match run_challenger_eval::<TrainingBackend, E>(
                         &model,
                         obs_normalizer.as_ref(),
                         &best_path,
+                        best_rating,
+                        best_uncertainty,
                         config.challenger_games,
                         config.challenger_threshold,
                         config,
@@ -757,6 +796,14 @@ where
                         config.seed.wrapping_add(global_step as u64),
                     ) {
                         Ok(result) => {
+                            // Save this checkpoint's training rating
+                            if let Err(e) = update_training_rating(
+                                &checkpoint_path,
+                                result.current_rating,
+                                result.current_uncertainty,
+                            ) {
+                                eprintln!("Warning: Failed to save training rating: {e}");
+                            }
                             // Log metrics
                             logger.log_scalar(
                                 "challenger/eval_time_ms",
@@ -784,18 +831,28 @@ where
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/elo_delta",
-                                result.elo_delta as f32,
+                                "challenger/rating_delta",
+                                result.rating_delta as f32,
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/current_elo",
-                                result.current_elo as f32,
+                                "challenger/current_rating",
+                                result.current_rating as f32,
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/best_elo",
-                                result.best_elo as f32,
+                                "challenger/current_uncertainty",
+                                result.current_uncertainty as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/best_rating",
+                                result.best_rating as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "challenger/best_uncertainty",
+                                result.best_uncertainty as f32,
                                 global_step,
                             )?;
 
@@ -917,6 +974,10 @@ fn main() -> Result<()> {
         Some(Command::Eval(eval_args)) => {
             let device = init_device();
             eval::run_evaluation::<TrainingBackend>(&eval_args, &device)
+        }
+        Some(Command::Tournament(tournament_args)) => {
+            let device = init_device();
+            tournament::run_tournament::<TrainingBackend>(&tournament_args, &device)
         }
         Some(Command::Train(args)) => {
             // Training mode with explicit subcommand

@@ -4,7 +4,7 @@
 //! - Watch mode: visualize games with ASCII rendering
 //! - Stats mode: parallel game execution with win/loss/draw statistics
 //! - Temperature-based sampling with schedule support
-//! - ELO delta calculation for 2-player games
+//! - Weng-Lin (`OpenSkill`) rating for skill comparison
 
 // Evaluation uses unwrap/expect for:
 // - Tensor data extraction (cannot fail with correct shapes)
@@ -20,6 +20,9 @@ use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+
+use skillratings::weng_lin::{weng_lin, WengLinConfig, WengLinRating};
+use skillratings::Outcomes;
 
 use crate::checkpoint::{load_normalizer, CheckpointManager, CheckpointMetadata};
 use crate::config::{Config, EvalArgs};
@@ -187,45 +190,6 @@ pub fn sample_with_temperature(
     probs.len() - 1
 }
 
-/// Calculate ELO delta between two players based on match results
-///
-/// Returns (delta, stderr) where positive delta means p0 is stronger.
-/// Standard error is computed using the delta method to propagate
-/// uncertainty in the score proportion through the ELO formula.
-pub fn elo_delta_2p(p0_wins: usize, p1_wins: usize, draws: usize) -> (f64, f64) {
-    let n = (p0_wins + p1_wins + draws) as f64;
-    if n == 0.0 {
-        return (0.0, f64::INFINITY);
-    }
-
-    let score = 0.5f64.mul_add(draws as f64, p0_wins as f64) / n; // P0's score [0, 1]
-
-    // ELO formula: delta = -400 * log10(1/score - 1)
-    // Derived from: P(win) = 1 / (1 + 10^(-delta/400))
-    let delta = if score <= 0.0 {
-        f64::NEG_INFINITY
-    } else if score >= 1.0 {
-        f64::INFINITY
-    } else {
-        -400.0 * ((1.0 / score) - 1.0).log10()
-    };
-
-    // Standard error using delta method:
-    // SE(score) = sqrt(score * (1 - score) / n)
-    // d(delta)/d(score) = 400 / (ln(10) * score * (1 - score))
-    // SE(delta) = |d(delta)/d(score)| * SE(score)
-    //           = 400 / (ln(10) * sqrt(n * score * (1 - score)))
-    let stderr = if score > 0.001 && score < 0.999 {
-        let pq = score * (1.0 - score);
-        400.0 / (std::f64::consts::LN_10 * (n * pq).sqrt())
-    } else {
-        // At extreme win rates, the standard error is very large/undefined
-        f64::INFINITY
-    };
-
-    (delta, stderr)
-}
-
 /// Convert rewards to placements (1 = first, 2 = second, etc.)
 /// Handles ties by giving the same placement to tied players
 pub fn rewards_to_placements(rewards: &[f32]) -> Vec<usize> {
@@ -288,15 +252,15 @@ pub fn determine_outcome<E: Environment>(env: &E, total_rewards: &[f32]) -> Game
 pub struct EvalStats {
     num_players: usize,
     /// Wins per checkpoint [`num_checkpoints`]
-    wins: Vec<usize>,
+    pub wins: Vec<usize>,
     /// Losses per checkpoint [`num_checkpoints`]
-    losses: Vec<usize>,
+    pub losses: Vec<usize>,
     /// Draws count (all tied)
-    draws: usize,
+    pub draws: usize,
     /// Placement counts per checkpoint [`num_checkpoints`][num_placements]
-    placements: Vec<Vec<usize>>,
+    pub placements: Vec<Vec<usize>>,
     /// Total games played
-    total_games: usize,
+    pub total_games: usize,
     /// Total rewards per game [`game_idx`][player]
     game_rewards: Vec<Vec<f64>>,
     /// Episode lengths
@@ -459,16 +423,43 @@ impl EvalStats {
             );
         }
 
-        // ELO delta
-        let (delta, stderr) = elo_delta_2p(self.wins[0], self.wins[1], self.draws);
-        if delta.is_finite() {
-            let stronger = if delta > 0.0 {
-                "checkpoint 0 stronger"
-            } else {
-                "checkpoint 1 stronger"
-            };
-            println!("\nELO Delta: {delta:+.0} ± {stderr:.0} ({stronger})");
+        // Compute Weng-Lin ratings (both start at 0)
+        let wl_config = WengLinConfig::new();
+        let mut p0 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+        let mut p1 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+
+        // Process all game outcomes
+        for _ in 0..self.wins[0] {
+            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
+            p0 = new_p0;
+            p1 = new_p1;
         }
+        for _ in 0..self.wins[1] {
+            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
+            p0 = new_p0;
+            p1 = new_p1;
+        }
+        for _ in 0..self.draws {
+            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::DRAW, &wl_config);
+            p0 = new_p0;
+            p1 = new_p1;
+        }
+
+        let stronger = if p0.rating > p1.rating {
+            "checkpoint 0 stronger"
+        } else {
+            "checkpoint 1 stronger"
+        };
+        println!(
+            "\nRating: P0={:.1}±{:.1}, P1={:.1}±{:.1} ({stronger})",
+            p0.rating, p0.uncertainty, p1.rating, p1.uncertainty
+        );
     }
 
     fn print_multi_player_summary(&self, checkpoint_names: &[String]) {
@@ -532,12 +523,16 @@ pub struct ChallengerResult {
     pub draw_rate: f64,
     /// Win rate for current model (0.0 - 1.0), accounting for draws
     pub win_rate: f64,
-    /// ELO delta (current - best), positive means current is stronger
-    pub elo_delta: f64,
-    /// Current model ELO (equals elo_delta since best is anchored to 0)
-    pub current_elo: f64,
-    /// Best model ELO (anchored to 0)
-    pub best_elo: f64,
+    /// Current model's skill rating (Weng-Lin mu) after evaluation
+    pub current_rating: f64,
+    /// Current model's skill uncertainty (Weng-Lin sigma) after evaluation
+    pub current_uncertainty: f64,
+    /// Best model's skill rating (Weng-Lin mu) after evaluation
+    pub best_rating: f64,
+    /// Best model's skill uncertainty (Weng-Lin sigma) after evaluation
+    pub best_uncertainty: f64,
+    /// Rating delta (current.mu - best.mu at start), positive means current is stronger
+    pub rating_delta: f64,
     /// Whether current model should be promoted to best
     pub should_promote: bool,
     /// Time taken for evaluation in milliseconds
@@ -559,7 +554,7 @@ fn ordinal(n: usize) -> String {
 ///
 /// Returns the model, metadata, and optional normalizer (if the checkpoint was trained with
 /// observation normalization enabled).
-fn load_model_from_checkpoint<B: Backend>(
+pub fn load_model_from_checkpoint<B: Backend>(
     checkpoint_path: &Path,
     device: &B::Device,
 ) -> Result<(ActorCritic<B>, CheckpointMetadata, Option<ObsNormalizer>)> {
@@ -590,11 +585,17 @@ fn load_model_from_checkpoint<B: Backend>(
 /// Plays `num_games` games between the current model and the best checkpoint,
 /// with position swapping for fairness in 2-player games.
 ///
+/// The `best_rating` and `best_uncertainty` parameters are the Weng-Lin rating
+/// of the best checkpoint (from its metadata). The current model starts with the
+/// same rating and updates based on match results. Rating accumulates across promotions.
+///
 /// Returns a `ChallengerResult` indicating whether the current model should be promoted.
 pub fn run_challenger_eval<B: Backend, E: Environment>(
     current_model: &ActorCritic<B>,
     current_normalizer: Option<&ObsNormalizer>,
     best_checkpoint_path: &Path,
+    best_rating: f64,
+    best_uncertainty: f64,
     num_games: usize,
     threshold: f64,
     config: &Config,
@@ -673,11 +674,37 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         tie_value // Expected value if no games played
     };
 
-    // Compute ELO delta (current vs best), anchored with best = 0
-    let (elo_delta, _stderr) = elo_delta_2p(current_wins, best_wins, draws);
-    let best_elo = 0.0;
-    let current_elo = elo_delta;
+    // Compute Weng-Lin ratings (challenger inherits best's rating as starting point)
+    let wl_config = WengLinConfig::new();
+    let initial_best_rating = best_rating;
 
+    let mut current = WengLinRating {
+        rating: best_rating,
+        uncertainty: best_uncertainty,
+    };
+    let mut best = WengLinRating {
+        rating: best_rating,
+        uncertainty: best_uncertainty,
+    };
+
+    // Process each game outcome individually (matches tournament.rs pattern)
+    for _ in 0..current_wins {
+        let (new_current, new_best) = weng_lin(&current, &best, &Outcomes::WIN, &wl_config);
+        current = new_current;
+        best = new_best;
+    }
+    for _ in 0..best_wins {
+        let (new_current, new_best) = weng_lin(&current, &best, &Outcomes::LOSS, &wl_config);
+        current = new_current;
+        best = new_best;
+    }
+    for _ in 0..draws {
+        let (new_current, new_best) = weng_lin(&current, &best, &Outcomes::DRAW, &wl_config);
+        current = new_current;
+        best = new_best;
+    }
+
+    let rating_delta = current.rating - initial_best_rating;
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(ChallengerResult {
@@ -685,9 +712,11 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         best_win_rate,
         draw_rate,
         win_rate,
-        elo_delta,
-        current_elo,
-        best_elo,
+        current_rating: current.rating,
+        current_uncertainty: current.uncertainty,
+        best_rating: best.rating,
+        best_uncertainty: best.uncertainty,
+        rating_delta,
         should_promote: win_rate > threshold,
         elapsed_ms,
     })
@@ -1349,7 +1378,7 @@ fn run_stats_mode<B: Backend>(
 ///
 /// When `silent` is true, suppresses output (used by challenger eval).
 /// Returns `EvalStats` for further processing.
-fn run_stats_mode_env<B: Backend, E: Environment>(
+pub fn run_stats_mode_env<B: Backend, E: Environment>(
     models: &[ActorCritic<B>],
     normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
@@ -1727,40 +1756,6 @@ mod tests {
     }
 
     #[test]
-    fn test_elo_delta_even() {
-        let (delta, _) = elo_delta_2p(50, 50, 0);
-        assert!(delta.abs() < 1.0); // Should be ~0
-    }
-
-    #[test]
-    fn test_elo_delta_75_percent() {
-        let (delta, _) = elo_delta_2p(75, 25, 0);
-        assert!((delta - 191.0).abs() < 10.0); // ~191 ELO for 75% win rate
-    }
-
-    #[test]
-    fn test_elo_delta_with_draws() {
-        let (delta, _) = elo_delta_2p(40, 40, 20);
-        assert!(delta.abs() < 1.0); // 50% score with draws = ~0 ELO
-    }
-
-    #[test]
-    fn test_elo_stderr_reasonable() {
-        // With 100 games at 50% win rate, stderr should be around 35 ELO
-        // SE = 400 / (ln(10) * sqrt(n * 0.5 * 0.5)) = 400 / (2.303 * 5) = 34.7
-        let (_, stderr) = elo_delta_2p(50, 50, 0);
-        assert!((stderr - 35.0).abs() < 5.0);
-
-        // With more games, stderr should decrease
-        let (_, stderr_1000) = elo_delta_2p(500, 500, 0);
-        assert!(stderr_1000 < stderr); // More games = smaller error
-
-        // At extreme win rates, stderr should be large/infinite
-        let (_, stderr_extreme) = elo_delta_2p(999, 1, 0);
-        assert!(stderr_extreme > 100.0 || stderr_extreme.is_infinite());
-    }
-
-    #[test]
     fn test_rewards_to_placements() {
         assert_eq!(rewards_to_placements(&[1.0, 0.5, 0.0]), vec![1, 2, 3]);
         assert_eq!(rewards_to_placements(&[0.0, 1.0, 0.5]), vec![3, 1, 2]);
@@ -1790,6 +1785,33 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_stats_print_two_player_summary() {
+        // Test that print_two_player_summary runs without panicking
+        // and exercises the Weng-Lin rating calculation code path
+        let mut stats = EvalStats::new(2);
+
+        // Record some games: 60 wins for p0, 30 for p1, 10 draws
+        for _ in 0..60 {
+            stats.record(&GameOutcome::Winner(0));
+        }
+        for _ in 0..30 {
+            stats.record(&GameOutcome::Winner(1));
+        }
+        for _ in 0..10 {
+            stats.record(&GameOutcome::Tie);
+        }
+
+        assert_eq!(stats.total_games, 100);
+        assert_eq!(stats.wins[0], 60);
+        assert_eq!(stats.wins[1], 30);
+        assert_eq!(stats.draws, 10);
+
+        // This exercises the Weng-Lin code path in print_two_player_summary
+        let names = vec!["checkpoint_a".to_string(), "checkpoint_b".to_string()];
+        stats.print_two_player_summary(&names);
+    }
+
+    #[test]
     fn test_ordinal() {
         assert_eq!(ordinal(1), "1st");
         assert_eq!(ordinal(2), "2nd");
@@ -1797,30 +1819,6 @@ mod tests {
         assert_eq!(ordinal(4), "4th");
         assert_eq!(ordinal(11), "11th");
         assert_eq!(ordinal(21), "21st");
-    }
-
-    #[test]
-    fn test_elo_perfect_win_rate() {
-        // 100% win rate should give infinite ELO delta
-        let (delta, stderr) = elo_delta_2p(100, 0, 0);
-        assert!(delta.is_infinite() && delta > 0.0);
-        assert!(stderr.is_infinite());
-    }
-
-    #[test]
-    fn test_elo_zero_win_rate() {
-        // 0% win rate should give negative infinite ELO delta
-        let (delta, stderr) = elo_delta_2p(0, 100, 0);
-        assert!(delta.is_infinite() && delta < 0.0);
-        assert!(stderr.is_infinite());
-    }
-
-    #[test]
-    fn test_elo_no_games() {
-        // No games should return 0 delta with infinite error
-        let (delta, stderr) = elo_delta_2p(0, 0, 0);
-        assert_eq!(delta, 0.0);
-        assert!(stderr.is_infinite());
     }
 
     #[test]
@@ -2057,13 +2055,16 @@ mod tests {
             best_win_rate: 0.30,
             draw_rate: 0.10,
             win_rate: 0.65,
-            elo_delta: 112.0, // approximate ELO for 65% win rate
-            current_elo: 112.0,
-            best_elo: 0.0,
+            current_rating: 5.0,
+            current_uncertainty: 6.0,
+            best_rating: -5.0,
+            best_uncertainty: 6.0,
+            rating_delta: 5.0,
             should_promote: true,
             elapsed_ms: 100,
         };
         assert!(result.should_promote);
+        assert!(result.rating_delta > 0.0);
 
         // Win rate below threshold should not promote
         // 30 wins, 60 losses, 10 draws out of 100 games
@@ -2072,12 +2073,154 @@ mod tests {
             best_win_rate: 0.60,
             draw_rate: 0.10,
             win_rate: 0.35,
-            elo_delta: -112.0, // approximate ELO for 35% win rate
-            current_elo: -112.0,
-            best_elo: 0.0,
+            current_rating: -5.0,
+            current_uncertainty: 6.0,
+            best_rating: 5.0,
+            best_uncertainty: 6.0,
+            rating_delta: -5.0,
             should_promote: false,
             elapsed_ms: 100,
         };
         assert!(!result2.should_promote);
+        assert!(result2.rating_delta < 0.0);
+    }
+
+    #[test]
+    fn test_weng_lin_rating_win_increases() {
+        // A single win should increase the winner's rating
+        let wl_config = WengLinConfig::new();
+        let p0 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+        let p1 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+
+        let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
+
+        // Winner's rating should increase, loser's should decrease
+        assert!(new_p0.rating > p0.rating);
+        assert!(new_p1.rating < p1.rating);
+    }
+
+    #[test]
+    fn test_weng_lin_rating_loss_decreases() {
+        // A single loss should decrease the loser's rating
+        let wl_config = WengLinConfig::new();
+        let p0 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+        let p1 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+
+        let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
+
+        // Loser's rating should decrease, winner's should increase
+        assert!(new_p0.rating < p0.rating);
+        assert!(new_p1.rating > p1.rating);
+    }
+
+    #[test]
+    fn test_weng_lin_rating_draw_minimal_change() {
+        // A draw between equal players should result in minimal rating change
+        let wl_config = WengLinConfig::new();
+        let p0 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+        let p1 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+
+        let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::DRAW, &wl_config);
+
+        // Ratings should stay close to original
+        assert!((new_p0.rating - p0.rating).abs() < 0.5);
+        assert!((new_p1.rating - p1.rating).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_weng_lin_uncertainty_decreases() {
+        // Uncertainty should decrease as more games are played
+        let wl_config = WengLinConfig::new();
+        let initial_uncertainty = 25.0 / 3.0;
+        let mut p0 = WengLinRating {
+            rating: 0.0,
+            uncertainty: initial_uncertainty,
+        };
+        let mut p1 = WengLinRating {
+            rating: 0.0,
+            uncertainty: initial_uncertainty,
+        };
+
+        // Play 100 games
+        for _ in 0..50 {
+            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
+            p0 = new_p0;
+            p1 = new_p1;
+        }
+        for _ in 0..50 {
+            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
+            p0 = new_p0;
+            p1 = new_p1;
+        }
+
+        // Uncertainty should have decreased
+        assert!(p0.uncertainty < initial_uncertainty);
+        assert!(p1.uncertainty < initial_uncertainty);
+    }
+
+    #[test]
+    fn test_weng_lin_perfect_win_rate() {
+        // 100% win rate should give high positive rating
+        let wl_config = WengLinConfig::new();
+        let mut p0 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+        let mut p1 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+
+        // P0 wins all 100 games
+        for _ in 0..100 {
+            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
+            p0 = new_p0;
+            p1 = new_p1;
+        }
+
+        assert!(p0.rating > 10.0); // Should have significant positive rating
+        assert!(p1.rating < -10.0); // P1 should have significant negative rating
+    }
+
+    #[test]
+    fn test_weng_lin_zero_win_rate() {
+        // 0% win rate should give low negative rating
+        let wl_config = WengLinConfig::new();
+        let mut p0 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+        let mut p1 = WengLinRating {
+            rating: 0.0,
+            uncertainty: 25.0 / 3.0,
+        };
+
+        // P0 loses all 100 games
+        for _ in 0..100 {
+            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
+            p0 = new_p0;
+            p1 = new_p1;
+        }
+
+        assert!(p0.rating < -10.0); // Should have significant negative rating
+        assert!(p1.rating > 10.0); // P1 should have significant positive rating
     }
 }

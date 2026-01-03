@@ -18,6 +18,8 @@ pub enum Command {
     Train(TrainArgs),
     /// Evaluate trained models
     Eval(EvalArgs),
+    /// Run a tournament between checkpoints with skill ratings
+    Tournament(TournamentArgs),
 }
 
 /// Arguments for training
@@ -125,6 +127,57 @@ pub struct EvalArgs {
     /// Gradually decay temperature over cutoff moves (requires --temp-cutoff)
     #[arg(long)]
     pub temp_decay: bool,
+}
+
+/// Arguments for tournament mode
+#[derive(Parser, Debug)]
+pub struct TournamentArgs {
+    /// Checkpoint paths or run directories to include
+    /// For run directories, all checkpoints are discovered automatically
+    #[arg(required = true)]
+    pub sources: Vec<PathBuf>,
+
+    /// Number of games per matchup between contestants
+    #[arg(short = 'n', long, default_value = "100")]
+    pub num_games: usize,
+
+    /// Number of parallel environments
+    #[arg(long, default_value = "64")]
+    pub num_envs: usize,
+
+    /// Number of Swiss rounds (default: auto = ceil(log2(n)) + 1)
+    /// Ignored for round-robin (N <= 8 contestants)
+    #[arg(long)]
+    pub rounds: Option<usize>,
+
+    /// Maximum checkpoints to select from each run directory
+    /// Selects evenly spaced checkpoints including first and last
+    #[arg(long)]
+    pub limit: Option<usize>,
+
+    /// Include a random agent as baseline
+    #[arg(long)]
+    pub random: bool,
+
+    /// Initial softmax temperature (0.0 = deterministic argmax)
+    #[arg(long, default_value = "0.3")]
+    pub temperature: f32,
+
+    /// Temperature after cutoff (requires --temp-cutoff)
+    #[arg(long)]
+    pub temp_final: Option<f32>,
+
+    /// Move number to switch from initial to final temperature
+    #[arg(long)]
+    pub temp_cutoff: Option<usize>,
+
+    /// Random seed for reproducibility
+    #[arg(long)]
+    pub seed: Option<u64>,
+
+    /// Save results to JSON file
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
 }
 
 /// Legacy alias for backward compatibility

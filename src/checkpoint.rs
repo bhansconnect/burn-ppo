@@ -52,6 +52,21 @@ pub struct CheckpointMetadata {
     pub activation: String,
     /// Environment name for dispatching at eval time
     pub env_name: String,
+    /// Training skill rating (Weng-Lin mu) for challenger evaluation
+    /// Rating accumulates across promotions
+    #[serde(default = "default_rating")]
+    pub training_rating: f64,
+    /// Training skill uncertainty (Weng-Lin sigma)
+    #[serde(default = "default_uncertainty")]
+    pub training_uncertainty: f64,
+}
+
+fn default_rating() -> f64 {
+    0.0
+}
+
+fn default_uncertainty() -> f64 {
+    25.0 / 3.0 // ~8.333, standard Weng-Lin sigma
 }
 
 /// Manages checkpointing for a training run
@@ -209,6 +224,28 @@ impl CheckpointManager {
     }
 }
 
+/// Load checkpoint metadata from a checkpoint directory
+///
+/// This reads only the metadata.json file without loading the model weights.
+pub fn load_metadata(checkpoint_path: &Path) -> Result<CheckpointMetadata> {
+    let metadata_path = checkpoint_path.join("metadata.json");
+    let metadata_json =
+        std::fs::read_to_string(&metadata_path).context("Failed to read checkpoint metadata")?;
+    serde_json::from_str(&metadata_json).context("Failed to parse checkpoint metadata")
+}
+
+/// Update the training rating fields in a checkpoint's metadata
+///
+/// This modifies only the metadata.json file without touching model weights.
+pub fn update_training_rating(checkpoint_path: &Path, rating: f64, uncertainty: f64) -> Result<()> {
+    let mut metadata = load_metadata(checkpoint_path)?;
+    metadata.training_rating = rating;
+    metadata.training_uncertainty = uncertainty;
+    let metadata_path = checkpoint_path.join("metadata.json");
+    let metadata_json = serde_json::to_string_pretty(&metadata)?;
+    fs::write(&metadata_path, metadata_json).context("Failed to write checkpoint metadata")
+}
+
 /// Save optimizer state to a checkpoint directory
 ///
 /// The optimizer record is saved alongside the model in the checkpoint directory.
@@ -357,6 +394,8 @@ mod tests {
             num_hidden: 2,
             activation: "tanh".to_string(),
             env_name: "cartpole".to_string(),
+            training_rating: 0.0,
+            training_uncertainty: 25.0 / 3.0,
         };
 
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
@@ -405,6 +444,8 @@ mod tests {
                     num_hidden: 2,
                     activation: "tanh".to_string(),
                     env_name: "cartpole".to_string(),
+                    training_rating: 0.0,
+                    training_uncertainty: 25.0 / 3.0,
                 },
                 true,
             )
@@ -428,6 +469,8 @@ mod tests {
                     num_hidden: 2,
                     activation: "tanh".to_string(),
                     env_name: "cartpole".to_string(),
+                    training_rating: 0.0,
+                    training_uncertainty: 25.0 / 3.0,
                 },
                 true,
             )
@@ -451,6 +494,8 @@ mod tests {
                     num_hidden: 2,
                     activation: "tanh".to_string(),
                     env_name: "cartpole".to_string(),
+                    training_rating: 0.0,
+                    training_uncertainty: 25.0 / 3.0,
                 },
                 true,
             )
@@ -529,6 +574,8 @@ mod tests {
             num_hidden: 3,
             activation: "relu".to_string(),
             env_name: "connect_four".to_string(),
+            training_rating: 150.5,
+            training_uncertainty: 5.0,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
@@ -539,6 +586,8 @@ mod tests {
         assert_eq!(loaded.activation, "relu");
         assert_eq!(loaded.env_name, "connect_four");
         assert_eq!(loaded.forked_from, Some("parent_run".to_string()));
+        assert!((loaded.training_rating - 150.5).abs() < f64::EPSILON);
+        assert!((loaded.training_uncertainty - 5.0).abs() < f64::EPSILON);
     }
 
     // =========================================
