@@ -32,7 +32,7 @@ pub fn sample_categorical<B: Backend>(
 
 /// Compute log probabilities of taken actions under categorical distribution
 ///
-/// logits: [batch, num_actions]
+/// logits: [batch, `num_actions`]
 /// actions: [batch]
 /// returns: [batch]
 pub fn log_prob_categorical<B: Backend>(
@@ -48,7 +48,7 @@ pub fn log_prob_categorical<B: Backend>(
 ///
 /// H = -sum(p * log(p))
 ///
-/// Optimization: derive probs from log_probs instead of computing softmax separately
+/// Optimization: derive probs from `log_probs` instead of computing softmax separately
 pub fn entropy_categorical<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 1> {
     profile_scope!("async_entropy_categorical");
     let log_probs = burn::tensor::activation::log_softmax(logits, 1);

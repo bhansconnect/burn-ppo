@@ -27,8 +27,8 @@ pub struct CheckpointMetadata {
     pub step: usize,
     pub avg_return: f32,
     pub rng_seed: u64,
-    /// Best average return seen during training (for CheckpointManager restoration)
-    /// Uses Option to handle f32::NEG_INFINITY which serializes as null
+    /// Best average return seen during training (for `CheckpointManager` restoration)
+    /// Uses Option to handle `f32::NEG_INFINITY` which serializes as null
     #[serde(default)]
     pub best_avg_return: Option<f32>,
     /// Last 100 episode returns for smoothed metrics
@@ -75,7 +75,7 @@ impl CheckpointManager {
     /// Save a checkpoint with atomic write
     ///
     /// If `update_best` is true, updates the "best" symlink if this checkpoint
-    /// has a higher avg_return than the previous best. Set to false when using
+    /// has a higher `avg_return` than the previous best. Set to false when using
     /// challenger evaluation to control best selection manually.
     ///
     /// Returns the path to the saved checkpoint directory
@@ -89,9 +89,7 @@ impl CheckpointManager {
         let checkpoint_dir = self.checkpoints_dir.join(&checkpoint_name);
 
         // Create temp directory for atomic write
-        let temp_dir = self
-            .checkpoints_dir
-            .join(format!(".tmp_{}", checkpoint_name));
+        let temp_dir = self.checkpoints_dir.join(format!(".tmp_{checkpoint_name}"));
         fs::create_dir_all(&temp_dir)?;
 
         // Save model using Burn's recorder
@@ -163,7 +161,6 @@ impl CheckpointManager {
     /// Get the path to the latest checkpoint, if any
     ///
     /// Note: Currently unused in training. Reserved for future inference mode.
-    #[allow(dead_code)]
     pub fn latest_checkpoint(&self) -> Option<PathBuf> {
         let latest = self.checkpoints_dir.join("latest");
         if latest.exists() {
@@ -176,7 +173,6 @@ impl CheckpointManager {
     /// Get the path to the best checkpoint, if any
     ///
     /// Note: Currently unused in training. Reserved for future inference mode.
-    #[allow(dead_code)]
     pub fn best_checkpoint(&self) -> Option<PathBuf> {
         let best = self.checkpoints_dir.join("best");
         if best.exists() {
@@ -187,12 +183,12 @@ impl CheckpointManager {
     }
 
     /// Get the current best average return
-    pub fn best_avg_return(&self) -> f32 {
+    pub const fn best_avg_return(&self) -> f32 {
         self.best_avg_return
     }
 
     /// Set the best average return (used when resuming)
-    pub fn set_best_avg_return(&mut self, value: f32) {
+    pub const fn set_best_avg_return(&mut self, value: f32) {
         self.best_avg_return = value;
     }
 
@@ -215,7 +211,7 @@ impl CheckpointManager {
     /// Update a symlink atomically
     fn update_symlink(&self, name: &str, target: &Path) -> Result<()> {
         let link_path = self.checkpoints_dir.join(name);
-        let temp_link = self.checkpoints_dir.join(format!(".tmp_{}", name));
+        let temp_link = self.checkpoints_dir.join(format!(".tmp_{name}"));
 
         // Create new symlink with temp name
         if temp_link.exists() {
@@ -223,7 +219,9 @@ impl CheckpointManager {
         }
 
         // Use relative path for symlink target
-        let target_name = target.file_name().unwrap();
+        let target_name = target.file_name().ok_or_else(|| {
+            anyhow::anyhow!("Symlink target has no file name: {}", target.display())
+        })?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(target_name, &temp_link)?;
         #[cfg(not(unix))]
@@ -307,7 +305,7 @@ pub fn save_rng_state(rng: &mut rand::rngs::StdRng, checkpoint_dir: &Path) -> Re
 
 /// Load RNG state from a checkpoint directory
 ///
-/// Returns a new StdRng initialized from the saved seed.
+/// Returns a new `StdRng` initialized from the saved seed.
 pub fn load_rng_state(checkpoint_dir: &Path) -> Result<Option<rand::rngs::StdRng>> {
     use rand::SeedableRng;
 
@@ -333,7 +331,7 @@ pub fn load_rng_state(checkpoint_dir: &Path) -> Result<Option<rand::rngs::StdRng
 
 /// Load observation normalizer from a checkpoint directory
 ///
-/// Returns None if no normalizer was saved (older checkpoint or normalize_obs=false).
+/// Returns None if no normalizer was saved (older checkpoint or `normalize_obs=false`).
 pub fn load_normalizer(checkpoint_dir: &Path) -> Result<Option<ObsNormalizer>> {
     let normalizer_path = checkpoint_dir.join("normalizer.json");
     if !normalizer_path.exists() {
@@ -508,7 +506,10 @@ mod tests {
 
         // This should fail because hidden_size, num_hidden, activation, env_name are missing
         let result: Result<CheckpointMetadata, _> = serde_json::from_str(old_json);
-        assert!(result.is_err(), "Old checkpoint without required fields should fail to deserialize");
+        assert!(
+            result.is_err(),
+            "Old checkpoint without required fields should fail to deserialize"
+        );
     }
 
     #[test]
@@ -529,7 +530,10 @@ mod tests {
 
         // This should fail because activation and env_name are missing
         let result: Result<CheckpointMetadata, _> = serde_json::from_str(partial_json);
-        assert!(result.is_err(), "Checkpoint with partial fields should fail to deserialize");
+        assert!(
+            result.is_err(),
+            "Checkpoint with partial fields should fail to deserialize"
+        );
     }
 
     #[test]

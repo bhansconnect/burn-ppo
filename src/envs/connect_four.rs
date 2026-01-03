@@ -29,6 +29,7 @@ pub struct ConnectFour {
 
 impl ConnectFour {
     /// Render the board as ASCII art
+    #[expect(clippy::unwrap_used, reason = "write! to String never fails")]
     pub fn render_board(&self) -> String {
         use std::fmt::Write;
         let mut output = String::new();
@@ -46,7 +47,7 @@ impl ConnectFour {
                     Cell::Player1 => 'X',
                     Cell::Player2 => 'O',
                 };
-                write!(output, " {}", symbol).unwrap();
+                write!(output, " {symbol}").unwrap();
             }
             writeln!(output, " |").unwrap();
         }
@@ -66,7 +67,7 @@ impl ConnectFour {
                 _ => writeln!(output, "Game Over: Draw!").unwrap(),
             }
         } else {
-            writeln!(output, "Turn: {}", turn).unwrap();
+            writeln!(output, "Turn: {turn}").unwrap();
         }
 
         output
@@ -293,6 +294,24 @@ impl Environment for ConnectFour {
             _ => Some(GameOutcome::Tie),
         }
     }
+
+    fn describe_action(&self, action: usize) -> String {
+        format!("Column {}", action + 1) // 1-indexed for humans
+    }
+
+    fn parse_action(&self, input: &str) -> Result<usize, String> {
+        let input = input.trim();
+        if let Ok(col) = input.parse::<usize>() {
+            // Accept 1-7 (human-friendly) or 0-6 (0-indexed)
+            if (1..=7).contains(&col) {
+                return Ok(col - 1); // Convert 1-indexed to 0-indexed
+            }
+            if col < 7 {
+                return Ok(col); // Allow 0-indexed too
+            }
+        }
+        Err("Enter column 1-7".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -513,7 +532,7 @@ mod tests {
         let (obs, _, _) = env.step(1);
 
         // P0 plane: (5,0) should be 1.0
-        assert_eq!(obs[5 * COLS + 0], 1.0);
+        assert_eq!(obs[5 * COLS], 1.0);
         // P1 plane: (5,1) should be 1.0
         assert_eq!(obs[BOARD_SIZE + 5 * COLS + 1], 1.0);
         // Turn indicator: P0's turn [1, 0]

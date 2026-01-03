@@ -33,7 +33,7 @@ impl ObsNormalizer {
 
     /// Update running statistics with a batch of observations
     ///
-    /// obs_batch: flat array of [batch_size * obs_dim]
+    /// `obs_batch`: flat array of [`batch_size` * `obs_dim`]
     pub fn update_batch(&mut self, obs_batch: &[f32], obs_dim: usize) {
         let batch_size = obs_batch.len() / obs_dim;
 
@@ -41,7 +41,7 @@ impl ObsNormalizer {
             self.count += 1.0;
             let offset = i * obs_dim;
             for j in 0..obs_dim {
-                let x = obs_batch[offset + j] as f64;
+                let x = f64::from(obs_batch[offset + j]);
 
                 // Welford's online update
                 let delta = x - self.mean[j];
@@ -54,7 +54,7 @@ impl ObsNormalizer {
 
     /// Normalize a batch of observations in-place
     ///
-    /// obs_batch: flat array of [batch_size * obs_dim], modified in place
+    /// `obs_batch`: flat array of [`batch_size` * `obs_dim`], modified in place
     pub fn normalize_batch(&self, obs_batch: &mut [f32], obs_dim: usize) {
         // Need at least 2 samples for meaningful variance
         if self.count < 2.0 {
@@ -68,7 +68,7 @@ impl ObsNormalizer {
             for j in 0..obs_dim {
                 let variance = self.var[j] / self.count;
                 let std = variance.sqrt().max(1e-8);
-                let normalized = ((obs_batch[offset + j] as f64 - self.mean[j]) / std) as f32;
+                let normalized = ((f64::from(obs_batch[offset + j]) - self.mean[j]) / std) as f32;
                 obs_batch[offset + j] = normalized.clamp(-self.clip, self.clip);
             }
         }
@@ -76,8 +76,7 @@ impl ObsNormalizer {
 
     /// Normalize a single observation, returning a new Vec
     ///
-    /// Note: Training uses normalize_batch(). Reserved for single-observation inference.
-    #[allow(dead_code)]
+    /// Note: Training uses `normalize_batch()`. Reserved for single-observation inference.
     pub fn normalize(&self, obs: &[f32]) -> Vec<f32> {
         // Need at least 2 samples for meaningful variance
         if self.count < 2.0 {
@@ -89,15 +88,14 @@ impl ObsNormalizer {
             .map(|(j, &x)| {
                 let variance = self.var[j] / self.count;
                 let std = variance.sqrt().max(1e-8);
-                let normalized = ((x as f64 - self.mean[j]) / std) as f32;
+                let normalized = ((f64::from(x) - self.mean[j]) / std) as f32;
                 normalized.clamp(-self.clip, self.clip)
             })
             .collect()
     }
 
     /// Get the observation dimension
-    #[allow(dead_code)]
-    pub fn obs_dim(&self) -> usize {
+    pub const fn obs_dim(&self) -> usize {
         self.mean.len()
     }
 }
@@ -249,8 +247,8 @@ mod tests {
         norm.normalize_batch(&mut new_obs, 1);
 
         // Expected normalized value: (15 - 5) / sqrt(50/2) = 10/5 = 2.0
-        let expected = (new_obs_raw as f64 - mean_before) / (var_before / 2.0).sqrt();
-        assert!((new_obs[0] as f64 - expected).abs() < 0.01);
+        let expected = (f64::from(new_obs_raw) - mean_before) / (var_before / 2.0).sqrt();
+        assert!((f64::from(new_obs[0]) - expected).abs() < 0.01);
 
         // Step 2: Update stats with raw observation (for next rollout)
         norm.update_batch(&[new_obs_raw], 1);

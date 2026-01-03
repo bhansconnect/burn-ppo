@@ -55,7 +55,7 @@ impl TrainingProgress {
         };
 
         self.main_bar
-            .set_message(format!("SPS: {:.0} | Return: {:.1}", sps, avg_return));
+            .set_message(format!("SPS: {sps:.0} | Return: {avg_return:.1}"));
     }
 
     /// Update with multiplayer statistics
@@ -83,8 +83,8 @@ impl TrainingProgress {
             format!(
                 "SPS: {:.0} | P0: {:.2} ({:.0}%W) | P1: {:.2} ({:.0}%W) | {:.0}%D",
                 sps,
-                returns_per_player.get(0).unwrap_or(&0.0),
-                win_rates.get(0).unwrap_or(&0.0) * 100.0,
+                returns_per_player.first().unwrap_or(&0.0),
+                win_rates.first().unwrap_or(&0.0) * 100.0,
                 returns_per_player.get(1).unwrap_or(&0.0),
                 win_rates.get(1).unwrap_or(&0.0) * 100.0,
                 draw_rate * 100.0
@@ -94,10 +94,10 @@ impl TrainingProgress {
             let returns_str: String = returns_per_player
                 .iter()
                 .enumerate()
-                .map(|(i, r)| format!("P{}: {:.2}", i, r))
+                .map(|(i, r)| format!("P{i}: {r:.2}"))
                 .collect::<Vec<_>>()
                 .join(" | ");
-            format!("SPS: {:.0} | {}", sps, returns_str)
+            format!("SPS: {sps:.0} | {returns_str}")
         };
 
         self.main_bar.set_message(msg);
@@ -107,7 +107,7 @@ impl TrainingProgress {
     ///
     /// This properly clears the bar, prints the message, then redraws the bar.
     pub fn println(&self, msg: &str) {
-        self.main_bar.suspend(|| println!("{}", msg));
+        self.main_bar.suspend(|| println!("{msg}"));
     }
 
     /// Finish training and close progress bar

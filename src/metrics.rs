@@ -3,7 +3,6 @@
 /// Logs metrics to metrics.jsonl in append-only format for crash safety
 /// and streaming reads by the Aim watcher.
 use serde::Serialize;
-use serde_json;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -62,7 +61,7 @@ impl MetricsLogger {
     /// Write metric to file
     fn write_metric(&mut self, metric: &Metric) -> std::io::Result<()> {
         let line = serde_json::to_string(metric)?;
-        writeln!(self.writer, "{}", line)?;
+        writeln!(self.writer, "{line}")?;
         Ok(())
     }
 

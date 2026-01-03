@@ -1,10 +1,15 @@
-/// Evaluation subcommand for assessing trained models
-///
-/// Features:
-/// - Watch mode: visualize games with ASCII rendering
-/// - Stats mode: parallel game execution with win/loss/draw statistics
-/// - Temperature-based sampling with schedule support
-/// - ELO delta calculation for 2-player games
+//! Evaluation subcommand for assessing trained models
+//!
+//! Features:
+//! - Watch mode: visualize games with ASCII rendering
+//! - Stats mode: parallel game execution with win/loss/draw statistics
+//! - Temperature-based sampling with schedule support
+//! - ELO delta calculation for 2-player games
+
+// Evaluation uses unwrap/expect for:
+// - Tensor data extraction (cannot fail with correct shapes)
+// - Internal data structure invariants
+
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
 use std::thread;
@@ -20,8 +25,49 @@ use crate::checkpoint::{CheckpointManager, CheckpointMetadata};
 use crate::config::{Config, EvalArgs};
 use crate::dispatch_env;
 use crate::env::{Environment, GameOutcome, VecEnv};
+use crate::human::{prompt_human_action, random_valid_action};
 use crate::network::ActorCritic;
 use crate::profile::profile_function;
+
+/// Source of actions for a player slot.
+///
+/// Used to configure each player in an evaluation session.
+#[derive(Clone, Debug)]
+pub enum PlayerSource {
+    /// Network loaded from checkpoint path
+    Checkpoint(std::path::PathBuf),
+    /// Human player with interactive terminal input
+    Human { name: String },
+    /// Random valid actions (useful for baseline comparisons)
+    Random,
+}
+
+impl PlayerSource {
+    /// Returns true if this source requires terminal interaction
+    pub const fn is_human(&self) -> bool {
+        matches!(self, Self::Human { .. })
+    }
+
+    /// Returns true if this source is a network checkpoint
+    pub const fn is_checkpoint(&self) -> bool {
+        matches!(self, Self::Checkpoint(_))
+    }
+
+    /// Display name for this player source
+    pub fn display_name(&self) -> String {
+        match self {
+            Self::Checkpoint(path) => {
+                // Extract meaningful name from path
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("checkpoint")
+                    .to_string()
+            }
+            Self::Human { name } => name.clone(),
+            Self::Random => "Random".to_string(),
+        }
+    }
+}
 
 /// Temperature schedule for action sampling
 ///
@@ -38,7 +84,7 @@ pub struct TempSchedule {
 }
 
 impl TempSchedule {
-    pub fn new(initial: f32, final_temp: f32, cutoff: Option<usize>, decay: bool) -> Self {
+    pub const fn new(initial: f32, final_temp: f32, cutoff: Option<usize>, decay: bool) -> Self {
         Self {
             initial,
             final_temp,
@@ -47,7 +93,7 @@ impl TempSchedule {
         }
     }
 
-    /// Create a TempSchedule from CLI arguments
+    /// Create a `TempSchedule` from CLI arguments
     ///
     /// # Errors
     /// Returns an error if --temp-final or --temp-decay is used without --temp-cutoff
@@ -86,7 +132,7 @@ impl TempSchedule {
 
         // Linear decay: initial → final over cutoff moves
         let t = move_num as f32 / cutoff as f32;
-        self.initial + t * (self.final_temp - self.initial)
+        t.mul_add(self.final_temp - self.initial, self.initial)
     }
 }
 
@@ -117,13 +163,12 @@ pub fn sample_with_temperature(
             .iter()
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            .map_or(0, |(i, _)| i);
     }
 
     // Apply temperature: softmax(logits / temp)
     let scaled: Vec<f32> = masked_logits.iter().map(|x| x / temperature).collect();
-    let max = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let max = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let exp: Vec<f32> = scaled.iter().map(|x| (x - max).exp()).collect();
     let sum: f32 = exp.iter().sum();
 
@@ -157,7 +202,7 @@ pub fn elo_delta_2p(p0_wins: usize, p1_wins: usize, draws: usize) -> (f64, f64) 
         return (0.0, f64::INFINITY);
     }
 
-    let score = (p0_wins as f64 + 0.5 * draws as f64) / n; // P0's score [0, 1]
+    let score = 0.5f64.mul_add(draws as f64, p0_wins as f64) / n; // P0's score [0, 1]
 
     // ELO formula: delta = -400 * log10(1/score - 1)
     // Derived from: P(win) = 1 / (1 + 10^(-delta/400))
@@ -188,7 +233,7 @@ pub fn elo_delta_2p(p0_wins: usize, p1_wins: usize, draws: usize) -> (f64, f64) 
 /// Convert rewards to placements (1 = first, 2 = second, etc.)
 /// Handles ties by giving the same placement to tied players
 pub fn rewards_to_placements(rewards: &[f32]) -> Vec<usize> {
-    let mut indexed: Vec<(usize, f32)> = rewards.iter().cloned().enumerate().collect();
+    let mut indexed: Vec<(usize, f32)> = rewards.iter().copied().enumerate().collect();
     // Sort by reward descending
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -243,17 +288,17 @@ pub fn determine_outcome<E: Environment>(env: &E, total_rewards: &[f32]) -> Game
 /// Statistics tracker for evaluation results
 pub struct EvalStats {
     num_players: usize,
-    /// Wins per checkpoint [num_checkpoints]
+    /// Wins per checkpoint [`num_checkpoints`]
     wins: Vec<usize>,
-    /// Losses per checkpoint [num_checkpoints]
+    /// Losses per checkpoint [`num_checkpoints`]
     losses: Vec<usize>,
     /// Draws count (all tied)
     draws: usize,
-    /// Placement counts per checkpoint [num_checkpoints][num_placements]
+    /// Placement counts per checkpoint [`num_checkpoints`][num_placements]
     placements: Vec<Vec<usize>>,
     /// Total games played
     total_games: usize,
-    /// Total rewards per game [game_idx][player]
+    /// Total rewards per game [`game_idx`][player]
     game_rewards: Vec<Vec<f64>>,
     /// Episode lengths
     episode_lengths: Vec<usize>,
@@ -276,7 +321,7 @@ impl EvalStats {
     /// Record a game outcome with optional rewards and length
     pub fn record_with_rewards(&mut self, outcome: &GameOutcome, rewards: &[f32], length: usize) {
         self.game_rewards
-            .push(rewards.iter().map(|&r| r as f64).collect());
+            .push(rewards.iter().map(|&r| f64::from(r)).collect());
         self.episode_lengths.push(length);
         self.record(outcome);
     }
@@ -385,11 +430,11 @@ impl EvalStats {
         );
         println!();
         println!("Reward Distribution:");
-        println!("  Mean:   {:.1} ± {:.1} (std)", mean, std);
-        println!("  Range:  [{:.1}, {:.1}]", min, max);
-        println!("  25th:   {:.1}", p25);
-        println!("  Median: {:.1}", p50);
-        println!("  75th:   {:.1}", p75);
+        println!("  Mean:   {mean:.1} ± {std:.1} (std)");
+        println!("  Range:  [{min:.1}, {max:.1}]");
+        println!("  25th:   {p25:.1}");
+        println!("  Median: {p50:.1}");
+        println!("  75th:   {p75:.1}");
 
         // Episode length stats if available
         if !self.episode_lengths.is_empty() {
@@ -399,8 +444,8 @@ impl EvalStats {
             let max_len = self.episode_lengths.iter().max().copied().unwrap_or(0);
             println!();
             println!("Episode Length:");
-            println!("  Mean:  {:.1}", avg_len);
-            println!("  Range: [{}, {}]", min_len, max_len);
+            println!("  Mean:  {avg_len:.1}");
+            println!("  Range: [{min_len}, {max_len}]");
         }
     }
 
@@ -423,7 +468,7 @@ impl EvalStats {
             } else {
                 "checkpoint 1 stronger"
             };
-            println!("\nELO Delta: {:+.0} ± {:.0} ({})", delta, stderr, stronger);
+            println!("\nELO Delta: {delta:+.0} ± {stderr:.0} ({stronger})");
         }
     }
 
@@ -451,7 +496,7 @@ impl EvalStats {
                 placement_pcts.join(", "),
                 avg_placement
             );
-            println!("  {}", name);
+            println!("  {name}");
         }
     }
 
@@ -471,7 +516,7 @@ impl EvalStats {
 
             if !rewards.is_empty() {
                 let mean = rewards.iter().sum::<f64>() / rewards.len() as f64;
-                println!("  Player {}: {:.3}", player, mean);
+                println!("  Player {player}: {mean:.3}");
             }
         }
     }
@@ -502,7 +547,7 @@ fn ordinal(n: usize) -> String {
         3 if n % 100 != 13 => "rd",
         _ => "th",
     };
-    format!("{}{}", n, suffix)
+    format!("{n}{suffix}")
 }
 
 /// Load a model from a checkpoint directory
@@ -560,9 +605,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     // models = [new, best], checkpoint_to_model = [0, 1, 1, 1, ...]
     // This means: checkpoint 0 = new model, checkpoints 1..N-1 = best model
     let models = vec![current_model.clone(), best_model];
-    let checkpoint_to_model: Vec<usize> = (0..num_players)
-        .map(|i| if i == 0 { 0 } else { 1 })
-        .collect();
+    let checkpoint_to_model: Vec<usize> = (0..num_players).map(|i| usize::from(i != 0)).collect();
     let names: Vec<String> = (0..num_players)
         .map(|i| if i == 0 { "new".into() } else { "best".into() })
         .collect();
@@ -620,7 +663,35 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
 pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result<()> {
     use std::collections::HashMap;
 
-    // Load unique checkpoints with deduplication
+    // Check if we have human or random players
+    let has_human = !args.humans.is_empty();
+    let has_random = args.random;
+    let has_mixed_players = has_human || has_random;
+
+    // Build player sources list
+    let mut player_sources: Vec<PlayerSource> = Vec::new();
+
+    // Add checkpoints as player sources
+    for path in &args.checkpoints {
+        player_sources.push(PlayerSource::Checkpoint(path.clone()));
+    }
+
+    // Add human players
+    for name in &args.humans {
+        player_sources.push(PlayerSource::Human { name: name.clone() });
+    }
+
+    // Add random player if requested
+    if has_random {
+        player_sources.push(PlayerSource::Random);
+    }
+
+    // If we have human/random players, use interactive mode
+    if has_mixed_players {
+        return run_interactive_evaluation::<B>(args, &player_sources, device);
+    }
+
+    // Original checkpoint-only flow below
     let mut models: Vec<ActorCritic<B>> = Vec::new();
     let mut path_to_model_idx: HashMap<std::path::PathBuf, usize> = HashMap::new();
     let mut checkpoint_to_model: Vec<usize> = Vec::new();
@@ -630,9 +701,10 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     for path in &args.checkpoints {
         // Resolve symlinks (latest, best)
         let resolved = if path.is_symlink() {
-            path.read_link()
-                .map(|target| path.parent().unwrap_or(path).join(target))
-                .unwrap_or_else(|_| path.clone())
+            path.read_link().map_or_else(
+                |_| path.clone(),
+                |target| path.parent().unwrap_or(path).join(target),
+            )
         } else {
             path.clone()
         };
@@ -644,11 +716,8 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
             let (model, metadata) = load_model_from_checkpoint::<B>(&resolved, device)?;
 
             // Store first metadata for environment info
-            if metadata_opt.is_none() {
-                metadata_opt = Some(metadata.clone());
-            } else {
+            if let Some(first) = &metadata_opt {
                 // Verify all checkpoints are for the same environment
-                let first = metadata_opt.as_ref().unwrap();
                 if metadata.obs_dim != first.obs_dim
                     || metadata.action_count != first.action_count
                     || metadata.num_players != first.num_players
@@ -658,6 +727,8 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
                         path.display()
                     );
                 }
+            } else {
+                metadata_opt = Some(metadata.clone());
             }
 
             let idx = models.len();
@@ -725,6 +796,93 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     }
 }
 
+/// Run interactive evaluation with mixed player sources (human, network, random)
+fn run_interactive_evaluation<B: Backend>(
+    args: &EvalArgs,
+    player_sources: &[PlayerSource],
+    device: &B::Device,
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    // Determine environment from first checkpoint or from --env arg
+    let env_name = if let Some(first_checkpoint) = args.checkpoints.first() {
+        let (_, metadata) = load_model_from_checkpoint::<B>(first_checkpoint, device)?;
+        metadata.env_name
+    } else if let Some(env) = &args.env_name {
+        env.clone()
+    } else {
+        anyhow::bail!(
+            "No checkpoint provided. Use --env to specify environment for human/random games.\n\
+             Example: --env connect_four --human Alice --human Bob"
+        );
+    };
+
+    // Load models for checkpoint players
+    let mut models: Vec<Option<ActorCritic<B>>> = Vec::new();
+    let mut path_to_model: HashMap<std::path::PathBuf, ActorCritic<B>> = HashMap::new();
+
+    for source in player_sources {
+        match source {
+            PlayerSource::Checkpoint(path) => {
+                // Resolve symlinks
+                let resolved = if path.is_symlink() {
+                    path.read_link().map_or_else(
+                        |_| path.clone(),
+                        |target| path.parent().unwrap_or(path).join(target),
+                    )
+                } else {
+                    path.clone()
+                };
+
+                // Load model (with deduplication)
+                if !path_to_model.contains_key(&resolved) {
+                    let (model, _) = load_model_from_checkpoint::<B>(&resolved, device)?;
+                    path_to_model.insert(resolved.clone(), model);
+                }
+                models.push(Some(path_to_model.get(&resolved).unwrap().clone()));
+            }
+            PlayerSource::Human { .. } | PlayerSource::Random => {
+                models.push(None);
+            }
+        }
+    }
+
+    // Setup
+    let seed = args.seed.unwrap_or(42);
+    let mut rng = StdRng::seed_from_u64(seed);
+    let temp_schedule = TempSchedule::from_args(args)?;
+
+    let num_games = if args.num_games == 100 {
+        1
+    } else {
+        args.num_games
+    };
+
+    // Dispatch based on environment name
+    dispatch_env!(env_name, {
+        // Verify player count matches
+        let expected_players = E::NUM_PLAYERS;
+        if player_sources.len() != expected_players {
+            anyhow::bail!(
+                "{} requires {} players, but {} were specified.\n\
+                 Use --checkpoint, --human, and --random to specify players.",
+                E::NAME,
+                expected_players,
+                player_sources.len()
+            );
+        }
+
+        run_interactive_game::<B, E>(
+            player_sources,
+            &models,
+            num_games,
+            &temp_schedule,
+            &mut rng,
+            device,
+        )
+    })
+}
+
 /// Run evaluation in watch mode (sequential, with rendering)
 fn run_watch_mode<B: Backend>(
     models: &[ActorCritic<B>],
@@ -775,7 +933,7 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
     for game_idx in 0..num_games {
         println!("\n=== Game {} ===", game_idx + 1);
         for (i, name) in checkpoint_names.iter().enumerate() {
-            println!("Player {}: {}", i, name);
+            println!("Player {i}: {name}");
         }
         println!();
 
@@ -785,7 +943,7 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
         let mut move_num = 0;
         let mut is_first_frame = true;
         let mut last_frame_lines = 0usize;
-        let frame_duration = Duration::from_millis(1000 / fps as u64);
+        let frame_duration = Duration::from_millis(1000 / u64::from(fps));
 
         loop {
             let frame_start = if animate { Some(Instant::now()) } else { None };
@@ -813,9 +971,9 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                         // +1 for the action line
                         print!("\x1b[{}A", last_frame_lines + 1);
                     }
-                    print!("{}\n", rendered);
+                    println!("{rendered}");
                     // Trailing spaces clear any leftover characters from previous longer text
-                    println!("Action: {} (temp={:.2})                    ", action, temp);
+                    println!("Action: {action} (temp={temp:.2})                    ");
                     io::stdout().flush().ok();
                     last_frame_lines = frame_lines;
                     is_first_frame = false;
@@ -823,21 +981,15 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                     if let Some(start) = frame_start {
                         let elapsed = start.elapsed();
                         if elapsed < frame_duration {
-                            thread::sleep(frame_duration - elapsed);
+                            thread::sleep(frame_duration.checked_sub(elapsed).unwrap());
                         }
                     }
                 } else {
-                    println!("{}", rendered);
-                    println!(
-                        "Player {} selects action {} (temp={:.2})",
-                        current_player, action, temp
-                    );
+                    println!("{rendered}");
+                    println!("Player {current_player} selects action {action} (temp={temp:.2})");
                 }
             } else {
-                println!(
-                    "Player {} selects action {} (temp={:.2})",
-                    current_player, action, temp
-                );
+                println!("Player {current_player} selects action {action} (temp={temp:.2})");
             }
 
             if step_mode {
@@ -858,10 +1010,10 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                     if animate {
                         // Overwrite the animation frame with final state
                         print!("\x1b[{}A", last_frame_lines + 1);
-                        println!("{}", rendered);
+                        println!("{rendered}");
                         println!(); // Extra line to separate from outcome
                     } else {
-                        println!("{}", rendered);
+                        println!("{rendered}");
                     }
                 }
 
@@ -869,14 +1021,14 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                 stats.record(&outcome);
 
                 match &outcome {
-                    GameOutcome::Winner(w) => println!("\nWinner: Player {}", w),
+                    GameOutcome::Winner(w) => println!("\nWinner: Player {w}"),
                     GameOutcome::Tie => println!("\nGame ended in a tie"),
                     GameOutcome::Placements(p) => {
-                        println!("\nFinal placements: {:?}", p);
+                        println!("\nFinal placements: {p:?}");
                     }
                 }
-                println!("Total rewards: {:?}", total_rewards);
-                println!("Game length: {} moves", move_num);
+                println!("Total rewards: {total_rewards:?}");
+                println!("Game length: {move_num} moves");
                 break;
             }
         }
@@ -895,6 +1047,188 @@ fn wait_for_enter() {
     io::stdout().flush().ok();
     let mut input = String::new();
     io::stdin().read_line(&mut input).ok();
+}
+
+/// Run interactive game with mixed player sources (human, network, random).
+///
+/// This is used when any player is human or random.
+/// Always runs in sequential mode (single env, one game at a time).
+pub fn run_interactive_game<B: Backend, E: Environment>(
+    player_sources: &[PlayerSource],
+    models: &[Option<ActorCritic<B>>],
+    num_games: usize,
+    temp_schedule: &TempSchedule,
+    rng: &mut StdRng,
+    device: &B::Device,
+) -> Result<()> {
+    use rand::RngCore;
+
+    let num_players = E::NUM_PLAYERS;
+    assert_eq!(
+        player_sources.len(),
+        num_players,
+        "Expected {num_players} player sources for {num_players}-player game"
+    );
+
+    // Build display names for players
+    let player_names: Vec<String> = player_sources
+        .iter()
+        .map(PlayerSource::display_name)
+        .collect();
+
+    let mut stats = EvalStats::new(num_players);
+
+    for game_idx in 0..num_games {
+        println!("\n=== Game {} of {} ===", game_idx + 1, num_games);
+        for (i, name) in player_names.iter().enumerate() {
+            let source_type = match &player_sources[i] {
+                PlayerSource::Checkpoint(_) => "[Network]",
+                PlayerSource::Human { .. } => "[Human]",
+                PlayerSource::Random => "[Random]",
+            };
+            println!("Player {}: {} {}", i + 1, name, source_type);
+        }
+        println!("\nCommands: help (h), render (r), random, hint, quit (q)\n");
+
+        let mut env = E::new(rng.next_u64());
+        let obs = env.reset();
+        let mut total_rewards = vec![0.0f32; num_players];
+        let mut move_num = 0;
+
+        // Store observation for network hints
+        let mut current_obs = obs;
+
+        loop {
+            let current_player = env.current_player();
+            let player_source = &player_sources[current_player];
+            let mask = env.action_mask();
+
+            // Render board before human turns (or always for visibility)
+            let has_human = player_sources.iter().any(PlayerSource::is_human);
+            if has_human {
+                if let Some(rendered) = env.render() {
+                    println!("{rendered}");
+                }
+            }
+
+            // Get action based on player source
+            let action = match player_source {
+                PlayerSource::Human { name } => {
+                    // Build hint closure from any available network
+                    let hint: Option<Box<dyn Fn() -> usize>> =
+                        build_hint_closure::<B, E>(models, &current_obs, mask.as_deref(), device);
+
+                    prompt_human_action(
+                        &env,
+                        current_player,
+                        num_players,
+                        name,
+                        hint.as_ref().map(std::convert::AsRef::as_ref),
+                        rng,
+                    )
+                }
+                PlayerSource::Random => {
+                    let action = random_valid_action(&env, rng);
+                    println!(
+                        "Player {} (Random) plays: {}",
+                        current_player + 1,
+                        env.describe_action(action)
+                    );
+                    action
+                }
+                PlayerSource::Checkpoint(_) => {
+                    // Network action
+                    let model = models[current_player]
+                        .as_ref()
+                        .expect("Model should be loaded for checkpoint player");
+
+                    let obs_tensor: Tensor<B, 2> =
+                        Tensor::<B, 1>::from_floats(&current_obs[..], device)
+                            .reshape([1, E::OBSERVATION_DIM]);
+                    let (logits, _) = model.forward(obs_tensor);
+                    let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
+
+                    let temp = temp_schedule.get_temp(move_num);
+                    let action = sample_with_temperature(&logits_vec, mask.as_deref(), temp, rng);
+
+                    println!(
+                        "Player {} ({}) plays: {} (temp={:.2})",
+                        current_player + 1,
+                        player_names[current_player],
+                        env.describe_action(action),
+                        temp
+                    );
+                    action
+                }
+            };
+
+            // Step environment
+            let (new_obs, rewards, done) = env.step(action);
+            for (i, &r) in rewards.iter().enumerate() {
+                total_rewards[i] += r;
+            }
+            current_obs = new_obs;
+            move_num += 1;
+
+            if done {
+                // Show final state
+                if let Some(rendered) = env.render() {
+                    println!("{rendered}");
+                }
+
+                let outcome = determine_outcome(&env, &total_rewards);
+                stats.record(&outcome);
+
+                match &outcome {
+                    GameOutcome::Winner(w) => {
+                        println!("\nWinner: Player {} ({})", w + 1, player_names[*w]);
+                    }
+                    GameOutcome::Tie => println!("\nGame ended in a tie"),
+                    GameOutcome::Placements(p) => {
+                        println!("\nFinal placements:");
+                        for (i, &place) in p.iter().enumerate() {
+                            println!("  {}: {} ({})", place, player_names[i], ordinal(place));
+                        }
+                    }
+                }
+                println!("Total rewards: {total_rewards:?}");
+                println!("Game length: {move_num} moves");
+                break;
+            }
+        }
+    }
+
+    if num_games > 1 {
+        stats.print_summary(&player_names);
+    }
+
+    Ok(())
+}
+
+/// Build a hint closure from any available network model
+fn build_hint_closure<'a, B: Backend, E: Environment>(
+    models: &'a [Option<ActorCritic<B>>],
+    obs: &[f32],
+    mask: Option<&[bool]>,
+    device: &B::Device,
+) -> Option<Box<dyn Fn() -> usize + 'a>> {
+    // Find first available network
+    let (_model_idx, model) = models
+        .iter()
+        .enumerate()
+        .find_map(|(i, m)| m.as_ref().map(|m| (i, m)))?;
+
+    // Compute action now (closure captures the result)
+    let obs_tensor: Tensor<B, 2> =
+        Tensor::<B, 1>::from_floats(obs, device).reshape([1, E::OBSERVATION_DIM]);
+    let (logits, _) = model.forward(obs_tensor);
+    let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
+
+    // Use temperature 0 for deterministic hint
+    let mut temp_rng = StdRng::seed_from_u64(0);
+    let action = sample_with_temperature(&logits_vec, mask, 0.0, &mut temp_rng);
+
+    Some(Box::new(move || action))
 }
 
 /// Run evaluation in stats mode (parallel)
@@ -932,7 +1266,7 @@ fn run_stats_mode<B: Backend>(
 /// Stats mode implementation for a specific environment type
 ///
 /// When `silent` is true, suppresses output (used by challenger eval).
-/// Returns EvalStats for further processing.
+/// Returns `EvalStats` for further processing.
 fn run_stats_mode_env<B: Backend, E: Environment>(
     models: &[ActorCritic<B>],
     checkpoint_to_model: &[usize],
@@ -962,15 +1296,10 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
     // Track permutation offset per environment for position rotation
     // checkpoint i plays as player (i + perm_offset) % num_players
     // This rotates all checkpoints through all positions for fairness
-    let mut perm_offsets: Vec<usize> = (0..num_envs)
-        .map(|env_idx| env_idx % num_players)
-        .collect();
+    let mut perm_offsets: Vec<usize> = (0..num_envs).map(|env_idx| env_idx % num_players).collect();
 
     if !silent {
-        println!(
-            "Running {} games across {} parallel environments...",
-            num_games, num_envs
-        );
+        println!("Running {num_games} games across {num_envs} parallel environments...");
     }
 
     let mut games_completed = 0;
@@ -990,7 +1319,7 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
         let mut actions = vec![0usize; num_envs];
 
         // Group environments by which model should act (based on position mapping)
-        for model_idx in 0..models.len() {
+        for (model_idx, model) in models.iter().enumerate() {
             // Find environments where this model's checkpoint is the current player
             let mut env_indices = Vec::new();
             let mut env_obs = Vec::new();
@@ -1032,7 +1361,7 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
             let batch_size = env_indices.len();
             let obs_tensor: Tensor<B, 2> =
                 Tensor::<B, 1>::from_floats(&env_obs[..], device).reshape([batch_size, obs_dim]);
-            let (logits_tensor, _) = models[model_idx].forward(obs_tensor);
+            let (logits_tensor, _) = model.forward(obs_tensor.clone());
             let logits_flat: Vec<f32> = logits_tensor.to_data().to_vec().unwrap();
 
             // Sample actions
@@ -1040,11 +1369,11 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
                 let logit_offset = i * action_count;
                 let logits = &logits_flat[logit_offset..logit_offset + action_count];
 
-                let mask = if !env_masks.is_empty() {
+                let mask = if env_masks.is_empty() {
+                    None
+                } else {
                     let mask_offset = i * action_count;
                     Some(&env_masks[mask_offset..mask_offset + action_count])
-                } else {
-                    None
                 };
 
                 let temp = temp_schedule.get_temp(move_counts[env_idx]);
@@ -1056,7 +1385,7 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
         let (_, _, _, completed_episodes) = vec_env.step(&actions);
 
         // Update move counts
-        for count in move_counts.iter_mut() {
+        for count in &mut move_counts {
             *count += 1;
         }
 
@@ -1064,7 +1393,7 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
         let completed_env_indices: Vec<usize> =
             completed_episodes.iter().map(|ep| ep.env_index).collect();
 
-        for ep in completed_episodes.into_iter() {
+        for ep in completed_episodes {
             // Only record up to num_games
             if games_completed >= num_games {
                 continue;
@@ -1078,11 +1407,12 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
 
             // Map player rewards to checkpoint rewards using permutation offset
             // checkpoint i was at player position (i + perm_offset) % num_players
-            let mut checkpoint_rewards = vec![0.0f32; num_checkpoints];
-            for checkpoint_idx in 0..num_checkpoints {
-                let player_idx = (checkpoint_idx + perm_offset) % num_players;
-                checkpoint_rewards[checkpoint_idx] = ep.total_rewards[player_idx];
-            }
+            let checkpoint_rewards: Vec<f32> = (0..num_checkpoints)
+                .map(|checkpoint_idx| {
+                    let player_idx = (checkpoint_idx + perm_offset) % num_players;
+                    ep.total_rewards[player_idx]
+                })
+                .collect();
 
             // Determine outcome from checkpoint rewards
             let outcome = {
@@ -1106,7 +1436,7 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
 
             // Progress indicator
             if !silent && games_completed % 100 == 0 {
-                println!("  {} / {} games completed", games_completed, num_games);
+                println!("  {games_completed} / {num_games} games completed");
             }
         }
 
@@ -1194,6 +1524,9 @@ mod tests {
         // No cutoff, no final/decay - valid
         let args = EvalArgs {
             checkpoints: vec![PathBuf::from("test")],
+            humans: vec![],
+            random: false,
+            env_name: None,
             num_games: 100,
             num_envs: 64,
             watch: false,
@@ -1227,6 +1560,9 @@ mod tests {
 
         let args = EvalArgs {
             checkpoints: vec![PathBuf::from("test")],
+            humans: vec![],
+            random: false,
+            env_name: None,
             num_games: 100,
             num_envs: 64,
             watch: false,
@@ -1253,6 +1589,9 @@ mod tests {
 
         let args = EvalArgs {
             checkpoints: vec![PathBuf::from("test")],
+            humans: vec![],
+            random: false,
+            env_name: None,
             num_games: 100,
             num_envs: 64,
             watch: false,
@@ -1514,8 +1853,8 @@ mod tests {
         // With equal logits and temp=1.0, each action should get ~100 samples
         // Allow for statistical variance (should be within 50-150 each)
         for count in counts {
-            assert!(count > 50, "Action count {} too low", count);
-            assert!(count < 150, "Action count {} too high", count);
+            assert!(count > 50, "Action count {count} too low");
+            assert!(count < 150, "Action count {count} too high");
         }
     }
 

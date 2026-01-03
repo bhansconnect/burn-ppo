@@ -6,7 +6,7 @@ use crate::profile::{profile_function, profile_scope};
 
 /// Create a Linear layer with orthogonal weight initialization and zero biases
 ///
-/// This is necessary because Burn's LinearConfig.with_initializer() applies
+/// This is necessary because Burn's `LinearConfig.with_initializer()` applies
 /// the same initializer to both weights and biases, but Orthogonal requires
 /// 2D tensors (weights are 2D, biases are 1D).
 ///
@@ -46,7 +46,7 @@ pub struct ActorCritic<B: Backend> {
     pub policy_head: nn::Linear<B>,
     /// Single value head with N outputs (one per player)
     pub value_head: nn::Linear<B>,
-    /// Use ReLU activation (true) or tanh (false)
+    /// Use `ReLU` activation (true) or tanh (false)
     #[module(skip)]
     use_relu: bool,
     /// Number of players (for value head output dimension)
@@ -55,10 +55,10 @@ pub struct ActorCritic<B: Backend> {
 }
 
 impl<B: Backend> ActorCritic<B> {
-    /// Create a new ActorCritic network
+    /// Create a new `ActorCritic` network
     ///
     /// Uses orthogonal initialization with specific gains (per ICLR blog):
-    /// - Hidden layers: sqrt(2) for ReLU, 1.0 for tanh
+    /// - Hidden layers: sqrt(2) for `ReLU`, 1.0 for tanh
     /// - Policy head: 0.01 (small for stable initial policy)
     /// - Value head: 1.0
     /// - All biases: 0
@@ -109,14 +109,14 @@ impl<B: Backend> ActorCritic<B> {
     }
 
     /// Get number of players (value head output dimension)
-    pub fn num_players(&self) -> usize {
+    pub const fn num_players(&self) -> usize {
         self.num_players
     }
 
     /// Forward pass returning action logits and N player values
     ///
-    /// Input: observations [batch, obs_dim]
-    /// Output: (logits [batch, action_count], values [batch, num_players])
+    /// Input: observations [batch, `obs_dim`]
+    /// Output: (logits [batch, `action_count`], values [batch, `num_players`])
     pub fn forward(&self, obs: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         profile_function!();
         let mut x = obs;

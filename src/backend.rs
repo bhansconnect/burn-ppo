@@ -3,7 +3,7 @@
 /// Usage:
 /// - `cargo run --release` → WGPU (default, cross-platform)
 /// - `cargo run --release --features cuda` → CUDA (NVIDIA GPUs)
-/// - `cargo run --release --features libtorch` → LibTorch (PyTorch)
+/// - `cargo run --release --features libtorch` → `LibTorch` (`PyTorch`)
 use burn::backend::Autodiff;
 
 // CUDA backend (highest priority)
@@ -54,14 +54,16 @@ pub fn init_device() -> <TrainingBackend as burn::tensor::backend::Backend>::Dev
 }
 
 #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "libtorch")))]
-pub fn backend_name() -> &'static str {
+pub const fn backend_name() -> &'static str {
     "WGPU"
 }
 
 #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "libtorch")))]
 pub fn device_name(device: &<TrainingBackend as burn::tensor::backend::Backend>::Device) -> String {
     use burn::backend::wgpu::graphics::AutoGraphicsApi;
-    let setup = burn::backend::wgpu::init_setup::<AutoGraphicsApi>(device, Default::default());
+    use burn::backend::wgpu::RuntimeOptions;
+    let setup =
+        burn::backend::wgpu::init_setup::<AutoGraphicsApi>(device, RuntimeOptions::default());
     let info = setup.adapter.get_info();
     format!("{} via {:?}", info.name, info.backend)
 }

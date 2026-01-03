@@ -1,3 +1,4 @@
+#![deny(warnings)]
 #![recursion_limit = "256"]
 
 mod backend;
@@ -6,6 +7,7 @@ mod config;
 mod env;
 mod envs;
 mod eval;
+mod human;
 mod metrics;
 mod network;
 mod normalization;
@@ -45,7 +47,7 @@ use std::collections::VecDeque;
 
 /// Extract run name from a checkpoint path
 ///
-/// e.g., "runs/cartpole_001/checkpoints/best" -> "cartpole_001"
+/// e.g., "`runs/cartpole_001/checkpoints/best`" -> "`cartpole_001`"
 fn extract_run_name_from_checkpoint_path(checkpoint_path: &std::path::Path) -> Option<String> {
     // Navigate up from checkpoint: checkpoints/<name> -> checkpoints -> run_dir
     let run_dir = checkpoint_path.parent()?.parent()?;
@@ -55,16 +57,34 @@ fn extract_run_name_from_checkpoint_path(checkpoint_path: &std::path::Path) -> O
 /// Get the step number from the best checkpoint symlink
 ///
 /// Reads the symlink target and extracts the step number from the directory name.
-/// e.g., "step_00010240" -> 10240
+/// e.g., "`step_00010240`" -> 10240
 fn get_best_checkpoint_step(best_path: &std::path::Path) -> Option<usize> {
     let target = std::fs::read_link(best_path).ok()?;
     let name = target.file_name()?.to_str()?;
     // Parse "step_XXXXXXXX" format
-    if name.starts_with("step_") {
-        name[5..].parse().ok()
-    } else {
-        None
+    name.strip_prefix("step_").and_then(|s| s.parse().ok())
+}
+
+/// Count checkpoint directories in a run's checkpoints folder
+///
+/// Returns the count of directories matching "step_*" pattern
+fn count_checkpoints(run_dir: &std::path::Path) -> usize {
+    let checkpoints_dir = run_dir.join("checkpoints");
+    if !checkpoints_dir.exists() {
+        return 0;
     }
+    std::fs::read_dir(&checkpoints_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("step_"))
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// Check if run directory exists and prompt user for deletion confirmation
@@ -76,25 +96,7 @@ fn check_run_exists_and_prompt(run_dir: &std::path::Path) -> Result<bool> {
         return Ok(true);
     }
 
-    // Gather info about the existing run
-    let checkpoints_dir = run_dir.join("checkpoints");
-    let checkpoint_count = if checkpoints_dir.exists() {
-        std::fs::read_dir(&checkpoints_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|e| {
-                        e.file_name()
-                            .to_str()
-                            .map(|n| n.starts_with("step_"))
-                            .unwrap_or(false)
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let checkpoint_count = count_checkpoints(run_dir);
 
     eprintln!();
     eprintln!(
@@ -102,7 +104,7 @@ fn check_run_exists_and_prompt(run_dir: &std::path::Path) -> Result<bool> {
         run_dir.file_name().unwrap().to_string_lossy(),
         run_dir
     );
-    eprintln!("This run contains {} checkpoint(s).", checkpoint_count);
+    eprintln!("This run contains {checkpoint_count} checkpoint(s).");
     eprintln!();
     eprint!("Delete existing run and continue? [y/N]: ");
 
@@ -141,7 +143,7 @@ enum TrainingMode {
 /// Run training with a specific environment type
 ///
 /// This is the core training function, generic over the environment type.
-/// Full static dispatch - VecEnv<CartPole> and VecEnv<ConnectFour> are separate types.
+/// Full static dispatch - `VecEnv`<CartPole> and `VecEnv`<ConnectFour> are separate types.
 fn run_training<E, F>(
     mode: TrainingMode,
     config: Config,
@@ -213,7 +215,7 @@ where
             let (model, _) =
                 CheckpointManager::load::<TrainingBackend>(checkpoint_dir, &config, device)
                     .with_context(|| {
-                        format!("Failed to load checkpoint from {:?}", checkpoint_dir)
+                        format!("Failed to load checkpoint from {checkpoint_dir:?}")
                     })?;
 
             // Create optimizer and try to load saved state
@@ -225,7 +227,7 @@ where
             ) {
                 Ok(opt) => opt,
                 Err(e) => {
-                    eprintln!("Warning: Failed to load optimizer state: {}", e);
+                    eprintln!("Warning: Failed to load optimizer state: {e}");
                     optimizer_config.init()
                 }
             };
@@ -241,7 +243,7 @@ where
                         // No normalizer saved, keep the fresh one
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to load normalizer: {}", e);
+                        eprintln!("Warning: Failed to load normalizer: {e}");
                     }
                 }
             }
@@ -256,7 +258,7 @@ where
                     // No RNG state saved, keep the fresh one
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load RNG state: {}", e);
+                    eprintln!("Warning: Failed to load RNG state: {e}");
                 }
             }
 
@@ -360,7 +362,7 @@ where
         let ent_coef = if config.entropy_anneal {
             let actual_update = update_offset + update;
             let progress_frac = actual_update as f64 / total_updates as f64;
-            config.entropy_coef * (1.0 - progress_frac * 0.9) // Decay to 10% of initial
+            config.entropy_coef * progress_frac.mul_add(-0.9, 1.0) // Decay to 10% of initial
         } else {
             config.entropy_coef
         };
@@ -565,8 +567,8 @@ where
                 let lengths: Vec<usize> = episodes_since_log.iter().map(|(_, l)| *l).collect();
 
                 let return_mean = returns.iter().sum::<f32>() / returns.len() as f32;
-                let return_max = returns.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let return_min = returns.iter().cloned().fold(f32::INFINITY, f32::min);
+                let return_max = returns.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let return_min = returns.iter().copied().fold(f32::INFINITY, f32::min);
 
                 let length_mean = lengths.iter().sum::<usize>() as f32 / lengths.len() as f32;
                 let length_max = *lengths.iter().max().unwrap() as f32;
@@ -600,22 +602,22 @@ where
                         let mean = player_returns.iter().sum::<f32>() / player_returns.len() as f32;
                         let max = player_returns
                             .iter()
-                            .cloned()
+                            .copied()
                             .fold(f32::NEG_INFINITY, f32::max);
-                        let min = player_returns.iter().cloned().fold(f32::INFINITY, f32::min);
+                        let min = player_returns.iter().copied().fold(f32::INFINITY, f32::min);
 
                         logger.log_scalar(
-                            &format!("episode/return_mean_p{}", player),
+                            &format!("episode/return_mean_p{player}"),
                             mean,
                             global_step,
                         )?;
                         logger.log_scalar(
-                            &format!("episode/return_max_p{}", player),
+                            &format!("episode/return_max_p{player}"),
                             max,
                             global_step,
                         )?;
                         logger.log_scalar(
-                            &format!("episode/return_min_p{}", player),
+                            &format!("episode/return_min_p{player}"),
                             min,
                             global_step,
                         )?;
@@ -648,10 +650,10 @@ where
                     }
                 }
 
-                for player in 0..num_players_usize {
-                    let win_rate = wins_per_player[player] as f32 / total_games as f32;
+                for (player, &wins) in wins_per_player.iter().enumerate() {
+                    let win_rate = wins as f32 / total_games as f32;
                     logger.log_scalar(
-                        &format!("episode/win_rate_p{}", player),
+                        &format!("episode/win_rate_p{player}"),
                         win_rate,
                         global_step,
                     )?;
@@ -707,19 +709,19 @@ where
                 &optimizer,
                 &checkpoint_path,
             ) {
-                eprintln!("Warning: Failed to save optimizer state: {}", e);
+                eprintln!("Warning: Failed to save optimizer state: {e}");
             }
 
             // Save observation normalizer if enabled
             if let Some(ref norm) = obs_normalizer {
                 if let Err(e) = save_normalizer(norm, &checkpoint_path) {
-                    eprintln!("Warning: Failed to save normalizer: {}", e);
+                    eprintln!("Warning: Failed to save normalizer: {e}");
                 }
             }
 
             // Save RNG state for reproducible continuation
             if let Err(e) = save_rng_state(&mut rng, &checkpoint_path) {
-                eprintln!("Warning: Failed to save RNG state: {}", e);
+                eprintln!("Warning: Failed to save RNG state: {e}");
             }
 
             // Challenger evaluation for multiplayer games
@@ -773,8 +775,7 @@ where
                                     * 100.0;
                                 if eval_pct > 5.0 && !warned_challenger_eval_time {
                                     progress.println(&format!(
-                                        "Warning: Challenger evaluation took {:.1}% of checkpoint interval (consider reducing challenger_games)",
-                                        eval_pct
+                                        "Warning: Challenger evaluation took {eval_pct:.1}% of checkpoint interval (consider reducing challenger_games)"
                                     ));
                                     warned_challenger_eval_time = true;
                                 }
@@ -784,10 +785,7 @@ where
                             if result.should_promote {
                                 if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path)
                                 {
-                                    eprintln!(
-                                        "Warning: Failed to promote checkpoint to best: {}",
-                                        e
-                                    );
+                                    eprintln!("Warning: Failed to promote checkpoint to best: {e}");
                                 }
                             }
 
@@ -803,14 +801,14 @@ where
                             Some(result.win_rate)
                         }
                         Err(e) => {
-                            eprintln!("Warning: Challenger evaluation failed: {}", e);
+                            eprintln!("Warning: Challenger evaluation failed: {e}");
                             None
                         }
                     }
                 } else {
                     // First checkpoint - becomes best automatically
                     if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
-                        eprintln!("Warning: Failed to set initial best checkpoint: {}", e);
+                        eprintln!("Warning: Failed to set initial best checkpoint: {e}");
                     }
                     None
                 }
@@ -856,10 +854,7 @@ where
 
     if !recent_returns.is_empty() {
         let avg_return: f32 = recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
-        println!(
-            "Final average return (last 100 episodes): {:.1}",
-            avg_return
-        );
+        println!("Final average return (last 100 episodes): {avg_return:.1}");
     }
 
     Ok(())
@@ -868,7 +863,7 @@ where
 fn main() -> Result<()> {
     // Initialize rayon thread pool with named threads for Tracy
     rayon::ThreadPoolBuilder::new()
-        .thread_name(|idx| format!("Rayon-{}", idx))
+        .thread_name(|idx| format!("Rayon-{idx}"))
         .build_global()
         .expect("Failed to initialize rayon thread pool");
 
@@ -882,7 +877,7 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Command::Eval(eval_args)) => {
             let device = init_device();
-            return eval::run_evaluation::<TrainingBackend>(&eval_args, &device);
+            eval::run_evaluation::<TrainingBackend>(&eval_args, &device)
         }
         Some(Command::Train(args)) => {
             // Training mode with explicit subcommand
@@ -903,10 +898,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
         let run_dir = resume_path.clone();
         let checkpoint_dir = run_dir.join("checkpoints/latest");
         if !checkpoint_dir.exists() {
-            bail!(
-                "No checkpoint found at {:?}. Cannot resume.",
-                checkpoint_dir
-            );
+            bail!("No checkpoint found at {checkpoint_dir:?}. Cannot resume.");
         }
         TrainingMode::Resume {
             run_dir,
@@ -916,7 +908,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
         // Fork mode: new run from checkpoint
         let checkpoint_dir = fork_path.clone();
         if !checkpoint_dir.exists() {
-            bail!("Checkpoint not found at {:?}. Cannot fork.", checkpoint_dir);
+            bail!("Checkpoint not found at {checkpoint_dir:?}. Cannot fork.");
         }
         TrainingMode::Fork { checkpoint_dir }
     } else {
@@ -943,7 +935,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
             // Load config from the run directory
             let config_path = run_dir.join("config.toml");
             let mut config = Config::load_from_path(&config_path)
-                .with_context(|| format!("Failed to load config from {:?}", config_path))?;
+                .with_context(|| format!("Failed to load config from {config_path:?}"))?;
 
             // Apply limited resume overrides (only total_timesteps allowed)
             config.apply_resume_overrides(&args);
@@ -951,7 +943,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
             // Load checkpoint metadata
             let metadata_path = checkpoint_dir.join("metadata.json");
             let metadata_json = std::fs::read_to_string(&metadata_path)
-                .with_context(|| format!("Failed to read {:?}", metadata_path))?;
+                .with_context(|| format!("Failed to read {metadata_path:?}"))?;
             let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
 
             (config, run_dir.clone(), Some(metadata))
@@ -972,7 +964,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
             // Load checkpoint metadata
             let metadata_path = checkpoint_dir.join("metadata.json");
             let metadata_json = std::fs::read_to_string(&metadata_path)
-                .with_context(|| format!("Failed to read {:?}", metadata_path))?;
+                .with_context(|| format!("Failed to read {metadata_path:?}"))?;
             let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
 
             (config, run_dir, Some(metadata))
@@ -986,7 +978,7 @@ fn run_training_cli(args: CliArgs) -> Result<()> {
         TrainingMode::Fresh => println!("Mode: Fresh training"),
         TrainingMode::Resume { .. } => println!("Mode: Resuming from checkpoint"),
         TrainingMode::Fork { checkpoint_dir } => {
-            println!("Mode: Forking from {:?}", checkpoint_dir)
+            println!("Mode: Forking from {checkpoint_dir:?}");
         }
     }
     println!("Environment: {}", config.env);
@@ -1060,4 +1052,135 @@ fn ctrlc_handler(running: Arc<AtomicBool>) {
         running.store(false, Ordering::SeqCst);
     })
     .expect("Error setting Ctrl-C handler");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_extract_run_name_from_checkpoint_path_valid() {
+        let path = Path::new("runs/cartpole_001/checkpoints/best");
+        assert_eq!(
+            extract_run_name_from_checkpoint_path(path),
+            Some("cartpole_001".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_run_name_from_checkpoint_path_latest() {
+        let path = Path::new("runs/connect_four_42/checkpoints/latest");
+        assert_eq!(
+            extract_run_name_from_checkpoint_path(path),
+            Some("connect_four_42".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_run_name_from_checkpoint_path_step() {
+        let path = Path::new("runs/my_run/checkpoints/step_00010240");
+        assert_eq!(
+            extract_run_name_from_checkpoint_path(path),
+            Some("my_run".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_run_name_from_checkpoint_path_too_short() {
+        let path = Path::new("checkpoints/best");
+        assert_eq!(extract_run_name_from_checkpoint_path(path), None);
+    }
+
+    #[test]
+    fn test_extract_run_name_from_checkpoint_path_single() {
+        let path = Path::new("best");
+        assert_eq!(extract_run_name_from_checkpoint_path(path), None);
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_step_valid() {
+        let dir = tempdir().unwrap();
+        let best = dir.path().join("best");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("step_00010240", &best).unwrap();
+        #[cfg(unix)]
+        assert_eq!(get_best_checkpoint_step(&best), Some(10240));
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_step_different_step() {
+        let dir = tempdir().unwrap();
+        let best = dir.path().join("best");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("step_00000512", &best).unwrap();
+        #[cfg(unix)]
+        assert_eq!(get_best_checkpoint_step(&best), Some(512));
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_step_not_symlink() {
+        let dir = tempdir().unwrap();
+        let best = dir.path().join("best");
+        std::fs::create_dir(&best).unwrap();
+        assert_eq!(get_best_checkpoint_step(&best), None);
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_step_invalid_format() {
+        let dir = tempdir().unwrap();
+        let best = dir.path().join("best");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("invalid_name", &best).unwrap();
+        #[cfg(unix)]
+        assert_eq!(get_best_checkpoint_step(&best), None);
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_step_nonexistent() {
+        let dir = tempdir().unwrap();
+        let best = dir.path().join("nonexistent");
+        assert_eq!(get_best_checkpoint_step(&best), None);
+    }
+
+    #[test]
+    fn test_count_checkpoints_no_dir() {
+        let dir = tempdir().unwrap();
+        let run_dir = dir.path().join("nonexistent_run");
+        assert_eq!(count_checkpoints(&run_dir), 0);
+    }
+
+    #[test]
+    fn test_count_checkpoints_empty() {
+        let dir = tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        std::fs::create_dir_all(run_dir.join("checkpoints")).unwrap();
+        assert_eq!(count_checkpoints(&run_dir), 0);
+    }
+
+    #[test]
+    fn test_count_checkpoints_with_steps() {
+        let dir = tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        let checkpoints = run_dir.join("checkpoints");
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        std::fs::create_dir(checkpoints.join("step_00001024")).unwrap();
+        std::fs::create_dir(checkpoints.join("step_00002048")).unwrap();
+        std::fs::create_dir(checkpoints.join("step_00003072")).unwrap();
+        assert_eq!(count_checkpoints(&run_dir), 3);
+    }
+
+    #[test]
+    fn test_count_checkpoints_ignores_non_step() {
+        let dir = tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        let checkpoints = run_dir.join("checkpoints");
+        std::fs::create_dir_all(&checkpoints).unwrap();
+        std::fs::create_dir(checkpoints.join("step_00001024")).unwrap();
+        std::fs::create_dir(checkpoints.join("best")).unwrap();
+        std::fs::create_dir(checkpoints.join("latest")).unwrap();
+        std::fs::write(checkpoints.join("metadata.json"), "{}").unwrap();
+        assert_eq!(count_checkpoints(&run_dir), 1);
+    }
 }

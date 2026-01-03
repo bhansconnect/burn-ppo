@@ -1,0 +1,31 @@
+# Minimal config for fast E2E tests
+# Runs in ~1-2 seconds with 1 training update
+
+env = "cartpole"
+num_envs = 2
+num_steps = 8
+total_timesteps = 64
+num_epochs = 1
+num_minibatches = 1
+
+# Minimal network
+hidden_size = 16
+num_hidden = 1
+activation = "relu"
+
+# Standard hyperparameters
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+
+# Checkpoint frequently for testing
+checkpoint_freq = 32
+log_freq = 1000
+
+seed = 42
+run_dir = "runs"

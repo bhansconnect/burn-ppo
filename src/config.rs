@@ -61,9 +61,22 @@ pub struct TrainArgs {
 /// Arguments for evaluation
 #[derive(Parser, Debug)]
 pub struct EvalArgs {
-    /// Checkpoint paths (one per player)
-    #[arg(required = true)]
+    /// Checkpoint paths (one per player, use with --human and --random for mixed games)
+    #[arg(long = "checkpoint", short = 'c')]
     pub checkpoints: Vec<PathBuf>,
+
+    /// Human players (specify name for each human player)
+    /// Example: --human Alice --human Bob
+    #[arg(long = "human")]
+    pub humans: Vec<String>,
+
+    /// Add a random player (useful for baseline comparisons)
+    #[arg(long = "random")]
+    pub random: bool,
+
+    /// Environment name (required if no checkpoint provided)
+    #[arg(long = "env", short = 'e')]
+    pub env_name: Option<String>,
 
     /// Number of games to play
     #[arg(short = 'n', long, default_value = "100")]
@@ -123,7 +136,7 @@ pub enum NumEnvs {
 
 impl Default for NumEnvs {
     fn default() -> Self {
-        NumEnvs::Auto("auto".to_string())
+        Self::Auto("auto".to_string())
     }
 }
 
@@ -131,8 +144,8 @@ impl NumEnvs {
     pub fn resolve(&self) -> usize {
         match self {
             // 1x CPU cores (not 2x) - no async rollout/training overlap
-            NumEnvs::Auto(_) => num_cpus::get(),
-            NumEnvs::Explicit(n) => *n,
+            Self::Auto(_) => num_cpus::get(),
+            Self::Explicit(n) => *n,
         }
     }
 }
@@ -162,7 +175,7 @@ pub struct Config {
     #[serde(default = "default_entropy_coef")]
     pub entropy_coef: f64,
     /// Whether to anneal entropy coefficient over training
-    /// When true, decays from entropy_coef to 10% of initial value
+    /// When true, decays from `entropy_coef` to 10% of initial value
     #[serde(default)]
     pub entropy_anneal: bool,
     #[serde(default = "default_value_coef")]
@@ -170,7 +183,7 @@ pub struct Config {
     #[serde(default = "default_max_grad_norm")]
     pub max_grad_norm: f64,
     /// KL divergence threshold for early stopping (None = disabled)
-    /// If approx_kl exceeds this during an epoch, stop the epoch early.
+    /// If `approx_kl` exceeds this during an epoch, stop the epoch early.
     /// Typical values: 0.01-0.03, recommended 0.015-0.02
     #[serde(default)]
     pub target_kl: Option<f64>,
@@ -241,49 +254,49 @@ pub struct Config {
 }
 
 // Default value functions
-fn default_num_steps() -> usize {
+const fn default_num_steps() -> usize {
     128
 }
-fn default_learning_rate() -> f64 {
+const fn default_learning_rate() -> f64 {
     2.5e-4
 }
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
-fn default_gamma() -> f64 {
+const fn default_gamma() -> f64 {
     0.99
 }
-fn default_gae_lambda() -> f64 {
+const fn default_gae_lambda() -> f64 {
     0.95
 }
-fn default_clip_epsilon() -> f64 {
+const fn default_clip_epsilon() -> f64 {
     0.2
 }
-fn default_entropy_coef() -> f64 {
+const fn default_entropy_coef() -> f64 {
     0.01
 }
-fn default_value_coef() -> f64 {
+const fn default_value_coef() -> f64 {
     0.5
 }
-fn default_max_grad_norm() -> f64 {
+const fn default_max_grad_norm() -> f64 {
     0.5
 }
-fn default_total_timesteps() -> usize {
+const fn default_total_timesteps() -> usize {
     1_000_000
 }
-fn default_num_epochs() -> usize {
+const fn default_num_epochs() -> usize {
     4
 }
-fn default_num_minibatches() -> usize {
+const fn default_num_minibatches() -> usize {
     4
 }
-fn default_adam_epsilon() -> f64 {
+const fn default_adam_epsilon() -> f64 {
     1e-5
 }
-fn default_hidden_size() -> usize {
+const fn default_hidden_size() -> usize {
     64
 }
-fn default_num_hidden() -> usize {
+const fn default_num_hidden() -> usize {
     2
 }
 fn default_activation() -> String {
@@ -292,22 +305,22 @@ fn default_activation() -> String {
 fn default_run_dir() -> PathBuf {
     PathBuf::from("runs")
 }
-fn default_checkpoint_freq() -> usize {
+const fn default_checkpoint_freq() -> usize {
     10_000
 }
-fn default_log_freq() -> usize {
+const fn default_log_freq() -> usize {
     1_000
 }
-fn default_seed() -> u64 {
+const fn default_seed() -> u64 {
     42
 }
-fn default_challenger_games() -> usize {
+const fn default_challenger_games() -> usize {
     64
 }
-fn default_challenger_threshold() -> f64 {
+const fn default_challenger_threshold() -> f64 {
     0.55
 }
-fn default_challenger_temperature() -> f32 {
+const fn default_challenger_temperature() -> f32 {
     0.3
 }
 
@@ -361,16 +374,17 @@ impl Config {
     /// The `forked_from` parameter is set when forking from another run
     pub fn load(args: &CliArgs, forked_from: Option<String>) -> Result<Self> {
         // Load base config - fail if file doesn't exist
+        let config_path = args.config.display();
         let content = fs::read_to_string(&args.config)
-            .with_context(|| format!("Config file not found: {:?}", args.config))?;
-        let mut config: Config = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config: {:?}", args.config))?;
+            .with_context(|| format!("Config file not found: {config_path}"))?;
+        let mut config: Self = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse config: {config_path}"))?;
 
         // Apply CLI overrides
         config.apply_cli_overrides(args);
 
         // Store forked_from relationship
-        config.forked_from = forked_from.clone();
+        config.forked_from.clone_from(&forked_from);
 
         // For fork mode, always generate child name (ignore --run-name if specified)
         if forked_from.is_some() {
@@ -390,15 +404,16 @@ impl Config {
 
     /// Load config from a specific TOML file path
     pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
+        let path_display = path.display();
         let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config: {:?}", path))?;
-        toml::from_str(&content).with_context(|| format!("Failed to parse config: {:?}", path))
+            .with_context(|| format!("Failed to read config: {path_display}"))?;
+        toml::from_str(&content).with_context(|| format!("Failed to parse config: {path_display}"))
     }
 
     /// Apply all CLI overrides to this config
     fn apply_cli_overrides(&mut self, args: &CliArgs) {
         if let Some(env) = &args.env {
-            self.env = env.clone();
+            self.env.clone_from(env);
         }
         if let Some(n) = args.num_envs {
             self.num_envs = NumEnvs::Explicit(n);
@@ -416,13 +431,13 @@ impl Config {
             self.run_name = Some(name.clone());
         }
         if let Some(activation) = &args.activation {
-            self.activation = activation.clone();
+            self.activation.clone_from(activation);
         }
     }
 
     /// Apply limited CLI overrides for resume mode
     ///
-    /// When resuming, we only allow extending total_timesteps.
+    /// When resuming, we only allow extending `total_timesteps`.
     /// Other parameters are locked to the original run config.
     pub fn apply_resume_overrides(&mut self, args: &CliArgs) {
         // Only allow extending training duration
@@ -449,8 +464,15 @@ impl Config {
     }
 
     /// Get the full path to the run directory
+    ///
+    /// # Panics
+    /// Panics if `run_name` is None (should be set during `load()`)
     pub fn run_path(&self) -> PathBuf {
-        self.run_dir.join(self.run_name.as_ref().unwrap())
+        self.run_dir.join(
+            self.run_name
+                .as_ref()
+                .expect("run_name should be set during Config::load()"),
+        )
     }
 
     /// Get resolved number of environments
@@ -493,10 +515,7 @@ impl Config {
         let batch_size = self.num_steps * self.num_envs();
         let minibatch_size = batch_size / self.num_minibatches;
         if minibatch_size < 4 {
-            bail!(
-                "minibatch_size {} too small, increase num_steps or num_envs",
-                minibatch_size
-            );
+            bail!("minibatch_size {minibatch_size} too small, increase num_steps or num_envs");
         }
 
         // Validate activation function
@@ -513,8 +532,8 @@ impl Config {
 
 /// Extract the global counter from a run name
 ///
-/// Handles both standard names like "cartpole_001" and
-/// child names like "cartpole_003_child_001"
+/// Handles both standard names like "`cartpole_001`" and
+/// child names like "`cartpole_003_child_001`"
 fn extract_run_counter(name: &str) -> Option<u32> {
     let parts: Vec<&str> = name.split('_').collect();
 
@@ -540,7 +559,7 @@ fn find_next_global_counter(run_dir: &std::path::Path, env: &str) -> u32 {
         for entry in entries.filter_map(Result::ok) {
             if let Some(name) = entry.file_name().to_str() {
                 // Only consider runs for this environment
-                if !name.starts_with(&format!("{}_", env)) {
+                if !name.starts_with(&format!("{env}_")) {
                     continue;
                 }
                 // Skip child runs when finding global counter
@@ -560,7 +579,7 @@ fn find_next_global_counter(run_dir: &std::path::Path, env: &str) -> u32 {
 /// Find the next available child counter for a specific parent run
 fn find_next_child_counter(run_dir: &std::path::Path, parent_name: &str) -> u32 {
     let mut max_counter: u32 = 0;
-    let prefix = format!("{}_child_", parent_name);
+    let prefix = format!("{parent_name}_child_");
 
     if let Ok(entries) = std::fs::read_dir(run_dir) {
         for entry in entries.filter_map(Result::ok) {
@@ -586,7 +605,7 @@ fn find_next_child_counter(run_dir: &std::path::Path, parent_name: &str) -> u32 
 fn generate_run_name(config: &Config, forked_from: Option<&str>) -> String {
     if let Some(parent_name) = forked_from {
         let child_counter = find_next_child_counter(&config.run_dir, parent_name);
-        format!("{}_child_{:03}", parent_name, child_counter)
+        format!("{parent_name}_child_{child_counter:03}")
     } else {
         let counter = find_next_global_counter(&config.run_dir, &config.env);
         format!("{}_{:03}", config.env, counter)
@@ -625,15 +644,19 @@ mod tests {
 
     #[test]
     fn test_config_validate_bad_lr() {
-        let mut config = Config::default();
-        config.learning_rate = -0.1;
+        let config = Config {
+            learning_rate: -0.1,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn test_config_validate_bad_gamma() {
-        let mut config = Config::default();
-        config.gamma = 1.5;
+        let config = Config {
+            gamma: 1.5,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

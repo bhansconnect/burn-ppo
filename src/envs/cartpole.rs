@@ -1,13 +1,13 @@
-/// CartPole environment - classic control task
+/// `CartPole` environment - classic control task
 ///
-/// Physics based on OpenAI Gym CartPole-v1
+/// Physics based on `OpenAI` Gym CartPole-v1
 /// Goal: Balance a pole on a cart by pushing left or right
 use rand::Rng;
 
 use crate::env::Environment;
 use crate::profile::profile_function;
 
-/// CartPole physics constants (matching OpenAI Gym)
+/// `CartPole` physics constants (matching `OpenAI` Gym)
 const GRAVITY: f32 = 9.8;
 const CART_MASS: f32 = 1.0;
 const POLE_MASS: f32 = 0.1;
@@ -22,7 +22,7 @@ const X_THRESHOLD: f32 = 2.4;
 const THETA_THRESHOLD: f32 = 12.0 * std::f32::consts::PI / 180.0; // 12 degrees
 const MAX_STEPS: usize = 500;
 
-/// CartPole state
+/// `CartPole` state
 #[derive(Debug, Clone)]
 pub struct CartPole {
     /// Cart position
@@ -40,8 +40,8 @@ pub struct CartPole {
 }
 
 impl CartPole {
-    /// Get current state for rendering: [x, x_dot, theta, theta_dot]
-    pub fn state(&self) -> [f32; 4] {
+    /// Get current state for rendering: [x, `x_dot`, theta, `theta_dot`]
+    pub const fn state(&self) -> [f32; 4] {
         [self.x, self.x_dot, self.theta, self.theta_dot]
     }
 
@@ -51,8 +51,9 @@ impl CartPole {
         let sin_theta = self.theta.sin();
 
         // Equations of motion (derived from Lagrangian mechanics)
-        let temp = (force + POLE_MASS_LENGTH * self.theta_dot.powi(2) * sin_theta) / TOTAL_MASS;
-        let theta_acc = (GRAVITY * sin_theta - cos_theta * temp)
+        let temp =
+            (POLE_MASS_LENGTH * self.theta_dot.powi(2)).mul_add(sin_theta, force) / TOTAL_MASS;
+        let theta_acc = GRAVITY.mul_add(sin_theta, -(cos_theta * temp))
             / (POLE_HALF_LENGTH * (4.0 / 3.0 - POLE_MASS * cos_theta.powi(2) / TOTAL_MASS));
         let x_acc = temp - POLE_MASS_LENGTH * theta_acc * cos_theta / TOTAL_MASS;
 
@@ -128,9 +129,7 @@ impl Environment for CartPole {
         let cart_center = margin + (x_normalized * usable_width as f32) as usize;
 
         // Draw track
-        for x in 0..WIDTH {
-            buffer[TRACK][x] = '═';
-        }
+        buffer[TRACK].fill('═');
 
         // Draw cart body
         let cart_left = cart_center.saturating_sub(CART_WIDTH / 2);
@@ -143,9 +142,7 @@ impl Environment for CartPole {
         if cart_right < WIDTH {
             buffer[CART_TOP][cart_right] = '┐';
         }
-        for x in (cart_left + 1)..cart_right {
-            buffer[CART_TOP][x] = '─';
-        }
+        buffer[CART_TOP][(cart_left + 1)..cart_right].fill('─');
 
         // Bottom of cart: └───────┘
         if cart_left < WIDTH {
@@ -154,9 +151,7 @@ impl Environment for CartPole {
         if cart_right < WIDTH {
             buffer[CART_BOTTOM][cart_right] = '┘';
         }
-        for x in (cart_left + 1)..cart_right {
-            buffer[CART_BOTTOM][x] = '─';
-        }
+        buffer[CART_BOTTOM][(cart_left + 1)..cart_right].fill('─');
 
         // Wheels on track: ═══○═══○═══
         let wheel_offset = 2;
@@ -290,6 +285,22 @@ impl Environment for CartPole {
         };
 
         (self.get_obs(), vec![reward], done)
+    }
+
+    fn describe_action(&self, action: usize) -> String {
+        match action {
+            0 => "Push left".to_string(),
+            1 => "Push right".to_string(),
+            _ => format!("Action {action}"),
+        }
+    }
+
+    fn parse_action(&self, input: &str) -> Result<usize, String> {
+        match input.trim().to_lowercase().as_str() {
+            "left" | "l" | "0" => Ok(0),
+            "right" | "r" | "1" => Ok(1),
+            _ => Err("Enter 'left' or 'right' (or 'l'/'r')".to_string()),
+        }
     }
 }
 
@@ -456,8 +467,7 @@ mod tests {
         output
             .lines()
             .nth(line_idx)
-            .map(|line| line.contains(ch))
-            .unwrap_or(false)
+            .is_some_and(|line| line.contains(ch))
     }
 
     #[test]
@@ -507,14 +517,12 @@ mod tests {
         let right =
             find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
 
-        let cart_center = (left + right) / 2;
-        let expected_center = 30; // WIDTH/2
+        let cart_center = usize::midpoint(left, right);
+        let expected_center: usize = 30; // WIDTH/2
 
         assert!(
             (cart_center as i32 - expected_center as i32).abs() <= 2,
-            "Cart should be centered. Found center at {}, expected ~{}",
-            cart_center,
-            expected_center
+            "Cart should be centered. Found center at {cart_center}, expected ~{expected_center}"
         );
     }
 
@@ -533,8 +541,7 @@ mod tests {
         // Cart should be near left margin (around column 7-10)
         assert!(
             left < 15,
-            "Cart at x=-2.4 should be on left side. Found at column {}",
-            left
+            "Cart at x=-2.4 should be on left side. Found at column {left}"
         );
     }
 
@@ -554,8 +561,7 @@ mod tests {
         // Cart should be near right side (column > 45 for WIDTH=60)
         assert!(
             right > 45,
-            "Cart at x=2.4 should be on right side. Found at column {}",
-            right
+            "Cart at x=2.4 should be on right side. Found at column {right}"
         );
     }
 
@@ -579,8 +585,7 @@ mod tests {
         for line_idx in 3..=6 {
             assert!(
                 line_contains(&output, line_idx, '│'),
-                "Line {} should have vertical pole segment (│)",
-                line_idx
+                "Line {line_idx} should have vertical pole segment (│)"
             );
         }
     }
@@ -599,8 +604,7 @@ mod tests {
         let pole_area: String = output.lines().skip(2).take(5).collect();
         assert!(
             pole_area.contains('╱'),
-            "Pole leaning right (θ=+10°) should have ╱ character.\nPole area:\n{}",
-            pole_area
+            "Pole leaning right (θ=+10°) should have ╱ character.\nPole area:\n{pole_area}"
         );
 
         // Should still have ball at top
@@ -624,8 +628,7 @@ mod tests {
         let pole_area: String = output.lines().skip(2).take(5).collect();
         assert!(
             pole_area.contains('╲'),
-            "Pole leaning left (θ=-10°) should have ╲ character.\nPole area:\n{}",
-            pole_area
+            "Pole leaning left (θ=-10°) should have ╲ character.\nPole area:\n{pole_area}"
         );
 
         // Should still have ball at top
@@ -673,7 +676,7 @@ mod tests {
         let scale_line = output.lines().last().expect("Scale line missing");
 
         assert!(scale_line.contains("-2.4"), "Scale should show -2.4 marker");
-        assert!(scale_line.contains("0"), "Scale should show 0 marker");
+        assert!(scale_line.contains('0'), "Scale should show 0 marker");
         assert!(scale_line.contains("2.4"), "Scale should show 2.4 marker");
     }
 
@@ -692,12 +695,11 @@ mod tests {
         let left = find_char_col(&output, cart_line_idx, '┌').expect("Cart left corner not found");
         let right =
             find_char_col(&output, cart_line_idx, '┐').expect("Cart right corner not found");
-        let cart_center = (left + right) / 2;
+        let cart_center = usize::midpoint(left, right);
 
         assert!(
             cart_center > 30,
-            "Cart at x=1.0 should be right of center. Found at column {}",
-            cart_center
+            "Cart at x=1.0 should be right of center. Found at column {cart_center}"
         );
 
         // Ball should be present

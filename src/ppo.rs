@@ -1,10 +1,14 @@
-/// PPO Algorithm Implementation
-///
-/// Implements Proximal Policy Optimization with all 13 details from the ICLR blog:
-/// - Vectorized architecture, orthogonal init, Adam epsilon 1e-5
-/// - Learning rate annealing, GAE, minibatch shuffled updates
-/// - Advantage normalization, clipped surrogate, value clipping
-/// - Combined loss, gradient clipping
+//! PPO Algorithm Implementation
+//!
+//! Implements Proximal Policy Optimization with all 13 details from the ICLR blog:
+//! - Vectorized architecture, orthogonal init, Adam epsilon 1e-5
+//! - Learning rate annealing, GAE, minibatch shuffled updates
+//! - Advantage normalization, clipped surrogate, value clipping
+//! - Combined loss, gradient clipping
+
+// Tensor operations use expect/unwrap for internal invariants that cannot fail
+// when tensor shapes are correct (which is guaranteed by construction)
+
 use burn::optim::GradientsParams;
 use burn::prelude::*;
 use burn::tensor::Int;
@@ -22,36 +26,36 @@ use crate::utils::{
 
 /// Stores trajectory data from environment rollouts
 ///
-/// Shape: [num_steps, num_envs] for most fields
+/// Shape: [`num_steps`, `num_envs`] for most fields
 /// For multi-player games, also stores per-player values and rewards.
 #[derive(Debug)]
 pub struct RolloutBuffer<B: Backend> {
-    /// Observations [num_steps, num_envs, obs_dim]
+    /// Observations [`num_steps`, `num_envs`, `obs_dim`]
     pub observations: Tensor<B, 3>,
-    /// Actions taken [num_steps, num_envs]
+    /// Actions taken [`num_steps`, `num_envs`]
     pub actions: Tensor<B, 2, Int>,
-    /// Rewards for acting player [num_steps, num_envs]
+    /// Rewards for acting player [`num_steps`, `num_envs`]
     pub rewards: Tensor<B, 2>,
-    /// Episode done flags [num_steps, num_envs]
+    /// Episode done flags [`num_steps`, `num_envs`]
     pub dones: Tensor<B, 2>,
-    /// Value estimates for acting player [num_steps, num_envs]
+    /// Value estimates for acting player [`num_steps`, `num_envs`]
     pub values: Tensor<B, 2>,
-    /// Log probabilities of actions [num_steps, num_envs]
+    /// Log probabilities of actions [`num_steps`, `num_envs`]
     pub log_probs: Tensor<B, 2>,
 
     // Multi-player support fields
-    /// Values for ALL players [num_steps, num_envs, num_players]
+    /// Values for ALL players [`num_steps`, `num_envs`, `num_players`]
     pub all_values: Tensor<B, 3>,
-    /// Rewards for ALL players [num_steps, num_envs, num_players]
+    /// Rewards for ALL players [`num_steps`, `num_envs`, `num_players`]
     pub all_rewards: Tensor<B, 3>,
-    /// Which player acted each step [num_steps, num_envs]
+    /// Which player acted each step [`num_steps`, `num_envs`]
     pub acting_players: Tensor<B, 2, Int>,
     /// Number of players (max 255)
     num_players: u8,
 
-    /// GAE advantages (computed after rollout) [num_steps, num_envs]
+    /// GAE advantages (computed after rollout) [`num_steps`, `num_envs`]
     pub advantages: Option<Tensor<B, 2>>,
-    /// Returns (values + advantages) [num_steps, num_envs]
+    /// Returns (values + advantages) [`num_steps`, `num_envs`]
     pub returns: Option<Tensor<B, 2>>,
 }
 
@@ -85,13 +89,16 @@ impl<B: Backend> RolloutBuffer<B> {
     }
 
     /// Get number of players (max 255)
-    pub fn num_players(&self) -> u8 {
+    pub const fn num_players(&self) -> u8 {
         self.num_players
     }
 
     /// Flatten buffer for minibatch processing
-    /// Returns (obs, actions, old_log_probs, advantages, returns, acting_players)
-    /// Each with shape [num_steps * num_envs, ...]
+    /// Returns (obs, actions, `old_log_probs`, advantages, returns, `acting_players`)
+    /// Each with shape [`num_steps` * `num_envs`, ...]
+    ///
+    /// # Panics
+    /// Panics if `compute_gae` was not called first (advantages/returns not set)
     pub fn flatten(
         &self,
     ) -> (
@@ -128,7 +135,7 @@ impl<B: Backend> RolloutBuffer<B> {
 
 /// Collect rollouts from vectorized environment
 ///
-/// Runs num_steps in each of num_envs environments, storing trajectories.
+/// Runs `num_steps` in each of `num_envs` environments, storing trajectories.
 /// Uses CPU collection with batch GPU transfer for performance.
 /// If normalizer is provided, observations are normalized before model inference
 /// using existing (lagged) statistics, then stats are updated at end of rollout.
@@ -311,7 +318,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 /// Compute Generalized Advantage Estimation
 ///
 /// GAE(gamma, lambda) = sum_{t'>=t} (gamma*lambda)^{t'-t} * delta_{t'}
-/// where delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+/// where `delta_t` = `r_t` + gamma * V(s_{t+1}) - `V(s_t)`
 pub fn compute_gae<B: Backend>(
     buffer: &mut RolloutBuffer<B>,
     last_values: Tensor<B, 1>,
@@ -352,10 +359,10 @@ pub fn compute_gae<B: Backend>(
             };
 
             // TD error: delta = r + gamma * V(s') * (1 - done) - V(s)
-            let delta = reward + gamma * next_value * (1.0 - done) - value;
+            let delta = (gamma * next_value).mul_add(1.0 - done, reward) - value;
 
             // GAE: A_t = delta_t + gamma * lambda * (1 - done) * A_{t+1}
-            last_gae[e] = delta + gamma * gae_lambda * (1.0 - done) * last_gae[e];
+            last_gae[e] = (gamma * gae_lambda * (1.0 - done)).mul_add(last_gae[e], delta);
             advantages[idx] = last_gae[e];
         }
     }
@@ -433,17 +440,15 @@ pub fn compute_gae_multiplayer<B: Backend>(
             reward_carry[e][acting_player] = 0.0;
 
             // Accumulate other players' rewards (they'll get credited when they next act)
-            for p in 0..num_players {
+            for (p, carry) in reward_carry[e].iter_mut().enumerate() {
                 if p != acting_player {
-                    reward_carry[e][p] += all_rewards_data[(t * num_envs + e) * num_players + p];
+                    *carry += all_rewards_data[(t * num_envs + e) * num_players + p];
                 }
             }
 
             // Reset on episode boundary
             if done > 0.5 {
-                for p in 0..num_players {
-                    reward_carry[e][p] = 0.0;
-                }
+                reward_carry[e].fill(0.0);
             }
         }
     }
@@ -470,10 +475,11 @@ pub fn compute_gae_multiplayer<B: Backend>(
             let done = dones_data[idx];
 
             // TD error using this player's next value
-            let delta = reward + gamma * next_value[e][player] * (1.0 - done) - value;
+            let delta = (gamma * next_value[e][player]).mul_add(1.0 - done, reward) - value;
 
             // GAE for this player
-            let advantage = delta + gamma * gae_lambda * (1.0 - done) * gae_carry[e][player];
+            let advantage =
+                (gamma * gae_lambda * (1.0 - done)).mul_add(gae_carry[e][player], delta);
             advantages[idx] = advantage;
 
             // Update carry for this player
@@ -482,10 +488,8 @@ pub fn compute_gae_multiplayer<B: Backend>(
 
             // Reset all players' GAE carry on episode boundary
             if done > 0.5 {
-                for p in 0..num_players {
-                    gae_carry[e][p] = 0.0;
-                    next_value[e][p] = 0.0;
-                }
+                gae_carry[e].fill(0.0);
+                next_value[e].fill(0.0);
             }
         }
     }
@@ -620,6 +624,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_advantages = normalize_advantages(mb_advantages_raw);
 
             // Forward pass with GPU sync for accurate timing
+            #[allow(clippy::let_and_return, reason = "scoped for profiling")]
             let (logits, all_values) = {
                 profile_scope!("minibatch_forward");
                 let result = model.forward(mb_obs);
@@ -751,13 +756,16 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             };
 
             // Optimizer step with GPU sync for accurate timing
-            model = {
-                profile_scope!("optimizer_step");
-                let grads = GradientsParams::from_grads(grads, &model);
-                let updated = optimizer.step(learning_rate.into(), model, grads);
-                gpu_sync!(updated.layers[0].weight.val()); // Force sync after weight update
-                updated
-            };
+            #[allow(clippy::let_and_return, reason = "scoped for profiling")]
+            {
+                model = {
+                    profile_scope!("optimizer_step");
+                    let grads = GradientsParams::from_grads(grads, &model);
+                    let updated = optimizer.step(learning_rate, model, grads);
+                    gpu_sync!(updated.layers[0].weight.val()); // Force sync after weight update
+                    updated
+                };
+            }
 
             // Batched metric extraction - single GPU sync instead of 8
             {
@@ -963,5 +971,62 @@ mod tests {
         assert_eq!(advantages.dims(), [8]);
         assert_eq!(returns.dims(), [8]);
         assert_eq!(acting_players.dims(), [8]);
+    }
+
+    #[test]
+    fn test_explained_variance_perfect_prediction() {
+        // Values perfectly predict returns
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let returns = vec![1.0, 2.0, 3.0, 4.0];
+        let ev = compute_explained_variance(&values, &returns);
+        assert!((ev - 1.0).abs() < 1e-5, "Expected 1.0, got {ev}");
+    }
+
+    #[test]
+    fn test_explained_variance_zero_correlation() {
+        // Values have no correlation with returns
+        let values = vec![0.0, 0.0, 0.0, 0.0];
+        let returns = vec![1.0, 2.0, 3.0, 4.0];
+        let ev = compute_explained_variance(&values, &returns);
+        // With zero mean values, explained variance should be negative
+        // since residuals will have higher variance than returns
+        assert!(ev < 1.0, "Expected < 1.0, got {ev}");
+    }
+
+    #[test]
+    fn test_explained_variance_constant_returns() {
+        // Returns have no variance
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+        let returns = vec![2.5, 2.5, 2.5, 2.5];
+        let ev = compute_explained_variance(&values, &returns);
+        // Should return 0 since var(returns) is near zero
+        assert!((ev - 0.0).abs() < 1e-5, "Expected 0.0, got {ev}");
+    }
+
+    #[test]
+    fn test_explained_variance_single_element() {
+        // Too few elements
+        let values = vec![1.0];
+        let returns = vec![1.0];
+        let ev = compute_explained_variance(&values, &returns);
+        assert!((ev - 0.0).abs() < 1e-5, "Expected 0.0 for single element");
+    }
+
+    #[test]
+    fn test_explained_variance_empty() {
+        let values: Vec<f32> = vec![];
+        let returns: Vec<f32> = vec![];
+        let ev = compute_explained_variance(&values, &returns);
+        assert!((ev - 0.0).abs() < 1e-5, "Expected 0.0 for empty input");
+    }
+
+    #[test]
+    fn test_explained_variance_partial_prediction() {
+        // Values partially predict returns
+        let values = vec![1.0, 2.5, 3.0, 4.5];
+        let returns = vec![1.0, 2.0, 3.0, 4.0];
+        let ev = compute_explained_variance(&values, &returns);
+        // Should be positive but less than 1
+        assert!(ev > 0.0 && ev < 1.0, "Expected 0 < ev < 1, got {ev}");
     }
 }

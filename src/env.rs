@@ -1,11 +1,11 @@
-/// Environment trait and VecEnv parallel wrapper
+/// Environment trait and `VecEnv` parallel wrapper
 use rayon::prelude::*;
 use std::collections::VecDeque;
 
 use crate::profile::{profile_function, profile_scope};
 
 /// Game outcome for evaluation - who won/placed where
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GameOutcome {
     /// Single winner (player index)
     Winner(usize),
@@ -36,7 +36,7 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// Reset environment and return initial observation
     fn reset(&mut self) -> Vec<f32>;
 
-    /// Take action and return (observation, rewards[NUM_PLAYERS], done)
+    /// Take action and return (observation, rewards[`NUM_PLAYERS`], done)
     ///
     /// For multi-player games:
     /// - observation: player-agnostic (same encoding for all players)
@@ -44,7 +44,7 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// - done: true if episode ended
     fn step(&mut self, action: usize) -> (Vec<f32>, Vec<f32>, bool);
 
-    /// Current player index (0..NUM_PLAYERS). Default 0 for single-agent.
+    /// Current player index (`0..NUM_PLAYERS`). Default 0 for single-agent.
     fn current_player(&self) -> usize {
         0
     }
@@ -55,8 +55,8 @@ pub trait Environment: Send + Sync + Sized + 'static {
     }
 
     /// Return explicit game outcome when episode is done.
-    /// Override this if using reward shaping where total_rewards doesn't reflect outcome.
-    /// Default: None (infer from total_rewards via argmax)
+    /// Override this if using reward shaping where `total_rewards` doesn't reflect outcome.
+    /// Default: None (infer from `total_rewards` via argmax)
     fn game_outcome(&self) -> Option<GameOutcome> {
         None
     }
@@ -66,12 +66,27 @@ pub trait Environment: Send + Sync + Sized + 'static {
     fn render(&self) -> Option<String> {
         None
     }
+
+    /// Human-readable description of an action (e.g., "Column 3" for Connect Four).
+    /// Used for human player input prompts.
+    fn describe_action(&self, action: usize) -> String {
+        format!("Action {action}")
+    }
+
+    /// Parse human input string to action index.
+    /// Returns Ok(action) or Err(help message).
+    fn parse_action(&self, input: &str) -> Result<usize, String> {
+        input
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("Enter action number 0-{}", Self::ACTION_COUNT - 1))
+    }
 }
 
 /// Episode statistics for completed episodes
 #[derive(Debug, Clone)]
 pub struct EpisodeStats {
-    /// Total reward per player [NUM_PLAYERS]
+    /// Total reward per player [`NUM_PLAYERS`]
     pub total_rewards: Vec<f32>,
     pub length: usize,
     /// Which environment index this episode came from
@@ -89,8 +104,8 @@ impl EpisodeStats {
 
 /// Compute win rates and draw rate from a collection of game outcomes
 ///
-/// Returns (win_rates[player], draw_rate) where win_rates[i] is the fraction
-/// of games won by player i, and draw_rate is the fraction of games that were draws.
+/// Returns (`win_rates`[player], `draw_rate`) where `win_rates`[i] is the fraction
+/// of games won by player i, and `draw_rate` is the fraction of games that were draws.
 pub fn compute_outcome_rates(
     outcomes: &VecDeque<GameOutcome>,
     num_players: usize,
@@ -136,23 +151,23 @@ pub fn compute_outcome_rates(
 /// on episode termination.
 pub struct VecEnv<E: Environment> {
     envs: Vec<E>,
-    /// Pre-allocated flat observation buffer [num_envs * obs_dim]
+    /// Pre-allocated flat observation buffer [`num_envs` * `obs_dim`]
     obs_buffer: Vec<f32>,
-    /// Accumulated rewards per env, per player [num_envs][num_players] (reset on episode end)
+    /// Accumulated rewards per env, per player [`num_envs`][num_players] (reset on episode end)
     episode_rewards: Vec<Vec<f32>>,
     /// Steps taken per env (reset on episode end)
     episode_lengths: Vec<usize>,
-    /// Envs in terminal state (won't step or reset) [num_envs]
+    /// Envs in terminal state (won't step or reset) [`num_envs`]
     terminal: Vec<bool>,
 }
 
 impl<E: Environment> VecEnv<E> {
-    /// Create VecEnv from a factory function
+    /// Create `VecEnv` from a factory function
     pub fn new<F>(num_envs: usize, factory: F) -> Self
     where
         F: Fn(usize) -> E,
     {
-        let mut envs: Vec<E> = (0..num_envs).map(|i| factory(i)).collect();
+        let mut envs: Vec<E> = (0..num_envs).map(factory).collect();
 
         // Pre-allocate flat observation buffer and initialize with reset observations
         let mut obs_buffer = vec![0.0; num_envs * E::OBSERVATION_DIM];
@@ -172,21 +187,21 @@ impl<E: Environment> VecEnv<E> {
     }
 
     /// Number of parallel environments
-    pub fn num_envs(&self) -> usize {
+    pub const fn num_envs(&self) -> usize {
         self.envs.len()
     }
 
-    /// Get current observations as flat array [num_envs * obs_dim]
+    /// Get current observations as flat array [`num_envs` * `obs_dim`]
     pub fn get_observations(&self) -> Vec<f32> {
         self.obs_buffer.clone()
     }
 
-    /// Get current player index for each environment (0..NUM_PLAYERS)
+    /// Get current player index for each environment (`0..NUM_PLAYERS`)
     pub fn get_current_players(&self) -> Vec<usize> {
-        self.envs.iter().map(|e| e.current_player()).collect()
+        self.envs.iter().map(Environment::current_player).collect()
     }
 
-    /// Get action masks for all environments, flattened [num_envs * action_count]
+    /// Get action masks for all environments, flattened [`num_envs` * `action_count`]
     /// Returns None if environment doesn't support action masking.
     pub fn get_action_masks(&self) -> Option<Vec<bool>> {
         // Check first env for masking support
@@ -220,10 +235,10 @@ impl<E: Environment> VecEnv<E> {
     /// Step all environments with given actions
     ///
     /// Returns:
-    /// - observations: [num_envs, obs_dim] flattened
-    /// - all_rewards: [num_envs][num_players] - rewards for ALL players per env
-    /// - dones: [num_envs]
-    /// - completed_episodes: stats for any episodes that finished this step
+    /// - observations: [`num_envs`, `obs_dim`] flattened
+    /// - `all_rewards`: [`num_envs`][num_players] - rewards for ALL players per env
+    /// - dones: [`num_envs`]
+    /// - `completed_episodes`: stats for any episodes that finished this step
     pub fn step(
         &mut self,
         actions: &[usize],
@@ -318,7 +333,7 @@ impl<E: Environment> VecEnv<E> {
 mod tests {
     use super::*;
 
-    /// Simple test environment: counter that terminates at MAX_STEPS
+    /// Simple test environment: counter that terminates at `MAX_STEPS`
     struct CounterEnv<const MAX_STEPS: usize> {
         count: usize,
     }
