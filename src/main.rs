@@ -688,12 +688,13 @@ where
                 rng_seed: config.seed,
                 best_avg_return: Some(checkpoint_manager.best_avg_return()),
                 recent_returns: recent_returns.clone(),
+                forked_from: config.forked_from.clone(),
                 obs_dim,
                 action_count,
                 num_players: num_players as usize,
                 hidden_size: config.hidden_size,
                 num_hidden: config.num_hidden,
-                forked_from: config.forked_from.clone(),
+                activation: config.activation.clone(),
                 env_name: E::NAME.to_string(),
             };
 

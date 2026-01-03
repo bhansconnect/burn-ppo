@@ -19,6 +19,9 @@ use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
 
 /// Training metadata saved alongside model weights
+///
+/// All network architecture fields are required - old checkpoints without
+/// these fields will fail to load (by design, to prevent silent mismatches).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMetadata {
     pub step: usize,
@@ -31,42 +34,24 @@ pub struct CheckpointMetadata {
     /// Last 100 episode returns for smoothed metrics
     #[serde(default)]
     pub recent_returns: Vec<f32>,
-    /// Observation dimension (for generic model loading)
-    #[serde(default)]
-    pub obs_dim: usize,
-    /// Action count (for generic model loading)
-    #[serde(default)]
-    pub action_count: usize,
-    /// Number of players (for value head dimension)
-    #[serde(default = "default_num_players")]
-    pub num_players: usize,
-    /// Hidden layer size (for network reconstruction)
-    #[serde(default = "default_hidden_size")]
-    pub hidden_size: usize,
-    /// Number of hidden layers (for network reconstruction)
-    #[serde(default = "default_num_hidden")]
-    pub num_hidden: usize,
     /// Parent run name if this run was forked from another
     #[serde(default)]
     pub forked_from: Option<String>,
+    // --- Required fields (no defaults) ---
+    /// Observation dimension (for generic model loading)
+    pub obs_dim: usize,
+    /// Action count (for generic model loading)
+    pub action_count: usize,
+    /// Number of players (for value head dimension)
+    pub num_players: usize,
+    /// Hidden layer size (for network reconstruction)
+    pub hidden_size: usize,
+    /// Number of hidden layers (for network reconstruction)
+    pub num_hidden: usize,
+    /// Activation function (for network reconstruction)
+    pub activation: String,
     /// Environment name for dispatching at eval time
-    #[serde(default)]
     pub env_name: String,
-}
-
-/// Default num_players for backward compatibility with older checkpoints
-fn default_num_players() -> usize {
-    1
-}
-
-/// Default hidden_size for backward compatibility with older checkpoints
-fn default_hidden_size() -> usize {
-    64
-}
-
-/// Default num_hidden for backward compatibility with older checkpoints
-fn default_num_hidden() -> usize {
-    2
 }
 
 /// Manages checkpointing for a training run
@@ -142,36 +127,28 @@ impl CheckpointManager {
 
     /// Load a checkpoint from a directory
     ///
-    /// Note: config is needed to initialize the model structure before loading weights
+    /// Note: config is needed to initialize the model structure before loading weights.
+    /// Old checkpoints without required metadata fields will fail to deserialize.
     pub fn load<B: burn::tensor::backend::Backend>(
         checkpoint_dir: &Path,
         config: &Config,
         device: &B::Device,
     ) -> Result<(ActorCritic<B>, CheckpointMetadata)> {
-        // Load metadata
+        // Load metadata - deserialization fails if required fields are missing
         let metadata_path = checkpoint_dir.join("metadata.json");
         let metadata_json =
             fs::read_to_string(&metadata_path).context("Failed to read checkpoint metadata")?;
-        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)?;
+        let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)
+            .context("Failed to parse checkpoint metadata (missing required fields?)")?;
 
-        // Use dimensions from metadata if available, otherwise fall back to CartPole defaults
-        let obs_dim = if metadata.obs_dim > 0 {
-            metadata.obs_dim
-        } else {
-            4
-        };
-        let action_count = if metadata.action_count > 0 {
-            metadata.action_count
-        } else {
-            2
-        };
-        let num_players = if metadata.num_players > 0 {
-            metadata.num_players
-        } else {
-            1
-        };
-        let default_model: ActorCritic<B> =
-            ActorCritic::new(obs_dim, action_count, num_players, config, device);
+        // Use dimensions directly from metadata (required fields, no fallbacks)
+        let default_model: ActorCritic<B> = ActorCritic::new(
+            metadata.obs_dim,
+            metadata.action_count,
+            metadata.num_players,
+            config,
+            device,
+        );
 
         // Load model using Burn's recorder
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
@@ -399,12 +376,13 @@ mod tests {
             rng_seed: 42,
             best_avg_return: Some(150.0),
             recent_returns: vec![140.0, 150.0, 160.0],
+            forked_from: None,
             obs_dim: 4,
             action_count: 2,
             num_players: 1,
             hidden_size: 64,
             num_hidden: 2,
-            forked_from: None,
+            activation: "tanh".to_string(),
             env_name: "cartpole".to_string(),
         };
 
@@ -446,12 +424,13 @@ mod tests {
                     rng_seed: 42,
                     best_avg_return: Some(100.0),
                     recent_returns: vec![100.0],
+                    forked_from: None,
                     obs_dim: 4,
                     action_count: 2,
                     num_players: 1,
                     hidden_size: 64,
                     num_hidden: 2,
-                    forked_from: None,
+                    activation: "tanh".to_string(),
                     env_name: "cartpole".to_string(),
                 },
                 true,
@@ -468,12 +447,13 @@ mod tests {
                     rng_seed: 42,
                     best_avg_return: Some(200.0),
                     recent_returns: vec![100.0, 200.0],
+                    forked_from: None,
                     obs_dim: 4,
                     action_count: 2,
                     num_players: 1,
                     hidden_size: 64,
                     num_hidden: 2,
-                    forked_from: None,
+                    activation: "tanh".to_string(),
                     env_name: "cartpole".to_string(),
                 },
                 true,
@@ -490,12 +470,13 @@ mod tests {
                     rng_seed: 42,
                     best_avg_return: Some(200.0),
                     recent_returns: vec![100.0, 200.0, 150.0],
+                    forked_from: None,
                     obs_dim: 4,
                     action_count: 2,
                     num_players: 1,
                     hidden_size: 64,
                     num_hidden: 2,
-                    forked_from: None,
+                    activation: "tanh".to_string(),
                     env_name: "cartpole".to_string(),
                 },
                 true,
@@ -512,18 +493,8 @@ mod tests {
     }
 
     #[test]
-    fn test_default_hidden_size() {
-        assert_eq!(default_hidden_size(), 64);
-    }
-
-    #[test]
-    fn test_default_num_hidden() {
-        assert_eq!(default_num_hidden(), 2);
-    }
-
-    #[test]
-    fn test_backward_compat_deserialize_old_checkpoint_metadata() {
-        // Simulate old checkpoint JSON without new fields
+    fn test_old_checkpoint_without_required_fields_fails() {
+        // Old checkpoint JSON missing required fields should fail to deserialize
         let old_json = r#"{
             "step": 5000,
             "avg_return": 100.0,
@@ -535,23 +506,14 @@ mod tests {
             "num_players": 1
         }"#;
 
-        let metadata: CheckpointMetadata = serde_json::from_str(old_json).unwrap();
-
-        // Verify defaults are applied for missing fields
-        assert_eq!(metadata.hidden_size, 64); // default
-        assert_eq!(metadata.num_hidden, 2); // default
-        assert_eq!(metadata.env_name, ""); // default for String
-        assert!(metadata.forked_from.is_none());
-
-        // Verify existing fields loaded correctly
-        assert_eq!(metadata.step, 5000);
-        assert_eq!(metadata.obs_dim, 4);
-        assert_eq!(metadata.action_count, 2);
+        // This should fail because hidden_size, num_hidden, activation, env_name are missing
+        let result: Result<CheckpointMetadata, _> = serde_json::from_str(old_json);
+        assert!(result.is_err(), "Old checkpoint without required fields should fail to deserialize");
     }
 
     #[test]
-    fn test_backward_compat_with_partial_new_fields() {
-        // Simulate checkpoint with some new fields but not all
+    fn test_checkpoint_with_partial_fields_fails() {
+        // Checkpoint with some new fields but not all should fail
         let partial_json = r#"{
             "step": 5000,
             "avg_return": 100.0,
@@ -561,32 +523,30 @@ mod tests {
             "obs_dim": 4,
             "action_count": 2,
             "num_players": 1,
-            "hidden_size": 128
+            "hidden_size": 128,
+            "num_hidden": 2
         }"#;
 
-        let metadata: CheckpointMetadata = serde_json::from_str(partial_json).unwrap();
-
-        // Specified field should be loaded
-        assert_eq!(metadata.hidden_size, 128);
-        // Missing fields should use defaults
-        assert_eq!(metadata.num_hidden, 2);
-        assert_eq!(metadata.env_name, "");
+        // This should fail because activation and env_name are missing
+        let result: Result<CheckpointMetadata, _> = serde_json::from_str(partial_json);
+        assert!(result.is_err(), "Checkpoint with partial fields should fail to deserialize");
     }
 
     #[test]
-    fn test_metadata_roundtrip_with_new_fields() {
+    fn test_metadata_roundtrip_with_all_fields() {
         let metadata = CheckpointMetadata {
             step: 1000,
             avg_return: 150.0,
             rng_seed: 42,
             best_avg_return: Some(150.0),
             recent_returns: vec![140.0, 150.0],
+            forked_from: Some("parent_run".to_string()),
             obs_dim: 86,
             action_count: 7,
             num_players: 2,
             hidden_size: 256,
             num_hidden: 3,
-            forked_from: Some("parent_run".to_string()),
+            activation: "relu".to_string(),
             env_name: "connect_four".to_string(),
         };
 
@@ -595,6 +555,7 @@ mod tests {
 
         assert_eq!(loaded.hidden_size, 256);
         assert_eq!(loaded.num_hidden, 3);
+        assert_eq!(loaded.activation, "relu");
         assert_eq!(loaded.env_name, "connect_four");
         assert_eq!(loaded.forked_from, Some("parent_run".to_string()));
     }

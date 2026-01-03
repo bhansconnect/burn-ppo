@@ -139,8 +139,7 @@ impl NumEnvs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    // Environment
-    #[serde(default = "default_env")]
+    // Environment (required - must be specified in TOML config)
     pub env: String,
     #[serde(default)]
     pub num_envs: NumEnvs,
@@ -242,9 +241,6 @@ pub struct Config {
 }
 
 // Default value functions
-fn default_env() -> String {
-    "cartpole".to_string()
-}
 fn default_num_steps() -> usize {
     128
 }
@@ -316,9 +312,11 @@ fn default_challenger_temperature() -> f32 {
 }
 
 impl Default for Config {
+    /// Default config for testing purposes.
+    /// Note: `env` must be specified in TOML configs for actual training.
     fn default() -> Self {
         Self {
-            env: default_env(),
+            env: "cartpole".to_string(), // For tests only
             num_envs: NumEnvs::default(),
             num_steps: default_num_steps(),
             learning_rate: default_learning_rate(),
