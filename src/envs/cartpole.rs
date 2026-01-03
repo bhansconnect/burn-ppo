@@ -41,6 +41,7 @@ pub struct CartPole {
 
 impl CartPole {
     /// Get current state for rendering: [x, `x_dot`, theta, `theta_dot`]
+    #[cfg(test)]
     pub const fn state(&self) -> [f32; 4] {
         [self.x, self.x_dot, self.theta, self.theta_dot]
     }

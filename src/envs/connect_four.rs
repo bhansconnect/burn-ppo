@@ -92,6 +92,7 @@ impl ConnectFour {
     }
 
     /// Get list of valid action indices (non-full columns)
+    #[cfg(test)]
     pub fn valid_actions(&self) -> Vec<usize> {
         (0..COLS)
             .filter(|&col| self.board[0][col] == Cell::Empty)

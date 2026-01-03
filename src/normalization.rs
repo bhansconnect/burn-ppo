@@ -76,7 +76,7 @@ impl ObsNormalizer {
 
     /// Normalize a single observation, returning a new Vec
     ///
-    /// Note: Training uses `normalize_batch()`. Reserved for single-observation inference.
+    /// Used for single-observation inference (eval mode). Training uses `normalize_batch()`.
     pub fn normalize(&self, obs: &[f32]) -> Vec<f32> {
         // Need at least 2 samples for meaningful variance
         if self.count < 2.0 {
@@ -95,6 +95,7 @@ impl ObsNormalizer {
     }
 
     /// Get the observation dimension
+    #[cfg(test)]
     pub const fn obs_dim(&self) -> usize {
         self.mean.len()
     }

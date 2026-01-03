@@ -109,6 +109,7 @@ impl<B: Backend> ActorCritic<B> {
     }
 
     /// Get number of players (value head output dimension)
+    #[cfg(test)]
     pub const fn num_players(&self) -> usize {
         self.num_players
     }

@@ -21,12 +21,13 @@ use burn::tensor::Tensor;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::checkpoint::{CheckpointManager, CheckpointMetadata};
+use crate::checkpoint::{load_normalizer, CheckpointManager, CheckpointMetadata};
 use crate::config::{Config, EvalArgs};
 use crate::dispatch_env;
 use crate::env::{Environment, GameOutcome, VecEnv};
 use crate::human::{prompt_human_action, random_valid_action};
 use crate::network::ActorCritic;
+use crate::normalization::ObsNormalizer;
 use crate::profile::profile_function;
 
 /// Source of actions for a player slot.
@@ -46,11 +47,6 @@ impl PlayerSource {
     /// Returns true if this source requires terminal interaction
     pub const fn is_human(&self) -> bool {
         matches!(self, Self::Human { .. })
-    }
-
-    /// Returns true if this source is a network checkpoint
-    pub const fn is_checkpoint(&self) -> bool {
-        matches!(self, Self::Checkpoint(_))
     }
 
     /// Display name for this player source
@@ -551,10 +547,13 @@ fn ordinal(n: usize) -> String {
 }
 
 /// Load a model from a checkpoint directory
+///
+/// Returns the model, metadata, and optional normalizer (if the checkpoint was trained with
+/// observation normalization enabled).
 fn load_model_from_checkpoint<B: Backend>(
     checkpoint_path: &Path,
     device: &B::Device,
-) -> Result<(ActorCritic<B>, CheckpointMetadata)> {
+) -> Result<(ActorCritic<B>, CheckpointMetadata, Option<ObsNormalizer>)> {
     // Load metadata to get network dimensions
     let metadata_path = checkpoint_path.join("metadata.json");
     let metadata_json =
@@ -571,7 +570,10 @@ fn load_model_from_checkpoint<B: Backend>(
     // Load model
     let (model, _) = CheckpointManager::load::<B>(checkpoint_path, &config, device)?;
 
-    Ok((model, metadata))
+    // Load normalizer if it exists (trained with normalize_obs=true)
+    let normalizer = load_normalizer(checkpoint_path)?;
+
+    Ok((model, metadata, normalizer))
 }
 
 /// Run challenger evaluation: current model vs best checkpoint
@@ -582,6 +584,7 @@ fn load_model_from_checkpoint<B: Backend>(
 /// Returns a `ChallengerResult` indicating whether the current model should be promoted.
 pub fn run_challenger_eval<B: Backend, E: Environment>(
     current_model: &ActorCritic<B>,
+    current_normalizer: Option<&ObsNormalizer>,
     best_checkpoint_path: &Path,
     num_games: usize,
     threshold: f64,
@@ -593,18 +596,20 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     let start = Instant::now();
     let num_players = E::NUM_PLAYERS;
 
-    // Load best checkpoint model
+    // Load best checkpoint model and normalizer
     let best_config = Config {
         hidden_size: config.hidden_size,
         num_hidden: config.num_hidden,
         ..Config::default()
     };
     let (best_model, _) = CheckpointManager::load::<B>(best_checkpoint_path, &best_config, device)?;
+    let best_normalizer = load_normalizer(best_checkpoint_path)?;
 
     // Setup models and checkpoint mapping
     // models = [new, best], checkpoint_to_model = [0, 1, 1, 1, ...]
     // This means: checkpoint 0 = new model, checkpoints 1..N-1 = best model
     let models = vec![current_model.clone(), best_model];
+    let normalizers = vec![current_normalizer.cloned(), best_normalizer];
     let checkpoint_to_model: Vec<usize> = (0..num_players).map(|i| usize::from(i != 0)).collect();
     let names: Vec<String> = (0..num_players)
         .map(|i| if i == 0 { "new".into() } else { "best".into() })
@@ -623,6 +628,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     let mut rng = StdRng::seed_from_u64(seed);
     let stats = run_stats_mode_env::<B, E>(
         &models,
+        &normalizers,
         &checkpoint_to_model,
         &names,
         num_games,
@@ -693,6 +699,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
 
     // Original checkpoint-only flow below
     let mut models: Vec<ActorCritic<B>> = Vec::new();
+    let mut normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
     let mut path_to_model_idx: HashMap<std::path::PathBuf, usize> = HashMap::new();
     let mut checkpoint_to_model: Vec<usize> = Vec::new();
     let mut checkpoint_names = Vec::new();
@@ -713,7 +720,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
         let model_idx = if let Some(&idx) = path_to_model_idx.get(&resolved) {
             idx
         } else {
-            let (model, metadata) = load_model_from_checkpoint::<B>(&resolved, device)?;
+            let (model, metadata, normalizer) = load_model_from_checkpoint::<B>(&resolved, device)?;
 
             // Store first metadata for environment info
             if let Some(first) = &metadata_opt {
@@ -733,6 +740,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
 
             let idx = models.len();
             models.push(model);
+            normalizers.push(normalizer);
             path_to_model_idx.insert(resolved, idx);
             idx
         };
@@ -776,6 +784,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     if watch {
         run_watch_mode::<B>(
             &models,
+            &normalizers,
             &checkpoint_to_model,
             &checkpoint_names,
             &metadata,
@@ -786,6 +795,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     } else {
         run_stats_mode::<B>(
             &models,
+            &normalizers,
             &checkpoint_to_model,
             &checkpoint_names,
             &metadata,
@@ -806,7 +816,7 @@ fn run_interactive_evaluation<B: Backend>(
 
     // Determine environment from first checkpoint or from --env arg
     let env_name = if let Some(first_checkpoint) = args.checkpoints.first() {
-        let (_, metadata) = load_model_from_checkpoint::<B>(first_checkpoint, device)?;
+        let (_, metadata, _) = load_model_from_checkpoint::<B>(first_checkpoint, device)?;
         metadata.env_name
     } else if let Some(env) = &args.env_name {
         env.clone()
@@ -817,9 +827,11 @@ fn run_interactive_evaluation<B: Backend>(
         );
     };
 
-    // Load models for checkpoint players
+    // Load models and normalizers for checkpoint players
     let mut models: Vec<Option<ActorCritic<B>>> = Vec::new();
-    let mut path_to_model: HashMap<std::path::PathBuf, ActorCritic<B>> = HashMap::new();
+    let mut normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
+    let mut path_to_model: HashMap<std::path::PathBuf, (ActorCritic<B>, Option<ObsNormalizer>)> =
+        HashMap::new();
 
     for source in player_sources {
         match source {
@@ -834,15 +846,19 @@ fn run_interactive_evaluation<B: Backend>(
                     path.clone()
                 };
 
-                // Load model (with deduplication)
+                // Load model and normalizer (with deduplication)
                 if !path_to_model.contains_key(&resolved) {
-                    let (model, _) = load_model_from_checkpoint::<B>(&resolved, device)?;
-                    path_to_model.insert(resolved.clone(), model);
+                    let (model, _, normalizer) =
+                        load_model_from_checkpoint::<B>(&resolved, device)?;
+                    path_to_model.insert(resolved.clone(), (model, normalizer));
                 }
-                models.push(Some(path_to_model.get(&resolved).unwrap().clone()));
+                let (model, normalizer) = path_to_model.get(&resolved).unwrap();
+                models.push(Some(model.clone()));
+                normalizers.push(normalizer.clone());
             }
             PlayerSource::Human { .. } | PlayerSource::Random => {
                 models.push(None);
+                normalizers.push(None);
             }
         }
     }
@@ -875,6 +891,7 @@ fn run_interactive_evaluation<B: Backend>(
         run_interactive_game::<B, E>(
             player_sources,
             &models,
+            &normalizers,
             num_games,
             &temp_schedule,
             &mut rng,
@@ -886,6 +903,7 @@ fn run_interactive_evaluation<B: Backend>(
 /// Run evaluation in watch mode (sequential, with rendering)
 fn run_watch_mode<B: Backend>(
     models: &[ActorCritic<B>],
+    normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     metadata: &CheckpointMetadata,
@@ -901,6 +919,7 @@ fn run_watch_mode<B: Backend>(
     dispatch_env!(metadata.env_name, {
         run_watch_mode_env::<B, E>(
             models,
+            normalizers,
             checkpoint_to_model,
             checkpoint_names,
             num_games,
@@ -917,6 +936,7 @@ fn run_watch_mode<B: Backend>(
 /// Watch mode implementation for a specific environment type
 fn run_watch_mode_env<B: Backend, E: Environment>(
     models: &[ActorCritic<B>],
+    normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     num_games: usize,
@@ -951,11 +971,17 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
             // In watch mode, checkpoint_idx == player_idx (no position swapping)
             let model_idx = checkpoint_to_model[current_player];
             let model = &models[model_idx];
+            let normalizer = &normalizers[model_idx];
             let mask = env.action_mask();
 
-            // Get action from model
-            let obs_tensor: Tensor<B, 2> =
-                Tensor::<B, 1>::from_floats(&obs[..], device).reshape([1, E::OBSERVATION_DIM]);
+            // Get action from model (normalize if checkpoint was trained with normalize_obs)
+            let obs_for_model = if let Some(norm) = normalizer {
+                norm.normalize(&obs)
+            } else {
+                obs.clone()
+            };
+            let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
+                .reshape([1, E::OBSERVATION_DIM]);
             let (logits, _) = model.forward(obs_tensor);
             let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
 
@@ -1056,6 +1082,7 @@ fn wait_for_enter() {
 pub fn run_interactive_game<B: Backend, E: Environment>(
     player_sources: &[PlayerSource],
     models: &[Option<ActorCritic<B>>],
+    normalizers: &[Option<ObsNormalizer>],
     num_games: usize,
     temp_schedule: &TempSchedule,
     rng: &mut StdRng,
@@ -1115,8 +1142,13 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
             let action = match player_source {
                 PlayerSource::Human { name } => {
                     // Build hint closure from any available network
-                    let hint: Option<Box<dyn Fn() -> usize>> =
-                        build_hint_closure::<B, E>(models, &current_obs, mask.as_deref(), device);
+                    let hint: Option<Box<dyn Fn() -> usize>> = build_hint_closure::<B, E>(
+                        models,
+                        normalizers,
+                        &current_obs,
+                        mask.as_deref(),
+                        device,
+                    );
 
                     prompt_human_action(
                         &env,
@@ -1137,13 +1169,19 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                     action
                 }
                 PlayerSource::Checkpoint(_) => {
-                    // Network action
+                    // Network action (normalize if checkpoint was trained with normalize_obs)
                     let model = models[current_player]
                         .as_ref()
                         .expect("Model should be loaded for checkpoint player");
+                    let normalizer = &normalizers[current_player];
 
+                    let obs_for_model = if let Some(norm) = normalizer {
+                        norm.normalize(&current_obs)
+                    } else {
+                        current_obs.clone()
+                    };
                     let obs_tensor: Tensor<B, 2> =
-                        Tensor::<B, 1>::from_floats(&current_obs[..], device)
+                        Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
                             .reshape([1, E::OBSERVATION_DIM]);
                     let (logits, _) = model.forward(obs_tensor);
                     let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
@@ -1208,19 +1246,26 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
 /// Build a hint closure from any available network model
 fn build_hint_closure<'a, B: Backend, E: Environment>(
     models: &'a [Option<ActorCritic<B>>],
+    normalizers: &'a [Option<ObsNormalizer>],
     obs: &[f32],
     mask: Option<&[bool]>,
     device: &B::Device,
 ) -> Option<Box<dyn Fn() -> usize + 'a>> {
-    // Find first available network
-    let (_model_idx, model) = models
+    // Find first available network and its normalizer
+    let (model_idx, model) = models
         .iter()
         .enumerate()
         .find_map(|(i, m)| m.as_ref().map(|m| (i, m)))?;
+    let normalizer = &normalizers[model_idx];
 
-    // Compute action now (closure captures the result)
+    // Compute action now (normalize if checkpoint was trained with normalize_obs)
+    let obs_for_model = if let Some(norm) = normalizer {
+        norm.normalize(obs)
+    } else {
+        obs.to_vec()
+    };
     let obs_tensor: Tensor<B, 2> =
-        Tensor::<B, 1>::from_floats(obs, device).reshape([1, E::OBSERVATION_DIM]);
+        Tensor::<B, 1>::from_floats(&obs_for_model[..], device).reshape([1, E::OBSERVATION_DIM]);
     let (logits, _) = model.forward(obs_tensor);
     let logits_vec: Vec<f32> = logits.to_data().to_vec().unwrap();
 
@@ -1234,6 +1279,7 @@ fn build_hint_closure<'a, B: Backend, E: Environment>(
 /// Run evaluation in stats mode (parallel)
 fn run_stats_mode<B: Backend>(
     models: &[ActorCritic<B>],
+    normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     metadata: &CheckpointMetadata,
@@ -1250,6 +1296,7 @@ fn run_stats_mode<B: Backend>(
     dispatch_env!(metadata.env_name, {
         run_stats_mode_env::<B, E>(
             models,
+            normalizers,
             checkpoint_to_model,
             checkpoint_names,
             num_games,
@@ -1269,6 +1316,7 @@ fn run_stats_mode<B: Backend>(
 /// Returns `EvalStats` for further processing.
 fn run_stats_mode_env<B: Backend, E: Environment>(
     models: &[ActorCritic<B>],
+    normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
     num_games: usize,
@@ -1357,10 +1405,18 @@ fn run_stats_mode_env<B: Backend, E: Environment>(
                 continue;
             }
 
-            // Batch inference for this model
+            // Batch inference for this model (normalize if checkpoint was trained with normalize_obs)
             let batch_size = env_indices.len();
-            let obs_tensor: Tensor<B, 2> =
-                Tensor::<B, 1>::from_floats(&env_obs[..], device).reshape([batch_size, obs_dim]);
+            let normalizer = &normalizers[model_idx];
+            let obs_for_model = if let Some(norm) = normalizer {
+                let mut obs_copy = env_obs.clone();
+                norm.normalize_batch(&mut obs_copy, obs_dim);
+                obs_copy
+            } else {
+                env_obs.clone()
+            };
+            let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
+                .reshape([batch_size, obs_dim]);
             let (logits_tensor, _) = model.forward(obs_tensor.clone());
             let logits_flat: Vec<f32> = logits_tensor.to_data().to_vec().unwrap();
 

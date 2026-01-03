@@ -1,4 +1,5 @@
-#![deny(warnings)]
+#![cfg_attr(not(test), deny(warnings))]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 #![recursion_limit = "256"]
 
 mod backend;
@@ -731,6 +732,7 @@ where
                     // Run challenger evaluation
                     match run_challenger_eval::<TrainingBackend, E>(
                         &model,
+                        obs_normalizer.as_ref(),
                         &best_path,
                         config.challenger_games,
                         config.challenger_threshold,

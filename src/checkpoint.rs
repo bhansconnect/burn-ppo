@@ -157,31 +157,6 @@ impl CheckpointManager {
 
         Ok((model, metadata))
     }
-
-    /// Get the path to the latest checkpoint, if any
-    ///
-    /// Note: Currently unused in training. Reserved for future inference mode.
-    pub fn latest_checkpoint(&self) -> Option<PathBuf> {
-        let latest = self.checkpoints_dir.join("latest");
-        if latest.exists() {
-            fs::read_link(&latest).ok()
-        } else {
-            None
-        }
-    }
-
-    /// Get the path to the best checkpoint, if any
-    ///
-    /// Note: Currently unused in training. Reserved for future inference mode.
-    pub fn best_checkpoint(&self) -> Option<PathBuf> {
-        let best = self.checkpoints_dir.join("best");
-        if best.exists() {
-            fs::read_link(&best).ok()
-        } else {
-            None
-        }
-    }
-
     /// Get the current best average return
     pub const fn best_avg_return(&self) -> f32 {
         self.best_avg_return
@@ -387,9 +362,9 @@ mod tests {
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
         assert!(checkpoint_path.exists());
 
-        // Verify latest symlink
-        let latest = manager.latest_checkpoint();
-        assert!(latest.is_some());
+        // Verify latest symlink exists
+        let latest_symlink = dir.path().join("checkpoints/latest");
+        assert!(latest_symlink.exists(), "latest symlink should exist");
 
         // Load and verify
         let (loaded_model, loaded_metadata) =
@@ -482,12 +457,14 @@ mod tests {
             .unwrap();
 
         // Verify best points to step 2000
-        let best = manager.best_checkpoint().unwrap();
-        assert!(best.to_string_lossy().contains("step_00002000"));
+        let best_symlink = dir.path().join("checkpoints/best");
+        let best_target = fs::read_link(&best_symlink).unwrap();
+        assert!(best_target.to_string_lossy().contains("step_00002000"));
 
         // Verify latest points to step 3000
-        let latest = manager.latest_checkpoint().unwrap();
-        assert!(latest.to_string_lossy().contains("step_00003000"));
+        let latest_symlink = dir.path().join("checkpoints/latest");
+        let latest_target = fs::read_link(&latest_symlink).unwrap();
+        assert!(latest_target.to_string_lossy().contains("step_00003000"));
     }
 
     #[test]

@@ -12,11 +12,6 @@ pub struct TrainingProgress {
 }
 
 impl TrainingProgress {
-    /// Create new progress display
-    pub fn new(total_steps: u64) -> Self {
-        Self::new_with_players(total_steps, 1)
-    }
-
     /// Create progress display with player count for multiplayer games
     pub fn new_with_players(total_steps: u64, num_players: usize) -> Self {
         let main_bar = ProgressBar::new(total_steps);
