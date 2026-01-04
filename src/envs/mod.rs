@@ -1,8 +1,10 @@
 pub mod cartpole;
 pub mod connect_four;
+pub mod liars_dice;
 
 pub use cartpole::CartPole;
 pub use connect_four::ConnectFour;
+pub use liars_dice::LiarsDice;
 
 /// Dispatch to the correct environment type based on `env_name`.
 /// Uses compile-time monomorphization for zero runtime overhead.
@@ -27,9 +29,13 @@ macro_rules! dispatch_env {
                 type E = $crate::envs::ConnectFour;
                 $callback
             }
+            "liars_dice" => {
+                type E = $crate::envs::LiarsDice;
+                $callback
+            }
             _ => {
                 anyhow::bail!(
-                    "Unknown environment: '{}'. Supported: cartpole, connect_four",
+                    "Unknown environment: '{}'. Supported: cartpole, connect_four, liars_dice",
                     name
                 )
             }
@@ -52,9 +58,13 @@ macro_rules! dispatch_env_ok {
                 type E = $crate::envs::ConnectFour;
                 Ok($callback)
             }
+            "liars_dice" => {
+                type E = $crate::envs::LiarsDice;
+                Ok($callback)
+            }
             _ => {
                 anyhow::bail!(
-                    "Unknown environment: '{}'. Supported: cartpole, connect_four",
+                    "Unknown environment: '{}'. Supported: cartpole, connect_four, liars_dice",
                     name
                 )
             }
@@ -82,6 +92,11 @@ mod tests {
 
     fn dispatch_connect_four() -> anyhow::Result<&'static str> {
         let name = "connect_four".to_string();
+        crate::dispatch_env!(name, Ok(get_env_name::<E>()))
+    }
+
+    fn dispatch_liars_dice() -> anyhow::Result<&'static str> {
+        let name = "liars_dice".to_string();
         crate::dispatch_env!(name, Ok(get_env_name::<E>()))
     }
 
@@ -113,9 +128,16 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_env_liars_dice() {
+        let result = dispatch_liars_dice();
+        assert_eq!(result.unwrap(), "liars_dice");
+    }
+
+    #[test]
     fn test_dispatch_env_gets_correct_obs_dim() {
         assert_eq!(dispatch_get_obs_dim("cartpole").unwrap(), 4); // CartPole has 4-dim observation
         assert_eq!(dispatch_get_obs_dim("connect_four").unwrap(), 86); // ConnectFour: 42*2 + 2
+        assert_eq!(dispatch_get_obs_dim("liars_dice").unwrap(), 78); // LiarsDice: 78-dim observation
     }
 
     #[test]
