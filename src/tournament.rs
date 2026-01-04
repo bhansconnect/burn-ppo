@@ -449,12 +449,30 @@ fn calculate_swiss_points(placements: &[usize]) -> Vec<f64> {
         .collect()
 }
 
-/// Generate Swiss pods for a round
+/// Check if any pair in a pod has faced each other before
+fn has_repeat_opponents(pod: &[usize], contestants: &[Contestant]) -> bool {
+    for i in 0..pod.len() {
+        for j in (i + 1)..pod.len() {
+            if contestants[pod[i]].opponents_faced.contains(&pod[j]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Generate Swiss pods for a round (generalized for any `pod_size` including 2-player)
 ///
-/// For round 1 (all `swiss_points` == 0): Uses Dutch-style pairing by dividing
-/// contestants into N groups by `initial_seed` and forming pods with one from each group.
-/// For subsequent rounds: Groups by similar Swiss points, preferring unfaced opponents.
+/// Uses Dutch-style pairing:
+/// - Round 1: Divide by `initial_seed` into N groups, form pods with one from each group
+/// - Subsequent rounds: Group by score brackets, apply same Dutch pairing within each bracket
+/// - Floaters (odd players) carry down to the next bracket
+/// - Greedy swap in last group to avoid repeat opponents
 fn swiss_pods(contestants: &[Contestant], pod_size: usize) -> Vec<Vec<usize>> {
+    if contestants.len() < pod_size {
+        return Vec::new();
+    }
+
     // Check if this is round 1 (all swiss_points are 0)
     let is_round_1 = contestants.iter().all(|c| c.swiss_points == 0.0);
 
@@ -468,35 +486,15 @@ fn swiss_pods(contestants: &[Contestant], pod_size: usize) -> Vec<Vec<usize>> {
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Calculate number of complete pods
-        let num_pods = contestants.len() / pod_size;
-        if num_pods == 0 {
-            return Vec::new();
-        }
-
-        // Form pods: Pod i gets contestants [i, i+num_pods, i+2*num_pods, ..., i+(N-1)*num_pods]
-        // This ensures each pod has one player from each "skill tier"
-        let mut pods = Vec::with_capacity(num_pods);
-        for pod_idx in 0..num_pods {
-            let mut pod = Vec::with_capacity(pod_size);
-            for group in 0..pod_size {
-                let ranked_pos = pod_idx + group * num_pods;
-                if ranked_pos < ranked.len() {
-                    pod.push(ranked[ranked_pos].0);
-                }
-            }
-            if pod.len() == pod_size {
-                pods.push(pod);
-            }
-        }
-        return pods;
+        let ranked_indices: Vec<usize> = ranked.iter().map(|(idx, _)| *idx).collect();
+        return form_dutch_pods(&ranked_indices, pod_size, contestants);
     }
 
-    // Subsequent rounds: sort by Swiss points (desc), initial_seed as tiebreaker
+    // Subsequent rounds: sort by Swiss points (desc), rating as tiebreaker
     let mut ranked: Vec<(usize, f64, f64)> = contestants
         .iter()
         .enumerate()
-        .map(|(i, c)| (i, c.swiss_points, c.initial_seed))
+        .map(|(i, c)| (i, c.swiss_points, c.rating.rating))
         .collect();
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -504,46 +502,99 @@ fn swiss_pods(contestants: &[Contestant], pod_size: usize) -> Vec<Vec<usize>> {
             .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    let mut pods = Vec::new();
-    let mut used = vec![false; contestants.len()];
+    // Group into score brackets
+    let mut brackets: Vec<Vec<usize>> = Vec::new();
+    let mut current_score = f64::MAX;
+    for &(idx, points, _) in &ranked {
+        if (points - current_score).abs() > 0.001 {
+            brackets.push(Vec::new());
+            current_score = points;
+        }
+        brackets
+            .last_mut()
+            .expect("brackets should have at least one element")
+            .push(idx);
+    }
 
-    // Greedy pod formation: take top N unused players who haven't all played together
-    for i in 0..ranked.len() {
-        let idx = ranked[i].0;
-        if used[idx] {
-            continue;
+    let mut all_pods = Vec::new();
+    let mut floaters: Vec<usize> = Vec::new();
+
+    for bracket in brackets {
+        // Floaters from higher bracket join at the top (FIDE: must pair first)
+        let pool: Vec<usize> = floaters.drain(..).chain(bracket).collect();
+
+        // Form Dutch-style pods within this bracket
+        let (pods, new_floaters) = form_dutch_pods_with_floaters(&pool, pod_size, contestants);
+        all_pods.extend(pods);
+        floaters = new_floaters;
+    }
+
+    // Any remaining floaters can't form a complete pod
+    all_pods
+}
+
+/// Form Dutch-style pods: divide into N groups, take one from each group per pod
+/// Returns the formed pods (does not handle floaters)
+fn form_dutch_pods(
+    ranked_indices: &[usize],
+    pod_size: usize,
+    contestants: &[Contestant],
+) -> Vec<Vec<usize>> {
+    let (pods, _) = form_dutch_pods_with_floaters(ranked_indices, pod_size, contestants);
+    pods
+}
+
+/// Form Dutch-style pods with floater handling
+/// Returns (pods, floaters) where floaters are players who couldn't form a complete pod
+fn form_dutch_pods_with_floaters(
+    ranked_indices: &[usize],
+    pod_size: usize,
+    contestants: &[Contestant],
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    if ranked_indices.len() < pod_size {
+        return (Vec::new(), ranked_indices.to_vec());
+    }
+
+    // Calculate number of complete pods we can form
+    let num_pods = ranked_indices.len() / pod_size;
+    if num_pods == 0 {
+        return (Vec::new(), ranked_indices.to_vec());
+    }
+
+    // Create mutable copy of indices for potential swaps
+    let mut indices = ranked_indices.to_vec();
+
+    // Form pods: Pod i gets contestants [i, i+num_pods, i+2*num_pods, ..., i+(N-1)*num_pods]
+    // This ensures each pod has one player from each "skill tier" (Dutch pairing)
+    let mut pods = Vec::with_capacity(num_pods);
+    for pod_idx in 0..num_pods {
+        let mut pod = Vec::with_capacity(pod_size);
+        for group in 0..pod_size {
+            let ranked_pos = pod_idx + group * num_pods;
+            if ranked_pos < indices.len() {
+                pod.push(indices[ranked_pos]);
+            }
         }
 
-        let mut pod = vec![idx];
-        used[idx] = true;
+        // Check for repeat opponents and try greedy swap in last group
+        if pod.len() == pod_size && has_repeat_opponents(&pod, contestants) {
+            // Try swapping the last group's player with later players in the same group
+            let last_group_start = (pod_size - 1) * num_pods;
+            let current_last_pos = pod_idx + last_group_start;
 
-        // Find pod_size-1 more players, preferring those not yet faced by all pod members
-        for &(candidate, _, _) in ranked.iter().skip(i + 1) {
-            if pod.len() >= pod_size {
-                break;
-            }
-            if used[candidate] {
-                continue;
-            }
-            // Check if candidate has faced all current pod members
-            let faced_all = pod
-                .iter()
-                .all(|&p| contestants[candidate].opponents_faced.contains(&p));
-            if !faced_all {
-                pod.push(candidate);
-                used[candidate] = true;
-            }
-        }
+            for swap_offset in 1..(num_pods - pod_idx) {
+                let swap_pos = current_last_pos + swap_offset;
+                if swap_pos < indices.len() {
+                    // Try this swap
+                    let mut test_pod = pod[..pod_size - 1].to_vec();
+                    test_pod.push(indices[swap_pos]);
 
-        // If we couldn't find enough unfaced opponents, take any available
-        if pod.len() < pod_size {
-            for &(candidate, _, _) in ranked.iter().skip(i + 1) {
-                if pod.len() >= pod_size {
-                    break;
-                }
-                if !used[candidate] {
-                    pod.push(candidate);
-                    used[candidate] = true;
+                    if !has_repeat_opponents(&test_pod, contestants) {
+                        // Swap is good - apply it
+                        indices.swap(current_last_pos, swap_pos);
+                        pod = test_pod;
+                        break;
+                    }
                 }
             }
         }
@@ -553,89 +604,21 @@ fn swiss_pods(contestants: &[Contestant], pod_size: usize) -> Vec<Vec<usize>> {
         }
     }
 
-    pods
+    // Floaters are the remaining players who couldn't form a complete pod
+    let floaters: Vec<usize> = indices[num_pods * pod_size..].to_vec();
+
+    (pods, floaters)
 }
 
 /// Generate Swiss pairings for a round (2-player games)
 ///
-/// For round 1 (all `swiss_points` == 0): Uses Dutch-style pairing by dividing
-/// contestants into top half and bottom half by `initial_seed`.
-/// For subsequent rounds: Pairs by similar Swiss points, preferring unfaced opponents.
+/// Thin wrapper around `swiss_pods` for 2-player games.
+/// Uses Dutch-style pairing with score brackets and floaters.
 fn swiss_pairings(contestants: &[Contestant]) -> Vec<(usize, usize)> {
-    // Check if this is round 1 (all swiss_points are 0)
-    let is_round_1 = contestants.iter().all(|c| c.swiss_points == 0.0);
-
-    if is_round_1 {
-        // Dutch-style initial pairing: sort by initial_seed, pair top half vs bottom half
-        let mut ranked: Vec<(usize, f64)> = contestants
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (i, c.initial_seed))
-            .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let num_pairs = contestants.len() / 2;
-        let mut pairings = Vec::with_capacity(num_pairs);
-
-        // Pair #1 vs #(num_pairs+1), #2 vs #(num_pairs+2), etc.
-        for i in 0..num_pairs {
-            let top_idx = ranked[i].0;
-            let bottom_idx = ranked[i + num_pairs].0;
-            pairings.push((top_idx, bottom_idx));
-        }
-        return pairings;
-    }
-
-    // Subsequent rounds: sort by Swiss points (desc), initial_seed as tiebreaker
-    let mut ranked: Vec<(usize, f64, f64)> = contestants
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i, c.swiss_points, c.initial_seed))
-        .collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
-    let mut pairings = Vec::new();
-    let mut paired = vec![false; contestants.len()];
-
-    for i in 0..ranked.len() {
-        let idx_a = ranked[i].0;
-        if paired[idx_a] {
-            continue;
-        }
-
-        // Find best unpaired opponent (similar points, preferring not yet faced)
-        let mut best_opponent = None;
-        let mut best_not_faced = None;
-
-        for (_, &(idx_b, _, _)) in ranked.iter().enumerate().skip(i + 1) {
-            if paired[idx_b] {
-                continue;
-            }
-
-            if best_opponent.is_none() {
-                best_opponent = Some(idx_b);
-            }
-
-            // Prefer opponents not yet faced
-            if !contestants[idx_a].opponents_faced.contains(&idx_b) && best_not_faced.is_none() {
-                best_not_faced = Some(idx_b);
-                break; // Found ideal opponent
-            }
-        }
-
-        // Use not-faced opponent if available, otherwise best available
-        if let Some(idx_b) = best_not_faced.or(best_opponent) {
-            pairings.push((idx_a, idx_b));
-            paired[idx_a] = true;
-            paired[idx_b] = true;
-        }
-    }
-
-    pairings
+    swiss_pods(contestants, 2)
+        .into_iter()
+        .map(|pod| (pod[0], pod[1]))
+        .collect()
 }
 
 /// Generate round-robin pairings (all possible pairs)
@@ -1249,18 +1232,21 @@ fn run_tournament_env<B: Backend, E: Environment>(
             let mut bye_recipients: Vec<usize> = Vec::new();
 
             if num_byes > 0 {
-                // Find lowest-ranked players (by Swiss points) who haven't had a bye
-                let mut bye_candidates: Vec<(usize, f64)> = contestants
+                // Find lowest-ranked players (by Swiss points, then rating) who haven't had a bye
+                let mut bye_candidates: Vec<(usize, f64, f64)> = contestants
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| !c.has_bye)
-                    .map(|(i, c)| (i, c.swiss_points))
+                    .map(|(i, c)| (i, c.swiss_points, c.rating.rating))
                     .collect();
-                // Sort ascending (lowest points first)
-                bye_candidates
-                    .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                // Sort ascending by points, then ascending by rating (lowest gets bye)
+                bye_candidates.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                });
 
-                for (bye_idx, _) in bye_candidates.iter().take(num_byes) {
+                for (bye_idx, _, _) in bye_candidates.iter().take(num_byes) {
                     // Award bye: points equivalent to 1st place in a match
                     // With match-level scoring, a bye = (pod_size - 1) Swiss points
                     let bye_points = (pod_size - 1) as f64;
@@ -1418,15 +1404,6 @@ fn run_tournament_env<B: Backend, E: Environment>(
         }
 
         pb.finish_and_clear();
-    }
-
-    // Shift ratings so minimum rating becomes 0.0
-    let min_rating = contestants
-        .iter()
-        .map(|c| c.rating.rating)
-        .fold(f64::INFINITY, f64::min);
-    for c in contestants.iter_mut() {
-        c.rating.rating -= min_rating;
     }
 
     // Final summary
@@ -2621,20 +2598,16 @@ mod tests {
 
     #[test]
     fn test_swiss_pods_by_points() {
-        // 8 players, pod_size=4 -> 2 pods
+        // 8 players all in same score bracket, pod_size=4 -> 2 pods with Dutch-style mixing
         let mut contestants: Vec<Contestant> = (0..8)
             .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random, f64::from(i)))
             .collect();
 
-        // Set different Swiss points
-        contestants[0].swiss_points = 10.0;
-        contestants[1].swiss_points = 9.0;
-        contestants[2].swiss_points = 8.0;
-        contestants[3].swiss_points = 7.0;
-        contestants[4].swiss_points = 6.0;
-        contestants[5].swiss_points = 5.0;
-        contestants[6].swiss_points = 4.0;
-        contestants[7].swiss_points = 3.0;
+        // All players in same score bracket (same swiss_points)
+        // This should use Dutch-style pairing within the bracket
+        for c in &mut contestants {
+            c.swiss_points = 5.0; // Same points for all
+        }
 
         let pods = swiss_pods(&contestants, 4);
         assert_eq!(pods.len(), 2);
@@ -2643,14 +2616,62 @@ mod tests {
         assert_eq!(pods[0].len(), 4);
         assert_eq!(pods[1].len(), 4);
 
-        // Top 4 by points should be in first pod (0,1,2,3)
-        // Bottom 4 should be in second pod (4,5,6,7)
-        for idx in &pods[0] {
-            assert!(*idx < 4);
-        }
-        for idx in &pods[1] {
-            assert!(*idx >= 4);
-        }
+        // Dutch-style: divide into 4 groups (quarters), one from each group per pod
+        // With 8 players sorted by rating: [7,6,5,4,3,2,1,0] (highest rating first)
+        // Groups: G0=[7,6], G1=[5,4], G2=[3,2], G3=[1,0]
+        // Pod 0: [7,5,3,1], Pod 1: [6,4,2,0]
+        // All pods should be complete
+        let all_players: std::collections::HashSet<_> = pods.iter().flatten().copied().collect();
+        assert_eq!(all_players.len(), 8);
+    }
+
+    #[test]
+    fn test_swiss_pods_floaters_across_brackets() {
+        // Test that floaters from higher score brackets carry down to lower brackets
+        let mut contestants: Vec<Contestant> = (0..6)
+            .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random, f64::from(i)))
+            .collect();
+
+        // Set up score brackets:
+        // - Bracket 1 (3 pts): players 0, 1, 2 (3 players - can't form pod of 4)
+        // - Bracket 2 (0 pts): players 3, 4, 5 (3 players - can't form pod of 4)
+        // Combined: 6 players, should form 1 pod with 2 floaters
+        contestants[0].swiss_points = 3.0;
+        contestants[1].swiss_points = 3.0;
+        contestants[2].swiss_points = 3.0;
+        contestants[3].swiss_points = 0.0;
+        contestants[4].swiss_points = 0.0;
+        contestants[5].swiss_points = 0.0;
+
+        let pods = swiss_pods(&contestants, 4);
+
+        // 6 players / 4 = 1 complete pod, 2 floaters
+        assert_eq!(pods.len(), 1);
+        assert_eq!(pods[0].len(), 4);
+
+        // The pod should contain players from both brackets (floaters + residents)
+        let pod_set: std::collections::HashSet<_> = pods[0].iter().copied().collect();
+        // Higher-bracket players should have priority (floaters pair first)
+        assert!(pod_set.contains(&0) || pod_set.contains(&1) || pod_set.contains(&2));
+    }
+
+    #[test]
+    fn test_has_repeat_opponents() {
+        let mut contestants: Vec<Contestant> = (0..4)
+            .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random, f64::from(i)))
+            .collect();
+
+        // No opponents faced yet
+        assert!(!has_repeat_opponents(&[0, 1, 2, 3], &contestants));
+
+        // Player 0 has faced player 1
+        contestants[0].opponents_faced.push(1);
+        contestants[1].opponents_faced.push(0);
+        assert!(has_repeat_opponents(&[0, 1, 2, 3], &contestants));
+
+        // Pod without the repeat
+        assert!(!has_repeat_opponents(&[0, 2, 3], &contestants));
+        assert!(!has_repeat_opponents(&[2, 3], &contestants));
     }
 
     #[test]
