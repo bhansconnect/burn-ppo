@@ -29,6 +29,10 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// Number of players (1 for single-agent, 2+ for multi-player)
     const NUM_PLAYERS: usize = 1;
 
+    /// Default temperature for eval/tournament sampling.
+    /// Stochastic games (e.g., bluffing games) should override to 1.0.
+    const DEFAULT_TEMP: f32 = 0.3;
+
     /// Create a new environment with the given seed.
     /// For deterministic games, the seed may be ignored.
     fn new(seed: u64) -> Self;
