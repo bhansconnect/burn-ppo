@@ -54,6 +54,7 @@ use crate::ppo::{
     collect_rollouts, compute_gae, compute_gae_multiplayer, ppo_update, RolloutBuffer,
 };
 use crate::progress::TrainingProgress;
+use crate::tournament::print_rating_guide;
 use std::collections::VecDeque;
 
 /// Extract run name from a checkpoint path
@@ -1105,6 +1106,9 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
     // Initialize device
     let device = init_device();
     println!("Backend: {} ({})", backend_name(), device_name(&device));
+
+    // Print rating guide for understanding Openskill ratings
+    print_rating_guide();
 
     // Create or validate run directory
     match &mode {

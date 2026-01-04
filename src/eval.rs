@@ -32,6 +32,7 @@ use crate::human::{prompt_human_action, random_valid_action};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
 use crate::profile::profile_function;
+use crate::tournament::print_rating_guide;
 
 /// Source of actions for a player slot.
 ///
@@ -486,8 +487,10 @@ impl EvalStats {
         } else {
             format!("{} stronger", checkpoint_names[1])
         };
+
+        print_rating_guide();
         println!(
-            "\nRating: P0={:.1}±{:.1}, P1={:.1}±{:.1} ({stronger})",
+            "Rating: P0={:.1}±{:.1}, P1={:.1}±{:.1} ({stronger})",
             ratings[0].rating, ratings[0].uncertainty, ratings[1].rating, ratings[1].uncertainty
         );
     }

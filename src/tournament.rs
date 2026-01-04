@@ -761,6 +761,15 @@ fn update_ratings_from_games(
     }
 }
 
+/// Print a quick guide to interpreting Openskill ratings
+pub fn print_rating_guide() {
+    println!();
+    println!("Rating Guide (Openskill):");
+    println!("  Win probability: +4 pts → 67% | +8 → 82% | +12 → 90% | +16 → 95%");
+    println!("  Uncertainty (σ): high = few games, may shift. Low = stable rating.");
+    println!("  Comparing: if 95% CIs (±2σ) overlap, difference may not be significant.");
+}
+
 /// Print current standings
 fn print_standings(contestants: &[Contestant], header: &str) {
     println!("\n{header}");
@@ -1407,6 +1416,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
     }
 
     // Final summary
+    print_rating_guide();
     print_final_summary(contestants, num_rounds, args.num_games);
 
     // JSON output if requested
