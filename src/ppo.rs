@@ -611,6 +611,8 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     let num_players = buffer.num_players() as usize;
 
     // Get flattened data from inner backend buffer
+    // Keep as InnerBackend tensors - convert to autodiff per-minibatch to ensure
+    // each minibatch has an independent computation graph that can be fully freed
     let (
         obs_inner,
         actions_inner,
@@ -620,17 +622,9 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         acting_players_inner,
     ) = buffer.flatten();
 
-    // Convert inner backend tensors to autodiff tensors for gradient computation
-    let obs: Tensor<B, 2> = Tensor::from_inner(obs_inner);
-    let actions: Tensor<B, 1, Int> = Tensor::from_inner(actions_inner);
-    let old_log_probs: Tensor<B, 1> = Tensor::from_inner(old_log_probs_inner);
-    let advantages: Tensor<B, 1> = Tensor::from_inner(advantages_inner);
-    let returns: Tensor<B, 1> = Tensor::from_inner(returns_inner);
-    let acting_players: Tensor<B, 1, Int> = Tensor::from_inner(acting_players_inner);
-
-    // Also convert buffer.values for value clipping (if enabled)
-    let old_values: Tensor<B, 2> = Tensor::from_inner(buffer.values.clone());
-    let batch_size = obs.dims()[0];
+    // Keep old_values on InnerBackend for value clipping
+    let old_values_inner = buffer.values.clone();
+    let batch_size = obs_inner.dims()[0];
     let minibatch_size = batch_size / config.num_minibatches;
 
     // Accumulators for metrics
@@ -662,18 +656,29 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 .iter()
                 .map(|&i| i as i64)
                 .collect();
-            let mb_indices_tensor: Tensor<B, 1, Int> =
+
+            // Create indices tensor on InnerBackend
+            let mb_indices_inner: Tensor<B::InnerBackend, 1, Int> =
                 Tensor::from_ints(mb_indices.as_slice(), &device);
 
-            // Gather minibatch data
-            let mb_obs = obs.clone().select(0, mb_indices_tensor.clone());
-            let mb_actions: Tensor<B, 1, Int> =
-                actions.clone().select(0, mb_indices_tensor.clone());
-            let mb_old_log_probs = old_log_probs.clone().select(0, mb_indices_tensor.clone());
-            let mb_advantages_raw = advantages.clone().select(0, mb_indices_tensor.clone());
-            let mb_returns = returns.clone().select(0, mb_indices_tensor.clone());
-            let mb_acting_players: Tensor<B, 1, Int> =
-                acting_players.clone().select(0, mb_indices_tensor);
+            // Select minibatch data on InnerBackend (no autodiff graph created)
+            let mb_obs_inner = obs_inner.clone().select(0, mb_indices_inner.clone());
+            let mb_actions_inner = actions_inner.clone().select(0, mb_indices_inner.clone());
+            let mb_old_log_probs_inner = old_log_probs_inner
+                .clone()
+                .select(0, mb_indices_inner.clone());
+            let mb_advantages_inner = advantages_inner.clone().select(0, mb_indices_inner.clone());
+            let mb_returns_inner = returns_inner.clone().select(0, mb_indices_inner.clone());
+            let mb_acting_players_inner = acting_players_inner.clone().select(0, mb_indices_inner);
+
+            // Convert to autodiff for THIS minibatch only (fresh independent graph)
+            // Each minibatch's graph is independent and can be fully freed at loop end
+            let mb_obs: Tensor<B, 2> = Tensor::from_inner(mb_obs_inner);
+            let mb_actions: Tensor<B, 1, Int> = Tensor::from_inner(mb_actions_inner);
+            let mb_old_log_probs: Tensor<B, 1> = Tensor::from_inner(mb_old_log_probs_inner);
+            let mb_advantages_raw: Tensor<B, 1> = Tensor::from_inner(mb_advantages_inner);
+            let mb_returns: Tensor<B, 1> = Tensor::from_inner(mb_returns_inner);
+            let mb_acting_players: Tensor<B, 1, Int> = Tensor::from_inner(mb_acting_players_inner);
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
@@ -727,17 +732,21 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
 
                 // Value loss (optionally clipped)
                 let value_loss = if config.clip_value {
-                    let mb_old_values = old_values.clone().flatten(0, 1).select(
-                        0,
-                        Tensor::from_ints(
-                            indices[mb_start..mb_end]
-                                .iter()
-                                .map(|&i| i as i64)
-                                .collect::<Vec<_>>()
-                                .as_slice(),
-                            &device,
-                        ),
+                    // Select old values on InnerBackend, then convert to autodiff
+                    let mb_old_values_indices: Tensor<B::InnerBackend, 1, Int> = Tensor::from_ints(
+                        indices[mb_start..mb_end]
+                            .iter()
+                            .map(|&i| i as i64)
+                            .collect::<Vec<_>>()
+                            .as_slice(),
+                        &device,
                     );
+                    let mb_old_values_inner = old_values_inner
+                        .clone()
+                        .flatten(0, 1)
+                        .select(0, mb_old_values_indices);
+                    let mb_old_values: Tensor<B, 1> = Tensor::from_inner(mb_old_values_inner);
+
                     let values_clipped = mb_old_values.clone()
                         + (values.clone() - mb_old_values.clone())
                             .clamp(-config.clip_epsilon, config.clip_epsilon);
