@@ -803,21 +803,26 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             }
 
             // Batched metric extraction - single GPU sync instead of 8
+            //
+            // CRITICAL: Use .inner() to convert autodiff tensors to non-autodiff BEFORE
+            // any operations. This prevents creating new autodiff graph nodes and allows
+            // the backward computation graph to be freed. Without this, every operation
+            // (reshape, mean, cat, negation) creates new graph nodes that retain the
+            // entire forward/backward computation graph, causing memory leaks.
             {
                 profile_scope!("extract_metrics");
 
-                // Concatenate all scalar metrics into one tensor for single GPU->CPU transfer
-                // Use reshape to convert 0-dim scalars to 1-dim, then cat along dim 0
-                let metrics_tensor: Tensor<B, 1> = Tensor::cat(
+                // Convert to inner (non-autodiff) tensors first to free the autodiff graph
+                let metrics_tensor: Tensor<B::InnerBackend, 1> = Tensor::cat(
                     vec![
-                        (-policy_loss_mean).reshape([1]), // Negate for display
-                        value_loss.reshape([1]),
-                        entropy.mean().reshape([1]),
-                        approx_kl.reshape([1]),
-                        clip_fraction.reshape([1]),
-                        loss.reshape([1]),
-                        values_mean.reshape([1]),
-                        returns_mean.reshape([1]),
+                        (-policy_loss_mean.inner()).reshape([1]), // Negate for display
+                        value_loss.inner().reshape([1]),
+                        entropy.inner().mean().reshape([1]),
+                        approx_kl.inner().reshape([1]),
+                        clip_fraction.inner().reshape([1]),
+                        loss.inner().reshape([1]),
+                        values_mean.inner().reshape([1]),
+                        returns_mean.inner().reshape([1]),
                     ],
                     0,
                 );

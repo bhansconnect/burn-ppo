@@ -15,14 +15,15 @@
 /// Returns list of backends available in this build
 #[must_use]
 pub fn available_backends() -> Vec<&'static str> {
-    let mut backends = vec!["ndarray"];
-    #[cfg(feature = "wgpu")]
-    backends.push("wgpu");
-    #[cfg(feature = "cuda")]
-    backends.push("cuda");
-    #[cfg(feature = "libtorch")]
-    backends.push("libtorch");
-    backends
+    vec![
+        "ndarray",
+        #[cfg(feature = "wgpu")]
+        "wgpu",
+        #[cfg(feature = "cuda")]
+        "cuda",
+        #[cfg(feature = "libtorch")]
+        "libtorch",
+    ]
 }
 
 /// Returns the best available backend for this build (cuda > libtorch > wgpu > ndarray)
