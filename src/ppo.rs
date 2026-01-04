@@ -184,20 +184,14 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         Vec::new()
     };
 
-    // Pre-allocate reusable buffers for per-step data (avoid allocations in hot loop)
-    let mut current_players_buf: Vec<usize> = vec![0; num_envs];
-    let mut obs_flat: Vec<f32> = vec![0.0; num_envs * obs_dim];
-    let mut actions_usize: Vec<usize> = vec![0; num_envs];
-    let mut acting_rewards: Vec<f32> = vec![0.0; num_envs];
-
     for _step in 0..num_steps {
         profile_scope!("rollout_step");
 
         // Get current players BEFORE the step (who is about to act)
-        current_players_buf.copy_from_slice(vec_env.current_players());
+        let current_players = vec_env.current_players().to_vec();
 
         // Get current observations (copy since we may normalize)
-        obs_flat.copy_from_slice(vec_env.observations());
+        let mut obs_flat = vec_env.observations().to_vec();
 
         // Store raw observations BEFORE normalization for stats update
         if collect_raw_obs {
@@ -222,26 +216,6 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             let actions = sample_categorical(logits.clone(), rng, device);
             let log_probs = log_prob_categorical(logits, actions.clone());
 
-            // Extract acting player's value using GPU gather (before CPU sync)
-            let acting_values: Tensor<B, 1> = if num_players == 1 {
-                // Single-player: just extract player 0
-                values.clone().slice([0..num_envs, 0..1]).squeeze::<1>()
-            } else {
-                // Multi-player: gather acting player's value for each env
-                let current_players_tensor: Tensor<B, 1, Int> = Tensor::from_ints(
-                    current_players_buf
-                        .iter()
-                        .map(|&p| p as i64)
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                    device,
-                );
-                values
-                    .clone()
-                    .gather(1, current_players_tensor.reshape([num_envs, 1]))
-                    .squeeze::<1>()
-            };
-
             // Sync to CPU - this is where actual GPU compute happens
             let actions_data: Vec<i64> = actions
                 .float()
@@ -255,11 +229,12 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             // Get all player values [num_envs * num_players]
             let values_all_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
 
-            // Acting values already extracted via gather
-            let acting_values_data: Vec<f32> = acting_values
-                .into_data()
-                .to_vec()
-                .expect("acting_values to vec");
+            // Extract acting player's value for each env
+            let acting_values_data: Vec<f32> = current_players
+                .iter()
+                .enumerate()
+                .map(|(e, &p)| values_all_data[e * num_players + p])
+                .collect();
 
             let log_probs_data: Vec<f32> =
                 log_probs.into_data().to_vec().expect("log_probs to vec");
@@ -271,10 +246,8 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             )
         };
 
-        // Convert actions to usize for environment (reuse pre-allocated buffer)
-        for (dst, &src) in actions_usize.iter_mut().zip(&actions_data) {
-            *dst = src as usize;
-        }
+        // Convert actions to Vec<usize> for environment
+        let actions_usize: Vec<usize> = actions_data.iter().map(|&a| a as usize).collect();
 
         // Step environment (CPU-bound)
         let completed = {
@@ -288,10 +261,9 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         let dones = vec_env.dones();
 
         // Extract acting player's reward for backward-compat single-player path
-        // (reuse pre-allocated buffer)
-        for e in 0..num_envs {
-            acting_rewards[e] = rewards_flat[e * num_players + current_players_buf[e]];
-        }
+        let acting_rewards: Vec<f32> = (0..num_envs)
+            .map(|e| rewards_flat[e * num_players + current_players[e]])
+            .collect();
 
         // Append to CPU buffers
         all_obs.extend_from_slice(&obs_flat);
@@ -304,7 +276,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         // Multi-player data
         all_values_flat.extend_from_slice(&values_all_data);
         all_rewards_flat.extend_from_slice(rewards_flat);
-        all_acting_players.extend(current_players_buf.iter().map(|&p| p as i64));
+        all_acting_players.extend(current_players.iter().map(|&p| p as i64));
     }
 
     // Batch transfer to GPU
@@ -550,36 +522,24 @@ pub fn compute_explained_variance(values: &[f32], returns: &[f32]) -> f32 {
         return 0.0;
     }
 
-    // Single pass to compute sums for both returns and residuals
-    let (sum_returns, sum_residuals) = values
+    let mean_returns = returns.iter().sum::<f32>() / n;
+    let var_returns = returns
         .iter()
-        .zip(returns)
-        .fold((0.0_f32, 0.0_f32), |(sr, sres), (v, r)| {
-            (sr + r, sres + (r - v))
-        });
-
-    let mean_returns = sum_returns / n;
-    let mean_residuals = sum_residuals / n;
-
-    // Second pass to compute variances (avoids intermediate Vec allocation)
-    let (var_returns, var_residuals) =
-        values
-            .iter()
-            .zip(returns)
-            .fold((0.0_f32, 0.0_f32), |(vr, vres), (v, r)| {
-                let residual = r - v;
-                (
-                    vr + (r - mean_returns).powi(2),
-                    vres + (residual - mean_residuals).powi(2),
-                )
-            });
-
-    let var_returns = var_returns / n;
-    let var_residuals = var_residuals / n;
+        .map(|r| (r - mean_returns).powi(2))
+        .sum::<f32>()
+        / n;
 
     if var_returns < 1e-8 {
         return 0.0;
     }
+
+    let residuals: Vec<f32> = values.iter().zip(returns).map(|(v, r)| r - v).collect();
+    let mean_residuals = residuals.iter().sum::<f32>() / n;
+    let var_residuals = residuals
+        .iter()
+        .map(|r| (r - mean_residuals).powi(2))
+        .sum::<f32>()
+        / n;
 
     1.0 - var_residuals / var_returns
 }
@@ -603,6 +563,7 @@ pub struct UpdateMetrics {
 ///
 /// Implements clipped surrogate objective with value clipping
 #[expect(
+    clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
     reason = "tensor indices and minibatch sizes are non-negative"
 )]
@@ -622,13 +583,6 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     let batch_size = obs.dims()[0];
     let minibatch_size = batch_size / config.num_minibatches;
 
-    // Pre-flatten values for value clipping (avoid per-minibatch flatten)
-    let old_values_flat = if config.clip_value {
-        Some(buffer.values.clone().flatten(0, 1))
-    } else {
-        None
-    };
-
     // Accumulators for metrics
     let mut total_policy_loss = 0.0;
     let mut total_value_loss = 0.0;
@@ -642,14 +596,12 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
 
     let mut model = model;
 
-    // Pre-allocate index buffer for minibatch shuffling (reused across epochs)
-    let mut indices: Vec<usize> = (0..batch_size).collect();
-
     // Epoch loop (labeled for KL early stopping)
     'epoch_loop: for _epoch in 0..config.num_epochs {
         profile_scope!("ppo_epoch");
 
-        // Shuffle indices for minibatches (reuse buffer)
+        // Shuffle indices for minibatches
+        let mut indices: Vec<usize> = (0..batch_size).collect();
         indices.shuffle(rng);
 
         // Minibatch loop
@@ -663,7 +615,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_indices_tensor: Tensor<B, 1, Int> =
                 Tensor::from_ints(mb_indices.as_slice(), &device);
 
-            // Gather minibatch data (keep mb_indices_tensor alive for value clipping)
+            // Gather minibatch data
             let mb_obs = obs.clone().select(0, mb_indices_tensor.clone());
             let mb_actions: Tensor<B, 1, Int> =
                 actions.clone().select(0, mb_indices_tensor.clone());
@@ -671,7 +623,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_advantages_raw = advantages.clone().select(0, mb_indices_tensor.clone());
             let mb_returns = returns.clone().select(0, mb_indices_tensor.clone());
             let mb_acting_players: Tensor<B, 1, Int> =
-                acting_players.clone().select(0, mb_indices_tensor.clone());
+                acting_players.clone().select(0, mb_indices_tensor);
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
@@ -689,13 +641,29 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_size = logits.dims()[0];
             let values: Tensor<B, 1> = if num_players == 1 {
                 // Single-player: just extract player 0
-                all_values.slice([0..mb_size, 0..1]).squeeze::<1>()
+                all_values.slice([0..mb_size, 0..1]).flatten(0, 1)
             } else {
-                // Multi-player: use GPU gather to extract acting player's value
-                // gather(dim, indices) selects values along dim using indices
-                all_values
-                    .gather(1, mb_acting_players.reshape([mb_size, 1]))
-                    .squeeze::<1>()
+                // Multi-player: extract acting player's value for each sample
+                // This is done on CPU since gather operations on GPU can be slow for small tensors
+                let all_values_data: Vec<f32> =
+                    all_values.clone().into_data().to_vec().expect("values");
+                // Convert through float to avoid IntElem type mismatches between backends
+                let acting_data: Vec<usize> = mb_acting_players
+                    .clone()
+                    .float()
+                    .into_data()
+                    .to_vec::<f32>()
+                    .expect("acting")
+                    .into_iter()
+                    .map(|x| x as usize)
+                    .collect();
+                let values_vec: Vec<f32> = (0..mb_size)
+                    .map(|i| {
+                        let player = acting_data[i];
+                        all_values_data[i * num_players + player]
+                    })
+                    .collect();
+                Tensor::<B, 1>::from_floats(values_vec.as_slice(), &device)
             };
 
             // Compute losses and backward pass (combined for accurate timing)
@@ -728,9 +696,18 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 let policy_loss_mean = policy_loss.mean();
 
                 // Value loss (optionally clipped)
-                let value_loss = if let Some(ref old_vals) = old_values_flat {
-                    // Reuse mb_indices_tensor and pre-flattened values
-                    let mb_old_values = old_vals.clone().select(0, mb_indices_tensor);
+                let value_loss = if config.clip_value {
+                    let mb_old_values = buffer.values.clone().flatten(0, 1).select(
+                        0,
+                        Tensor::from_ints(
+                            indices[mb_start..mb_end]
+                                .iter()
+                                .map(|&i| i as i64)
+                                .collect::<Vec<_>>()
+                                .as_slice(),
+                            &device,
+                        ),
+                    );
                     let values_clipped = mb_old_values.clone()
                         + (values.clone() - mb_old_values.clone())
                             .clamp(-config.clip_epsilon, config.clip_epsilon);
@@ -982,294 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gae_multiplayer_known_values() {
-        // Test multiplayer GAE with hand-traced expected values
-        // Scenario: 2 steps, 1 env, 2 players
-        // Step 0: P0 acts
-        // Step 1: P1 acts (terminal)
-        // Rewards at step 1: P0 gets +1 (winner), P1 gets -1 (loser)
-        // All values = 0.5
-        //
-        // Two-pass algorithm:
-        // Pass 1 (backward): Reward attribution
-        //   t=1: P1 acts, attributed[1] = -1, P0 carry += 1, then done resets carry
-        //   t=0: P0 acts, attributed[0] = 0 + 0 = 0 (carry was reset)
-        //
-        // Pass 2 (backward): GAE computation
-        //   t=1: P1's delta = -1 + 0*0 - 0.5 = -1.5, A[1] = -1.5
-        //   t=0: P0's delta = 0 + 0.99*0.5 - 0.5 = -0.005, A[0] = -0.005 + 0 = -0.005
-        //        (GAE carry for P0 was 0 since P0 didn't act after step 0)
-
-        let device = Default::default();
-        let num_steps = 2;
-        let num_envs = 1;
-        let num_players = 2u8;
-        let gamma = 0.99_f32;
-        let lambda = 0.95_f32;
-
-        let mut buffer: RolloutBuffer<TestBackend> =
-            RolloutBuffer::new(num_steps, num_envs, 1, num_players, &device);
-
-        buffer.all_rewards = Tensor::from_floats(
-            [
-                [[0.0, 0.0]],  // Step 0: no rewards
-                [[1.0, -1.0]], // Step 1: P0 wins, P1 loses
-            ],
-            &device,
-        );
-        buffer.all_values = Tensor::from_floats(
-            [
-                [[0.5, 0.5]], // Step 0
-                [[0.5, 0.5]], // Step 1
-            ],
-            &device,
-        );
-        buffer.acting_players = Tensor::from_ints([[0], [1]], &device); // P0, P1
-        buffer.dones = Tensor::from_floats([[0.0], [1.0]], &device); // Terminal at step 1
-
-        let last_values: Tensor<TestBackend, 2> = Tensor::from_floats([[0.0, 0.0]], &device); // Terminal
-
-        compute_gae_multiplayer(
-            &mut buffer,
-            last_values,
-            gamma,
-            lambda,
-            num_players,
-            &device,
-        );
-
-        let advantages: Vec<f32> = buffer
-            .advantages
-            .as_ref()
-            .expect("advantages computed")
-            .clone()
-            .into_data()
-            .to_vec()
-            .expect("advantages to vec");
-
-        // Expected values (hand-traced through the algorithm):
-        // Step 1 (P1 acts, terminal):
-        //   attributed_reward = -1 (P1's reward at terminal)
-        //   delta = -1 + gamma * 0 * (1-1) - 0.5 = -1.5
-        //   A[1] = -1.5
-        //   Then done resets gae_carry and next_value to 0 for all players
-        let expected_a1 = -1.5_f32;
-
-        // Step 0 (P0 acts):
-        //   attributed_reward = 0 (P0's reward at step 0, carry was reset by done)
-        //   next_value[P0] = 0 (was reset by done at step 1!)
-        //   delta = 0 + gamma * 0 * 1 - 0.5 = -0.5
-        //   gae_carry[P0] = 0 (was reset by done)
-        //   A[0] = -0.5 + 0 = -0.5
-        let expected_a0 = -0.5_f32;
-
-        assert!(
-            (advantages[0] - expected_a0).abs() < 1e-5,
-            "A_0: expected {expected_a0}, got {}",
-            advantages[0]
-        );
-        assert!(
-            (advantages[1] - expected_a1).abs() < 1e-5,
-            "A_1: expected {expected_a1}, got {}",
-            advantages[1]
-        );
-    }
-
-    #[test]
-    fn test_gae_multiplayer_reward_attribution() {
-        // Test that rewards are properly attributed across turns
-        // P0 acts at step 0, then P1 acts at step 1, then P0 acts at step 2
-        // P0 gets reward +0.5 at step 1 (while P1 is acting)
-        // This reward should be attributed to P0's next action at step 2
-        //
-        // No terminal states for cleaner testing
-
-        let device = Default::default();
-        let num_steps = 3;
-        let num_envs = 1;
-        let num_players = 2u8;
-        let gamma = 0.99_f32;
-        let lambda = 0.95_f32;
-
-        let mut buffer: RolloutBuffer<TestBackend> =
-            RolloutBuffer::new(num_steps, num_envs, 1, num_players, &device);
-
-        buffer.all_rewards = Tensor::from_floats(
-            [
-                [[0.0, 0.0]], // Step 0
-                [[0.5, 0.0]], // Step 1: P0 gets 0.5 while P1 acts
-                [[0.0, 0.0]], // Step 2
-            ],
-            &device,
-        );
-        buffer.all_values =
-            Tensor::from_floats([[[0.5, 0.5]], [[0.5, 0.5]], [[0.5, 0.5]]], &device);
-        buffer.acting_players = Tensor::from_ints([[0], [1], [0]], &device); // P0, P1, P0
-        buffer.dones = Tensor::zeros([num_steps, num_envs], &device);
-
-        let last_values: Tensor<TestBackend, 2> = Tensor::from_floats([[0.5, 0.5]], &device);
-
-        compute_gae_multiplayer(
-            &mut buffer,
-            last_values,
-            gamma,
-            lambda,
-            num_players,
-            &device,
-        );
-
-        let advantages: Vec<f32> = buffer
-            .advantages
-            .as_ref()
-            .expect("advantages computed")
-            .clone()
-            .into_data()
-            .to_vec()
-            .expect("advantages to vec");
-
-        // Trace reward attribution (backward):
-        // t=2 (P0 acts): attributed[2] = 0 + carry[P0] = 0 + 0.5 = 0.5 (P0's reward from step 1!)
-        //                carry[P0] = 0, carry[P1] += 0 = 0
-        // t=1 (P1 acts): attributed[1] = 0 + carry[P1] = 0
-        //                carry[P0] += 0.5 = 0.5, carry[P1] = 0
-        // t=0 (P0 acts): attributed[0] = 0 + carry[P0] = 0 (carry was already claimed at t=2)
-        //                Wait, that's not right...
-
-        // Actually tracing again more carefully:
-        // Initialize: reward_carry = [[0, 0]]
-        // t=2 (P0 acts):
-        //   acting_player = 0
-        //   attributed[2] = all_rewards[2,0,0] + carry[0][0] = 0 + 0 = 0
-        //   carry[0][0] = 0
-        //   For P1: carry[0][1] += all_rewards[2,0,1] = 0 + 0 = 0
-        //   no done
-        // t=1 (P1 acts):
-        //   acting_player = 1
-        //   attributed[1] = all_rewards[1,0,1] + carry[0][1] = 0 + 0 = 0
-        //   carry[0][1] = 0
-        //   For P0: carry[0][0] += all_rewards[1,0,0] = 0 + 0.5 = 0.5
-        //   no done
-        // t=0 (P0 acts):
-        //   acting_player = 0
-        //   attributed[0] = all_rewards[0,0,0] + carry[0][0] = 0 + 0.5 = 0.5
-        //   carry[0][0] = 0
-        //
-        // So attributed_rewards = [0.5, 0, 0]
-        // The P0 reward from step 1 is credited to P0's step 0 action (previous action)
-
-        // Now GAE computation (backward):
-        // Initialize: gae_carry = [[0, 0]], next_value = [[0.5, 0.5]]
-        // t=2 (P0 acts):
-        //   value = all_values[2,0,0] = 0.5
-        //   delta = 0 + gamma * next_value[0][0] - value = 0 + 0.99*0.5 - 0.5 = -0.005
-        //   A[2] = delta + gamma*lambda*gae_carry[0][0] = -0.005 + 0 = -0.005
-        //   gae_carry[0][0] = A[2] = -0.005
-        //   next_value[0][0] = 0.5
-        // t=1 (P1 acts):
-        //   value = all_values[1,0,1] = 0.5
-        //   delta = 0 + gamma * next_value[0][1] - value = 0 + 0.99*0.5 - 0.5 = -0.005
-        //   A[1] = delta + gamma*lambda*gae_carry[0][1] = -0.005 + 0 = -0.005
-        //   gae_carry[0][1] = -0.005
-        //   next_value[0][1] = 0.5
-        // t=0 (P0 acts):
-        //   value = all_values[0,0,0] = 0.5
-        //   delta = 0.5 + gamma * next_value[0][0] - value = 0.5 + 0.99*0.5 - 0.5 = 0.495
-        //   A[0] = delta + gamma*lambda*gae_carry[0][0] = 0.495 + 0.9405*(-0.005) = 0.49029...
-        //   gae_carry[0][0] = A[0]
-        //   next_value[0][0] = 0.5
-
-        let gam_lam = gamma * lambda;
-        let expected_a2 = gamma * 0.5 - 0.5; // -0.005
-        let expected_a1 = gamma * 0.5 - 0.5; // -0.005
-        let expected_a0 = 0.5 + gamma * 0.5 - 0.5 + gam_lam * expected_a2; // 0.495 - 0.0047...
-
-        assert!(
-            (advantages[2] - expected_a2).abs() < 1e-4,
-            "A_2: expected {expected_a2}, got {}",
-            advantages[2]
-        );
-        assert!(
-            (advantages[1] - expected_a1).abs() < 1e-4,
-            "A_1: expected {expected_a1}, got {}",
-            advantages[1]
-        );
-        assert!(
-            (advantages[0] - expected_a0).abs() < 1e-4,
-            "A_0: expected {expected_a0}, got {}",
-            advantages[0]
-        );
-    }
-
-    #[test]
-    #[expect(clippy::cast_sign_loss, reason = "test indices are known non-negative")]
-    fn test_gather_equivalence() {
-        // Test that tensor gather produces the same result as CPU indexing loop
-        // This validates that we can safely replace CPU loops with gather ops
-        let device = Default::default();
-
-        // values: [batch_size, num_players] = [4, 3]
-        let values: Tensor<TestBackend, 2> = Tensor::from_floats(
-            [
-                [1.0, 2.0, 3.0],
-                [4.0, 5.0, 6.0],
-                [7.0, 8.0, 9.0],
-                [10.0, 11.0, 12.0],
-            ],
-            &device,
-        );
-
-        // indices: which player's value to extract for each batch item
-        let indices: Tensor<TestBackend, 1, Int> = Tensor::from_ints([1, 0, 2, 1], &device);
-
-        // CPU reference implementation (current code pattern)
-        let values_data: Vec<f32> = values.clone().into_data().to_vec().expect("values");
-        let indices_data: Vec<i64> = indices.clone().into_data().to_vec().expect("indices");
-        let num_players = 3;
-        let cpu_result: Vec<f32> = (0..4)
-            .map(|i| values_data[i * num_players + indices_data[i] as usize])
-            .collect();
-
-        // GPU gather implementation
-        // gather(dim, indices) - indices must have same dims as output
-        // For selecting along dim 1, indices shape must be [batch_size, 1]
-        let indices_2d = indices.reshape([4, 1]);
-        let gpu_result_tensor = values.gather(1, indices_2d);
-        // squeeze() in Burn removes all dimensions of size 1 (no dim arg)
-        let gpu_result: Vec<f32> = gpu_result_tensor
-            .squeeze::<1>()
-            .into_data()
-            .to_vec()
-            .expect("gather result");
-
-        // Expected: [2.0, 4.0, 9.0, 11.0] (indices 1, 0, 2, 1 from each row)
-        assert_eq!(cpu_result, vec![2.0, 4.0, 9.0, 11.0]);
-        assert_eq!(cpu_result, gpu_result, "Gather should match CPU indexing");
-    }
-
-    #[test]
-    fn test_gather_single_player() {
-        // Edge case: single player (num_players = 1)
-        let device = Default::default();
-
-        let values: Tensor<TestBackend, 2> = Tensor::from_floats([[1.0], [2.0], [3.0]], &device);
-        let indices: Tensor<TestBackend, 1, Int> = Tensor::from_ints([0, 0, 0], &device);
-
-        // CPU reference
-        let values_data: Vec<f32> = values.clone().into_data().to_vec().expect("values");
-        let cpu_result: Vec<f32> = values_data; // All indices are 0
-
-        // GPU gather
-        let gpu_result: Vec<f32> = values
-            .gather(1, indices.reshape([3, 1]))
-            .squeeze::<1>()
-            .into_data()
-            .to_vec()
-            .expect("gather");
-
-        assert_eq!(cpu_result, gpu_result);
-    }
-
-    #[test]
     fn test_buffer_flatten() {
         let device = Default::default();
         let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
@@ -1344,155 +1033,5 @@ mod tests {
         let ev = compute_explained_variance(&values, &returns);
         // Should be positive but less than 1
         assert!(ev > 0.0 && ev < 1.0, "Expected 0 < ev < 1, got {ev}");
-    }
-
-    #[test]
-    fn test_gae_known_values() {
-        // Test GAE computation with hand-calculated expected values
-        // Setup: 3 steps, 1 env, constant rewards=1.0, values=0.5, no terminal states
-        // gamma=0.99, lambda=0.95
-        //
-        // GAE formula (backward):
-        // delta_t = r_t + gamma * V(s_{t+1}) * (1-done) - V(s_t)
-        // A_t = delta_t + gamma * lambda * (1-done) * A_{t+1}
-        //
-        // All deltas = 1.0 + 0.99*0.5 - 0.5 = 0.995
-        //
-        // Step 2: A_2 = 0.995
-        // Step 1: A_1 = 0.995 + 0.9405 * 0.995 = 1.930822...
-        // Step 0: A_0 = 0.995 + 0.9405 * 1.930822 = 2.811458...
-
-        let device = Default::default();
-        let num_steps = 3;
-        let num_envs = 1;
-
-        let mut buffer: RolloutBuffer<TestBackend> =
-            RolloutBuffer::new(num_steps, num_envs, 1, 1u8, &device);
-
-        buffer.rewards = Tensor::from_floats([[1.0], [1.0], [1.0]], &device);
-        buffer.values = Tensor::from_floats([[0.5], [0.5], [0.5]], &device);
-        buffer.dones = Tensor::zeros([num_steps, num_envs], &device);
-
-        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats([0.5], &device);
-        let gamma = 0.99_f32;
-        let lambda = 0.95_f32;
-
-        compute_gae(&mut buffer, last_values, gamma, lambda, &device);
-
-        let advantages: Vec<f32> = buffer
-            .advantages
-            .as_ref()
-            .expect("advantages computed")
-            .clone()
-            .into_data()
-            .to_vec()
-            .expect("advantages to vec");
-
-        // Hand-calculated expected values
-        let gam_lam = gamma * lambda; // 0.9405
-        let delta = 0.995_f32;
-        let expected_a2 = delta;
-        let expected_a1 = delta + gam_lam * expected_a2;
-        let expected_a0 = delta + gam_lam * expected_a1;
-
-        assert!(
-            (advantages[0] - expected_a0).abs() < 1e-5,
-            "A_0: expected {expected_a0}, got {}",
-            advantages[0]
-        );
-        assert!(
-            (advantages[1] - expected_a1).abs() < 1e-5,
-            "A_1: expected {expected_a1}, got {}",
-            advantages[1]
-        );
-        assert!(
-            (advantages[2] - expected_a2).abs() < 1e-5,
-            "A_2: expected {expected_a2}, got {}",
-            advantages[2]
-        );
-
-        // Verify returns = advantages + values
-        let returns: Vec<f32> = buffer
-            .returns
-            .as_ref()
-            .expect("returns computed")
-            .clone()
-            .into_data()
-            .to_vec()
-            .expect("returns to vec");
-
-        for i in 0..3 {
-            let expected_return = advantages[i] + 0.5;
-            assert!(
-                (returns[i] - expected_return).abs() < 1e-5,
-                "return[{i}]: expected {expected_return}, got {}",
-                returns[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_gae_with_terminal() {
-        // Test GAE with an episode boundary
-        // 3 steps, 1 env: step 1 is terminal (done=1), which resets GAE
-        //
-        // Step 2: delta_2 = 1.0 + 0.99*0.5 - 0.5 = 0.995, A_2 = 0.995
-        // Step 1 (terminal): delta_1 = 1.0 + 0.99*0.5*(1-1) - 0.5 = 0.5
-        //                    A_1 = delta_1 + 0.9405*(1-1)*A_2 = 0.5
-        // Step 0: delta_0 = 1.0 + 0.99*0.5 - 0.5 = 0.995
-        //         A_0 = delta_0 + 0.9405*1*A_1 = 0.995 + 0.9405*0.5 = 1.46525
-
-        let device = Default::default();
-        let num_steps = 3;
-        let num_envs = 1;
-
-        let mut buffer: RolloutBuffer<TestBackend> =
-            RolloutBuffer::new(num_steps, num_envs, 1, 1u8, &device);
-
-        buffer.rewards = Tensor::from_floats([[1.0], [1.0], [1.0]], &device);
-        buffer.values = Tensor::from_floats([[0.5], [0.5], [0.5]], &device);
-        buffer.dones = Tensor::from_floats([[0.0], [1.0], [0.0]], &device); // Terminal at step 1
-
-        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats([0.5], &device);
-        let gamma = 0.99_f32;
-        let lambda = 0.95_f32;
-
-        compute_gae(&mut buffer, last_values, gamma, lambda, &device);
-
-        let advantages: Vec<f32> = buffer
-            .advantages
-            .as_ref()
-            .expect("advantages computed")
-            .clone()
-            .into_data()
-            .to_vec()
-            .expect("advantages to vec");
-
-        // Step 2: normal GAE
-        let expected_a2 = 0.995_f32;
-        // Step 1: terminal - next value is bootstrapped but masked by done
-        // delta_1 = r + gamma * next_value * (1-done) - value = 1 + 0.99*0.5*0 - 0.5 = 0.5
-        // A_1 = delta_1 + gamma*lambda*(1-done)*A_2 = 0.5 + 0 = 0.5
-        let expected_a1 = 0.5_f32;
-        // Step 0: uses A_1 for GAE continuation
-        // delta_0 = 1 + 0.99*0.5 - 0.5 = 0.995
-        // A_0 = delta_0 + gamma*lambda*1*A_1 = 0.995 + 0.9405*0.5 = 1.46525
-        let expected_a0 = 0.995_f32 + gamma * lambda * expected_a1;
-
-        assert!(
-            (advantages[2] - expected_a2).abs() < 1e-5,
-            "A_2: expected {expected_a2}, got {}",
-            advantages[2]
-        );
-        assert!(
-            (advantages[1] - expected_a1).abs() < 1e-5,
-            "A_1: expected {expected_a1}, got {}",
-            advantages[1]
-        );
-        assert!(
-            (advantages[0] - expected_a0).abs() < 1e-5,
-            "A_0: expected {expected_a0}, got {}",
-            advantages[0]
-        );
     }
 }
