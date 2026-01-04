@@ -37,6 +37,10 @@ pub struct TrainArgs {
     #[arg(long, conflicts_with = "resume")]
     pub fork: Option<PathBuf>,
 
+    /// Compute backend (defaults to best available: cuda > libtorch > wgpu > ndarray)
+    #[arg(long)]
+    pub backend: Option<String>,
+
     // --- Overrides ---
     #[arg(long)]
     pub env: Option<String>,
@@ -70,6 +74,10 @@ pub struct EvalArgs {
     /// Checkpoint paths (one per player, use with --human and --random for mixed games)
     #[arg(long = "checkpoint", short = 'c')]
     pub checkpoints: Vec<PathBuf>,
+
+    /// Compute backend (defaults to best available: cuda > libtorch > wgpu > ndarray)
+    #[arg(long)]
+    pub backend: Option<String>,
 
     /// Human players (specify name for each human player)
     /// Example: --human Alice --human Bob
@@ -136,6 +144,10 @@ pub struct TournamentArgs {
     /// For run directories, all checkpoints are discovered automatically
     #[arg(required = true)]
     pub sources: Vec<PathBuf>,
+
+    /// Compute backend (defaults to best available: cuda > libtorch > wgpu > ndarray)
+    #[arg(long)]
+    pub backend: Option<String>,
 
     /// Number of games per matchup between contestants
     #[arg(short = 'n', long, default_value = "100")]

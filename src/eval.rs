@@ -1695,6 +1695,7 @@ mod tests {
         // No cutoff, no final/decay - valid
         let args = EvalArgs {
             checkpoints: vec![PathBuf::from("test")],
+            backend: None,
             humans: vec![],
             random: false,
             env_name: None,
@@ -1731,6 +1732,7 @@ mod tests {
 
         let args = EvalArgs {
             checkpoints: vec![PathBuf::from("test")],
+            backend: None,
             humans: vec![],
             random: false,
             env_name: None,
@@ -1760,6 +1762,7 @@ mod tests {
 
         let args = EvalArgs {
             checkpoints: vec![PathBuf::from("test")],
+            backend: None,
             humans: vec![],
             random: false,
             env_name: None,

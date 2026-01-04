@@ -39,7 +39,6 @@ use burn::prelude::*;
 use clap::Parser;
 use rand::SeedableRng;
 
-use crate::backend::{backend_name, device_name, init_device, InferenceBackend, TrainingBackend};
 use crate::checkpoint::{
     load_metadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer,
     save_optimizer, save_rng_state, update_training_rating, CheckpointManager, CheckpointMetadata,
@@ -159,18 +158,19 @@ enum TrainingMode {
 
 /// Run training with a specific environment type
 ///
-/// This is the core training function, generic over the environment type.
+/// This is the core training function, generic over the environment type and backend.
 /// Full static dispatch - `VecEnv`<CartPole> and `VecEnv`<ConnectFour> are separate types.
-fn run_training<E, F>(
+fn run_training<TB, E, F>(
     mode: &TrainingMode,
     config: &Config,
     run_dir: &Path,
     resumed_metadata: Option<&CheckpointMetadata>,
-    device: &<TrainingBackend as burn::tensor::backend::Backend>::Device,
+    device: &TB::Device,
     running: &Arc<AtomicBool>,
     env_factory: F,
 ) -> Result<()>
 where
+    TB: burn::tensor::backend::AutodiffBackend,
     E: Environment,
     F: Fn(usize) -> E,
 {
@@ -210,7 +210,7 @@ where
     // Initialize model and optimizer based on mode
     let (mut model, mut optimizer, mut global_step, mut recent_returns, best_return) = match mode {
         TrainingMode::Fresh => {
-            let model: ActorCritic<TrainingBackend> =
+            let model: ActorCritic<TB> =
                 ActorCritic::new(obs_dim, action_count, num_players as usize, config, device);
             let optimizer = optimizer_config.init();
             println!("Created ActorCritic network");
@@ -229,28 +229,24 @@ where
             }
 
             // Load model from checkpoint
-            let (model, _) =
-                CheckpointManager::load::<TrainingBackend>(checkpoint_dir, config, device)
-                    .with_context(|| {
-                        format!(
-                            "Failed to load checkpoint from {}",
-                            checkpoint_dir.display()
-                        )
-                    })?;
+            let (model, _) = CheckpointManager::load::<TB>(checkpoint_dir, config, device)
+                .with_context(|| {
+                    format!(
+                        "Failed to load checkpoint from {}",
+                        checkpoint_dir.display()
+                    )
+                })?;
 
             // Create optimizer and try to load saved state
             let optimizer = optimizer_config.init();
-            let optimizer = match load_optimizer::<TrainingBackend, _, ActorCritic<TrainingBackend>>(
-                optimizer,
-                checkpoint_dir,
-                device,
-            ) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    eprintln!("Warning: Failed to load optimizer state: {e}");
-                    optimizer_config.init()
-                }
-            };
+            let optimizer =
+                match load_optimizer::<TB, _, ActorCritic<TB>>(optimizer, checkpoint_dir, device) {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load optimizer state: {e}");
+                        optimizer_config.init()
+                    }
+                };
 
             // Load observation normalizer if it was saved
             if config.normalize_obs {
@@ -297,7 +293,7 @@ where
 
     // Create rollout buffer with inference backend (non-autodiff)
     // This prevents memory accumulation from autodiff graph during rollout
-    let mut buffer: RolloutBuffer<InferenceBackend> =
+    let mut buffer: RolloutBuffer<TB::InnerBackend> =
         RolloutBuffer::new(config.num_steps, num_envs, obs_dim, num_players, device);
 
     // Create metrics logger
@@ -474,8 +470,8 @@ where
         if let Some(ref norm) = obs_normalizer {
             norm.normalize_batch(&mut obs_flat, obs_dim);
         }
-        let obs_tensor: Tensor<InferenceBackend, 2> =
-            Tensor::<InferenceBackend, 1>::from_floats(obs_flat.as_slice(), device)
+        let obs_tensor: Tensor<TB::InnerBackend, 2> =
+            Tensor::<TB::InnerBackend, 1>::from_floats(obs_flat.as_slice(), device)
                 .reshape([num_envs, obs_dim]);
         let (_, all_values) = inference_model.forward(obs_tensor);
 
@@ -493,7 +489,7 @@ where
             );
         } else {
             // Single-player: extract player 0's values [num_envs]
-            let last_values: Tensor<InferenceBackend, 1> =
+            let last_values: Tensor<TB::InnerBackend, 1> =
                 all_values.slice([0..num_envs, 0..1]).flatten(0, 1);
             compute_gae(
                 &mut buffer,
@@ -758,10 +754,7 @@ where
             let checkpoint_path = checkpoint_manager.save(&model, &metadata, use_auto_best)?;
 
             // Save optimizer state alongside model
-            if let Err(e) = save_optimizer::<TrainingBackend, _, ActorCritic<TrainingBackend>>(
-                &optimizer,
-                &checkpoint_path,
-            ) {
+            if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
                 eprintln!("Warning: Failed to save optimizer state: {e}");
             }
 
@@ -786,9 +779,10 @@ where
                         .map(|m| (m.training_rating, m.training_uncertainty))
                         .unwrap_or((25.0, 25.0 / 3.0));
 
-                    // Run challenger evaluation
-                    match run_challenger_eval::<TrainingBackend, E>(
-                        &model,
+                    // Run challenger evaluation with inference backend (no autodiff)
+                    let challenger_model = model.valid();
+                    match run_challenger_eval::<TB::InnerBackend, E>(
+                        &challenger_model,
                         obs_normalizer.as_ref(),
                         &best_path,
                         best_rating,
@@ -971,12 +965,22 @@ fn main() -> Result<()> {
     // Dispatch based on subcommand
     match cli.command {
         Some(Command::Eval(eval_args)) => {
-            let device = init_device();
-            eval::run_evaluation::<TrainingBackend>(&eval_args, &device)
+            let backend_name = eval_args
+                .backend
+                .as_deref()
+                .unwrap_or_else(|| backend::default_backend());
+            dispatch_backend!(backend_name, device, {
+                eval::run_evaluation::<TB>(&eval_args, &device)
+            })
         }
         Some(Command::Tournament(tournament_args)) => {
-            let device = init_device();
-            tournament::run_tournament::<TrainingBackend>(&tournament_args, &device)
+            let backend_name = tournament_args
+                .backend
+                .as_deref()
+                .unwrap_or_else(|| backend::default_backend());
+            dispatch_backend!(backend_name, device, {
+                tournament::run_tournament::<TB>(&tournament_args, &device)
+            })
         }
         Some(Command::Train(args)) => {
             // Training mode with explicit subcommand
@@ -1106,9 +1110,16 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
     let r = running.clone();
     ctrlc_handler(r);
 
-    // Initialize device
-    let device = init_device();
-    println!("Backend: {} ({})", backend_name(), device_name(&device));
+    // Get backend from args or use default
+    let backend_name = args
+        .backend
+        .as_deref()
+        .unwrap_or_else(|| backend::default_backend());
+    println!(
+        "Backend: {} ({})",
+        backend::get_backend_display_name(backend_name),
+        backend_name
+    );
 
     // Print rating guide for understanding Openskill ratings
     print_rating_guide();
@@ -1128,42 +1139,44 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
         }
     }
 
-    // Dispatch to environment-specific training
-    // Full static dispatch: VecEnv<CartPole> and VecEnv<ConnectFour> are separate types
-    let seed = config.seed;
-    match config.env.as_str() {
-        "cartpole" => run_training::<CartPole, _>(
-            &mode,
-            &config,
-            &run_dir,
-            resumed_metadata.as_ref(),
-            &device,
-            &running,
-            move |i| CartPole::new(seed + i as u64),
-        ),
-        "connect_four" => run_training::<ConnectFour, _>(
-            &mode,
-            &config,
-            &run_dir,
-            resumed_metadata.as_ref(),
-            &device,
-            &running,
-            move |i| ConnectFour::new(seed + i as u64),
-        ),
-        "liars_dice" => run_training::<LiarsDice, _>(
-            &mode,
-            &config,
-            &run_dir,
-            resumed_metadata.as_ref(),
-            &device,
-            &running,
-            move |i| LiarsDice::new(seed + i as u64),
-        ),
-        _ => bail!(
-            "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice",
-            config.env
-        ),
-    }
+    // Dispatch to backend and environment
+    // Full static dispatch for both backend and environment types
+    dispatch_backend!(backend_name, device, {
+        let seed = config.seed;
+        match config.env.as_str() {
+            "cartpole" => run_training::<TB, CartPole, _>(
+                &mode,
+                &config,
+                &run_dir,
+                resumed_metadata.as_ref(),
+                &device,
+                &running,
+                move |i| CartPole::new(seed + i as u64),
+            ),
+            "connect_four" => run_training::<TB, ConnectFour, _>(
+                &mode,
+                &config,
+                &run_dir,
+                resumed_metadata.as_ref(),
+                &device,
+                &running,
+                move |i| ConnectFour::new(seed + i as u64),
+            ),
+            "liars_dice" => run_training::<TB, LiarsDice, _>(
+                &mode,
+                &config,
+                &run_dir,
+                resumed_metadata.as_ref(),
+                &device,
+                &running,
+                move |i| LiarsDice::new(seed + i as u64),
+            ),
+            _ => bail!(
+                "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice",
+                config.env
+            ),
+        }
+    })
 }
 
 /// Set up Ctrl+C handler for graceful shutdown

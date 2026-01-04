@@ -1952,6 +1952,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![],
+            backend: None,
             num_games: 3,
             num_envs: 1,
             temp: Some(1.0),
@@ -1987,6 +1988,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![],
+            backend: None,
             num_games: 5,
             num_envs: 1,
             temp: Some(0.5),
@@ -2016,6 +2018,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![],
+            backend: None,
             num_games: 5,
             num_envs: 1,
             temp: Some(1.0),
@@ -2044,6 +2047,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![checkpoint.clone()],
+            backend: None,
             num_games: 1,
             num_envs: 1,
             temp: Some(1.0),
@@ -2074,6 +2078,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![checkpoint],
+            backend: None,
             num_games: 1,
             num_envs: 1,
             temp: Some(1.0),
@@ -2105,6 +2110,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![temp.path().to_path_buf()],
+            backend: None,
             num_games: 1,
             num_envs: 1,
             temp: Some(1.0),
@@ -2135,6 +2141,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![temp.path().to_path_buf()],
+            backend: None,
             num_games: 1,
             num_envs: 1,
             temp: Some(1.0),
@@ -2158,6 +2165,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![PathBuf::from("/nonexistent/path/to/checkpoint")],
+            backend: None,
             num_games: 1,
             num_envs: 1,
             temp: Some(1.0),
@@ -2186,6 +2194,7 @@ mod tests {
         // Actually, an empty dir won't pass is_run_checkpoints_dir, so this is invalid
         let args = TournamentArgs {
             sources: vec![temp.path().to_path_buf()],
+            backend: None,
             num_games: 1,
             num_envs: 1,
             temp: Some(1.0),
@@ -2262,6 +2271,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![],
+            backend: None,
             num_games: 8,
             num_envs: 1,
             temp: Some(1.0),
@@ -2353,6 +2363,7 @@ mod tests {
 
         let args = TournamentArgs {
             sources: vec![],
+            backend: None,
             num_games: 3,
             num_envs: 1,
             temp: Some(1.0),
