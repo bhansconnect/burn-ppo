@@ -433,7 +433,7 @@ fn test_eval_with_temperature() {
         best_checkpoint.to_str().unwrap(),
         "--num-games",
         "5",
-        "--temperature",
+        "--temp",
         "0.5",
         "--temp-cutoff",
         "10",
@@ -443,7 +443,7 @@ fn test_eval_with_temperature() {
 
     assert!(
         output.status.success(),
-        "Eval with temperature failed: {}",
+        "Eval with temp failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -678,6 +678,53 @@ run_dir = "{}"
     assert!(
         output.status.success(),
         "Connect Four training failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_liars_dice_training() {
+    let dir = tempdir().unwrap();
+
+    // Create config for Liar's Dice
+    let config_content = format!(
+        r#"
+env = "liars_dice"
+num_envs = 2
+num_steps = 8
+total_timesteps = 64
+num_epochs = 1
+num_minibatches = 1
+hidden_size = 16
+num_hidden = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.1
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 32
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("ld_config.toml");
+    fs::write(&config_path, config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "Liar's Dice training failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

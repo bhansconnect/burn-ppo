@@ -569,7 +569,9 @@ pub struct UpdateMetrics {
 
 /// Perform PPO update on collected rollouts
 ///
-/// Implements clipped surrogate objective with value clipping
+/// Implements clipped surrogate objective with value clipping.
+/// Takes buffer with inner (non-autodiff) backend tensors and converts them
+/// to autodiff tensors for gradient computation.
 #[expect(
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
@@ -577,7 +579,7 @@ pub struct UpdateMetrics {
 )]
 pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     model: ActorCritic<B>,
-    buffer: &RolloutBuffer<B>,
+    buffer: &RolloutBuffer<B::InnerBackend>,
     optimizer: &mut impl burn::optim::Optimizer<ActorCritic<B>, B>,
     config: &Config,
     learning_rate: f64,
@@ -587,7 +589,27 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     profile_function!();
     let device = model.devices()[0].clone();
     let num_players = buffer.num_players() as usize;
-    let (obs, actions, old_log_probs, advantages, returns, acting_players) = buffer.flatten();
+
+    // Get flattened data from inner backend buffer
+    let (
+        obs_inner,
+        actions_inner,
+        old_log_probs_inner,
+        advantages_inner,
+        returns_inner,
+        acting_players_inner,
+    ) = buffer.flatten();
+
+    // Convert inner backend tensors to autodiff tensors for gradient computation
+    let obs: Tensor<B, 2> = Tensor::from_inner(obs_inner);
+    let actions: Tensor<B, 1, Int> = Tensor::from_inner(actions_inner);
+    let old_log_probs: Tensor<B, 1> = Tensor::from_inner(old_log_probs_inner);
+    let advantages: Tensor<B, 1> = Tensor::from_inner(advantages_inner);
+    let returns: Tensor<B, 1> = Tensor::from_inner(returns_inner);
+    let acting_players: Tensor<B, 1, Int> = Tensor::from_inner(acting_players_inner);
+
+    // Also convert buffer.values for value clipping (if enabled)
+    let old_values: Tensor<B, 2> = Tensor::from_inner(buffer.values.clone());
     let batch_size = obs.dims()[0];
     let minibatch_size = batch_size / config.num_minibatches;
 
@@ -705,7 +727,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
 
                 // Value loss (optionally clipped)
                 let value_loss = if config.clip_value {
-                    let mb_old_values = buffer.values.clone().flatten(0, 1).select(
+                    let mb_old_values = old_values.clone().flatten(0, 1).select(
                         0,
                         Tensor::from_ints(
                             indices[mb_start..mb_end]

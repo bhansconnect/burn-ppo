@@ -93,11 +93,11 @@ impl TempSchedule {
         }
     }
 
-    /// Create a `TempSchedule` from CLI arguments
+    /// Create a `TempSchedule` from CLI arguments with a default temperature
     ///
     /// # Errors
     /// Returns an error if --temp-final or --temp-decay is used without --temp-cutoff
-    pub fn from_args(args: &EvalArgs) -> Result<Self> {
+    pub fn from_args_with_default(args: &EvalArgs, default_temp: f32) -> Result<Self> {
         // Validate: temp_final and temp_decay require temp_cutoff
         if args.temp_cutoff.is_none() {
             if args.temp_final.is_some() {
@@ -109,7 +109,7 @@ impl TempSchedule {
         }
 
         Ok(Self::new(
-            args.temperature,
+            args.temp.unwrap_or(default_temp),
             args.temp_final.unwrap_or(0.0),
             args.temp_cutoff,
             args.temp_decay,
@@ -658,7 +658,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
 
     // Create temperature schedule from config
     let temp_schedule = TempSchedule::new(
-        config.challenger_temperature,
+        config.challenger_temp,
         config.challenger_temp_final.unwrap_or(0.0),
         config.challenger_temp_cutoff,
         config.challenger_temp_decay,
@@ -960,7 +960,6 @@ fn run_interactive_evaluation<B: Backend>(
     // Setup
     let seed = args.seed.unwrap_or(42);
     let mut rng = StdRng::seed_from_u64(seed);
-    let temp_schedule = TempSchedule::from_args(args)?;
 
     let num_games = if args.num_games == 100 {
         1
@@ -970,6 +969,9 @@ fn run_interactive_evaluation<B: Backend>(
 
     // Dispatch based on environment name
     dispatch_env!(env_name, {
+        // Create temp schedule with environment-specific default
+        let temp_schedule = TempSchedule::from_args_with_default(args, E::DEFAULT_TEMP)?;
+
         // Verify player count matches
         let expected_players = E::NUM_PLAYERS;
         if player_sources.len() != expected_players {
@@ -1008,10 +1010,12 @@ fn run_watch_mode<B: Backend>(
 ) -> Result<()> {
     let seed = args.seed.unwrap_or(42);
     let mut rng = StdRng::seed_from_u64(seed);
-    let temp_schedule = TempSchedule::from_args(args)?;
 
     // Dispatch based on env_name stored in checkpoint metadata
-    crate::dispatch_env_ok!(metadata.env_name, {
+    crate::dispatch_env!(metadata.env_name, {
+        // Create temp schedule with environment-specific default
+        let temp_schedule = TempSchedule::from_args_with_default(args, E::DEFAULT_TEMP)?;
+
         run_watch_mode_env::<B, E>(
             models,
             normalizers,
@@ -1025,6 +1029,7 @@ fn run_watch_mode<B: Backend>(
             &mut rng,
             device,
         );
+        Ok(())
     })
 }
 
@@ -1391,11 +1396,13 @@ fn run_stats_mode<B: Backend>(
 ) -> Result<()> {
     let seed = args.seed.unwrap_or(42);
     let mut rng = StdRng::seed_from_u64(seed);
-    let temp_schedule = TempSchedule::from_args(args)?;
 
     // Dispatch based on env_name stored in checkpoint metadata
     // Stats are printed inside run_stats_mode_env when not silent
-    crate::dispatch_env_ok!(metadata.env_name, {
+    crate::dispatch_env!(metadata.env_name, {
+        // Create temp schedule with environment-specific default
+        let temp_schedule = TempSchedule::from_args_with_default(args, E::DEFAULT_TEMP)?;
+
         run_stats_mode_env::<B, E>(
             models,
             normalizers,
@@ -1408,6 +1415,7 @@ fn run_stats_mode<B: Backend>(
             device,
             false, // not silent - print progress and summary
         );
+        Ok(())
     })
 }
 
@@ -1697,12 +1705,12 @@ mod tests {
             animate: false,
             fps: 10,
             seed: None,
-            temperature: 0.5,
+            temp: Some(0.5),
             temp_final: None,
             temp_cutoff: None,
             temp_decay: false,
         };
-        let schedule = TempSchedule::from_args(&args).unwrap();
+        let schedule = TempSchedule::from_args_with_default(&args, 0.3).unwrap();
         assert_eq!(schedule.get_temp(0), 0.5);
         assert_eq!(schedule.get_temp(100), 0.5);
 
@@ -1712,7 +1720,7 @@ mod tests {
             temp_final: Some(0.1),
             ..args
         };
-        let schedule = TempSchedule::from_args(&args).unwrap();
+        let schedule = TempSchedule::from_args_with_default(&args, 0.3).unwrap();
         assert_eq!(schedule.get_temp(0), 0.5);
         assert_eq!(schedule.get_temp(10), 0.1);
     }
@@ -1733,12 +1741,12 @@ mod tests {
             animate: false,
             fps: 10,
             seed: None,
-            temperature: 0.5,
+            temp: Some(0.5),
             temp_final: Some(0.1), // final without cutoff = error
             temp_cutoff: None,
             temp_decay: false,
         };
-        let result = TempSchedule::from_args(&args);
+        let result = TempSchedule::from_args_with_default(&args, 0.3);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1762,12 +1770,12 @@ mod tests {
             animate: false,
             fps: 10,
             seed: None,
-            temperature: 0.5,
+            temp: Some(0.5),
             temp_final: None,
             temp_cutoff: None,
             temp_decay: true, // decay without cutoff = error
         };
-        let result = TempSchedule::from_args(&args);
+        let result = TempSchedule::from_args_with_default(&args, 0.3);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

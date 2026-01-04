@@ -112,9 +112,9 @@ pub struct EvalArgs {
     #[arg(long)]
     pub seed: Option<u64>,
 
-    /// Initial softmax temperature (0.0 = deterministic argmax)
-    #[arg(long, default_value = "0.3")]
-    pub temperature: f32,
+    /// Initial softmax temperature (uses environment default if not specified)
+    #[arg(long)]
+    pub temp: Option<f32>,
 
     /// Temperature after cutoff (requires --temp-cutoff)
     #[arg(long)]
@@ -159,9 +159,9 @@ pub struct TournamentArgs {
     #[arg(long)]
     pub random: bool,
 
-    /// Initial softmax temperature (0.0 = deterministic argmax)
-    #[arg(long, default_value = "0.3")]
-    pub temperature: f32,
+    /// Initial softmax temperature (uses environment default if not specified)
+    #[arg(long)]
+    pub temp: Option<f32>,
 
     /// Temperature after cutoff (requires --temp-cutoff)
     #[arg(long)]
@@ -293,8 +293,8 @@ pub struct Config {
     #[serde(default = "default_challenger_threshold")]
     pub challenger_threshold: f64,
     /// Temperature for challenger evaluation action sampling (default: 0.3)
-    #[serde(default = "default_challenger_temperature")]
-    pub challenger_temperature: f32,
+    #[serde(default = "default_challenger_temp")]
+    pub challenger_temp: f32,
     /// Final temperature after cutoff (default: 0.0)
     #[serde(default)]
     pub challenger_temp_final: Option<f32>,
@@ -381,7 +381,7 @@ const fn default_challenger_games() -> usize {
 const fn default_challenger_threshold() -> f64 {
     0.55
 }
-const fn default_challenger_temperature() -> f32 {
+const fn default_challenger_temp() -> f32 {
     0.3
 }
 
@@ -418,7 +418,7 @@ impl Default for Config {
             challenger_eval: false,
             challenger_games: default_challenger_games(),
             challenger_threshold: default_challenger_threshold(),
-            challenger_temperature: default_challenger_temperature(),
+            challenger_temp: default_challenger_temp(),
             challenger_temp_final: None,
             challenger_temp_cutoff: None,
             challenger_temp_decay: false,
@@ -546,9 +546,9 @@ impl Config {
         use anyhow::bail;
 
         // Validate environment name
-        if !["cartpole", "connect_four"].contains(&self.env.as_str()) {
+        if !["cartpole", "connect_four", "liars_dice"].contains(&self.env.as_str()) {
             bail!(
-                "Unknown environment '{}'. Supported: cartpole, connect_four",
+                "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice",
                 self.env
             );
         }

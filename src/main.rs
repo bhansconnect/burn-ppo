@@ -33,19 +33,20 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use burn::grad_clipping::GradientClippingConfig;
+use burn::module::AutodiffModule;
 use burn::optim::AdamConfig;
 use burn::prelude::*;
 use clap::Parser;
 use rand::SeedableRng;
 
-use crate::backend::{backend_name, device_name, init_device, TrainingBackend};
+use crate::backend::{backend_name, device_name, init_device, InferenceBackend, TrainingBackend};
 use crate::checkpoint::{
     load_metadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer,
     save_optimizer, save_rng_state, update_training_rating, CheckpointManager, CheckpointMetadata,
 };
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_outcome_rates, Environment, GameOutcome, VecEnv};
-use crate::envs::{CartPole, ConnectFour};
+use crate::envs::{CartPole, ConnectFour, LiarsDice};
 use crate::eval::run_challenger_eval;
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
@@ -294,8 +295,9 @@ where
         }
     };
 
-    // Create rollout buffer
-    let mut buffer: RolloutBuffer<TrainingBackend> =
+    // Create rollout buffer with inference backend (non-autodiff)
+    // This prevents memory accumulation from autodiff graph during rollout
+    let mut buffer: RolloutBuffer<InferenceBackend> =
         RolloutBuffer::new(config.num_steps, num_envs, obs_dim, num_players, device);
 
     // Create metrics logger
@@ -415,10 +417,11 @@ where
             config.entropy_coef
         };
 
-        // Collect rollouts
+        // Collect rollouts using non-autodiff model for inference
         let rollout_start = std::time::Instant::now();
+        let inference_model = model.valid();
         let completed_episodes = collect_rollouts(
-            &model,
+            &inference_model,
             &mut vec_env,
             &mut buffer,
             config.num_steps,
@@ -466,15 +469,15 @@ where
             }
         }
 
-        // Compute bootstrap value (normalize observations if normalizer is active)
+        // Compute bootstrap value using non-autodiff inference
         let mut obs_flat = vec_env.get_observations();
         if let Some(ref norm) = obs_normalizer {
             norm.normalize_batch(&mut obs_flat, obs_dim);
         }
-        let obs_tensor: Tensor<TrainingBackend, 2> =
-            Tensor::<TrainingBackend, 1>::from_floats(obs_flat.as_slice(), device)
+        let obs_tensor: Tensor<InferenceBackend, 2> =
+            Tensor::<InferenceBackend, 1>::from_floats(obs_flat.as_slice(), device)
                 .reshape([num_envs, obs_dim]);
-        let (_, all_values) = model.forward(obs_tensor);
+        let (_, all_values) = inference_model.forward(obs_tensor);
 
         // Compute GAE - dispatch based on number of players
         let gae_start = std::time::Instant::now();
@@ -490,7 +493,7 @@ where
             );
         } else {
             // Single-player: extract player 0's values [num_envs]
-            let last_values: Tensor<TrainingBackend, 1> =
+            let last_values: Tensor<InferenceBackend, 1> =
                 all_values.slice([0..num_envs, 0..1]).flatten(0, 1);
             compute_gae(
                 &mut buffer,
@@ -1147,8 +1150,17 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
             &running,
             move |i| ConnectFour::new(seed + i as u64),
         ),
+        "liars_dice" => run_training::<LiarsDice, _>(
+            &mode,
+            &config,
+            &run_dir,
+            resumed_metadata.as_ref(),
+            &device,
+            &running,
+            move |i| LiarsDice::new(seed + i as u64),
+        ),
         _ => bail!(
-            "Unknown environment '{}'. Supported: cartpole, connect_four",
+            "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice",
             config.env
         ),
     }
