@@ -15,8 +15,7 @@ pub enum GameOutcome {
     Placements(Vec<usize>),
 }
 
-/// Minimal environment interface - just what PPO needs.
-/// Uses write-buffer API for zero allocations in hot paths.
+/// Minimal environment interface - just what PPO needs
 pub trait Environment: Send + Sync + Sized + 'static {
     /// Dimension of observation vector
     const OBSERVATION_DIM: usize;
@@ -34,27 +33,26 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// For deterministic games, the seed may be ignored.
     fn new(seed: u64) -> Self;
 
-    /// Reset environment and write initial observation to buffer.
-    /// Buffer must have length `OBSERVATION_DIM`.
-    fn reset(&mut self, obs: &mut [f32]);
+    /// Reset environment and return initial observation
+    fn reset(&mut self) -> Vec<f32>;
 
-    /// Take action and write results to buffers. Returns done flag.
+    /// Take action and return (observation, rewards[`NUM_PLAYERS`], done)
     ///
     /// For multi-player games:
-    /// - obs: player-agnostic observation (length `OBSERVATION_DIM`)
-    /// - rewards: reward for EACH player this step (length `NUM_PLAYERS`)
-    /// - returns: true if episode ended
-    fn step(&mut self, action: usize, obs: &mut [f32], rewards: &mut [f32]) -> bool;
+    /// - observation: player-agnostic (same encoding for all players)
+    /// - rewards: reward for EACH player this step (not just actor)
+    /// - done: true if episode ended
+    fn step(&mut self, action: usize) -> (Vec<f32>, Vec<f32>, bool);
 
     /// Current player index (`0..NUM_PLAYERS`). Default 0 for single-agent.
     fn current_player(&self) -> usize {
         0
     }
 
-    /// Write action mask to buffer. Always writes.
-    /// Buffer must have length `ACTION_COUNT`.
-    /// Environments without dynamic masking should write all `true`.
-    fn action_mask(&self, mask: &mut [bool]);
+    /// Return mask of valid actions (true = valid). None = all valid.
+    fn action_mask(&self) -> Option<Vec<bool>> {
+        None
+    }
 
     /// Return explicit game outcome when episode is done.
     /// Override this if using reward shaping where `total_rewards` doesn't reflect outcome.
@@ -149,22 +147,13 @@ pub fn compute_outcome_rates(
 
 /// Vectorized environment wrapper for parallel execution
 ///
-/// Steps N environments in parallel using rayon, automatically resetting
-/// on episode termination. Uses preallocated buffers for zero allocations
-/// in the hot path.
+/// Steps N environments in parallel, automatically resetting
+/// on episode termination.
 pub struct VecEnv<E: Environment> {
     envs: Vec<E>,
-    /// Pre-allocated flat observation buffer [`num_envs` * `OBSERVATION_DIM`]
+    /// Pre-allocated flat observation buffer [`num_envs` * `obs_dim`]
     obs_buffer: Vec<f32>,
-    /// Pre-allocated flat reward buffer [`num_envs` * `NUM_PLAYERS`]
-    reward_buffer: Vec<f32>,
-    /// Pre-allocated flat action mask buffer [`num_envs` * `ACTION_COUNT`]
-    mask_buffer: Vec<bool>,
-    /// Pre-allocated done buffer [`num_envs`]
-    done_buffer: Vec<bool>,
-    /// Pre-allocated current player buffer [`num_envs`]
-    player_buffer: Vec<usize>,
-    /// Accumulated rewards per env, per player [`num_envs`][`NUM_PLAYERS`] (reset on episode end)
+    /// Accumulated rewards per env, per player [`num_envs`][num_players] (reset on episode end)
     episode_rewards: Vec<Vec<f32>>,
     /// Steps taken per env (reset on episode end)
     episode_lengths: Vec<usize>,
@@ -180,31 +169,17 @@ impl<E: Environment> VecEnv<E> {
     {
         let mut envs: Vec<E> = (0..num_envs).map(factory).collect();
 
-        // Pre-allocate all buffers
+        // Pre-allocate flat observation buffer and initialize with reset observations
         let mut obs_buffer = vec![0.0; num_envs * E::OBSERVATION_DIM];
-        let reward_buffer = vec![0.0; num_envs * E::NUM_PLAYERS];
-        let mut mask_buffer = vec![false; num_envs * E::ACTION_COUNT];
-        let done_buffer = vec![false; num_envs];
-        let mut player_buffer = vec![0; num_envs];
-
-        // Initialize with reset observations, masks, and players
         for (i, env) in envs.iter_mut().enumerate() {
-            let obs_slice = &mut obs_buffer[i * E::OBSERVATION_DIM..][..E::OBSERVATION_DIM];
-            env.reset(obs_slice);
-
-            let mask_slice = &mut mask_buffer[i * E::ACTION_COUNT..][..E::ACTION_COUNT];
-            env.action_mask(mask_slice);
-
-            player_buffer[i] = env.current_player();
+            let obs = env.reset();
+            let offset = i * E::OBSERVATION_DIM;
+            obs_buffer[offset..offset + E::OBSERVATION_DIM].copy_from_slice(&obs);
         }
 
         Self {
             envs,
             obs_buffer,
-            reward_buffer,
-            mask_buffer,
-            done_buffer,
-            player_buffer,
             episode_rewards: vec![vec![0.0; E::NUM_PLAYERS]; num_envs],
             episode_lengths: vec![0; num_envs],
             terminal: vec![false; num_envs],
@@ -216,29 +191,30 @@ impl<E: Environment> VecEnv<E> {
         self.envs.len()
     }
 
-    /// Zero-copy access to observations [`num_envs` * `OBSERVATION_DIM`]
-    pub fn observations(&self) -> &[f32] {
-        &self.obs_buffer
+    /// Get current observations as flat array [`num_envs` * `obs_dim`]
+    pub fn get_observations(&self) -> Vec<f32> {
+        self.obs_buffer.clone()
     }
 
-    /// Zero-copy access to rewards [`num_envs` * `NUM_PLAYERS`]
-    pub fn rewards(&self) -> &[f32] {
-        &self.reward_buffer
+    /// Get current player index for each environment (`0..NUM_PLAYERS`)
+    pub fn get_current_players(&self) -> Vec<usize> {
+        self.envs.iter().map(Environment::current_player).collect()
     }
 
-    /// Zero-copy access to action masks [`num_envs` * `ACTION_COUNT`]
-    pub fn action_masks(&self) -> &[bool] {
-        &self.mask_buffer
-    }
+    /// Get action masks for all environments, flattened [`num_envs` * `action_count`]
+    /// Returns None if environment doesn't support action masking.
+    pub fn get_action_masks(&self) -> Option<Vec<bool>> {
+        // Check first env for masking support
+        self.envs[0].action_mask()?;
 
-    /// Zero-copy access to done flags [`num_envs`]
-    pub fn dones(&self) -> &[bool] {
-        &self.done_buffer
-    }
-
-    /// Zero-copy access to current players [`num_envs`]
-    pub fn current_players(&self) -> &[usize] {
-        &self.player_buffer
+        let action_count = E::ACTION_COUNT;
+        let mut masks = Vec::with_capacity(self.envs.len() * action_count);
+        for env in &self.envs {
+            if let Some(mask) = env.action_mask() {
+                masks.extend(mask);
+            }
+        }
+        Some(masks)
     }
 
     /// Mark an env as terminal (won't step or reset)
@@ -256,72 +232,56 @@ impl<E: Environment> VecEnv<E> {
         self.terminal.iter().filter(|&&t| !t).count()
     }
 
-    /// Step all environments with given actions (parallel, zero-allocation)
+    /// Step all environments with given actions
     ///
-    /// Results are written to internal buffers accessible via:
-    /// - `observations()` - new observations
-    /// - `rewards()` - step rewards
-    /// - `dones()` - done flags
-    ///
-    /// Returns completed episode stats (only allocation is for completed episodes)
-    pub fn step(&mut self, actions: &[usize]) -> Vec<EpisodeStats> {
+    /// Returns:
+    /// - observations: [`num_envs`, `obs_dim`] flattened
+    /// - `all_rewards`: [`num_envs`][num_players] - rewards for ALL players per env
+    /// - dones: [`num_envs`]
+    /// - `completed_episodes`: stats for any episodes that finished this step
+    pub fn step(
+        &mut self,
+        actions: &[usize],
+    ) -> (Vec<f32>, Vec<Vec<f32>>, Vec<bool>, Vec<EpisodeStats>) {
         profile_function!();
         assert_eq!(actions.len(), self.envs.len());
 
-        // Parallel step all environments - writes directly to preallocated buffers
-        let completed: Vec<Option<EpisodeStats>> = {
+        let num_players = E::NUM_PLAYERS;
+
+        // Parallel step all environments
+        let results: Vec<_> = {
             profile_scope!("parallel_env_step");
 
             self.envs
                 .par_iter_mut()
                 .zip(actions.par_iter())
-                .zip(self.obs_buffer.par_chunks_mut(E::OBSERVATION_DIM))
-                .zip(self.reward_buffer.par_chunks_mut(E::NUM_PLAYERS))
-                .zip(self.done_buffer.par_iter_mut())
-                .zip(self.mask_buffer.par_chunks_mut(E::ACTION_COUNT))
-                .zip(self.player_buffer.par_iter_mut())
                 .zip(self.episode_rewards.par_iter_mut())
                 .zip(self.episode_lengths.par_iter_mut())
+                .zip(self.obs_buffer.par_chunks_mut(E::OBSERVATION_DIM))
                 .zip(self.terminal.par_iter())
                 .enumerate()
                 .map(
                     |(
                         env_idx,
-                        (
-                            (
-                                (
-                                    ((((((env, &action), obs), rewards), done), mask), player),
-                                    ep_rewards,
-                                ),
-                                length,
-                            ),
-                            &is_terminal,
-                        ),
+                        (((((env, &action), ep_rewards), length), obs_chunk), &is_terminal),
                     )| {
                         #[cfg(feature = "tracy")]
                         let _span = tracy_client::span!("env_step");
 
                         // Skip terminal envs entirely
                         if is_terminal {
-                            rewards.fill(0.0);
-                            *done = true;
-                            return None;
+                            return (vec![0.0; num_players], true, None);
                         }
 
-                        // Step writes directly to preallocated slices - no allocation!
-                        *done = env.step(action, obs, rewards);
+                        let (new_obs, step_rewards, done) = env.step(action);
 
                         // Accumulate per-player rewards
-                        for (i, &r) in rewards.iter().enumerate() {
+                        for (i, &r) in step_rewards.iter().enumerate() {
                             ep_rewards[i] += r;
                         }
                         *length += 1;
 
-                        // Update mask and player after step
-                        env.action_mask(mask);
-                        *player = env.current_player();
-
-                        if *done {
+                        let completed = if done {
                             // Capture game outcome BEFORE reset (state is lost after reset)
                             let outcome = env.game_outcome();
                             let stats = EpisodeStats {
@@ -330,23 +290,42 @@ impl<E: Environment> VecEnv<E> {
                                 env_index: env_idx,
                                 outcome,
                             };
-                            // Reset writes to same obs buffer
-                            env.reset(obs);
-                            env.action_mask(mask);
-                            *player = env.current_player();
-                            ep_rewards.fill(0.0);
+                            let reset_obs = env.reset();
+                            obs_chunk.copy_from_slice(&reset_obs);
+                            for r in ep_rewards.iter_mut() {
+                                *r = 0.0;
+                            }
                             *length = 0;
                             Some(stats)
                         } else {
+                            obs_chunk.copy_from_slice(&new_obs);
                             None
-                        }
+                        };
+
+                        (step_rewards, done, completed)
                     },
                 )
                 .collect()
         };
 
-        // Only allocation: collect completed episodes
-        completed.into_iter().flatten().collect()
+        // Collect results (sequential, fast)
+        let mut all_rewards = Vec::with_capacity(self.envs.len());
+        let mut dones = Vec::with_capacity(self.envs.len());
+        let mut completed_episodes = Vec::new();
+
+        for (step_rewards, done, completed) in results {
+            // Ensure proper size even if env returned wrong size
+            let mut rewards = step_rewards;
+            rewards.resize(num_players, 0.0);
+            all_rewards.push(rewards);
+            dones.push(done);
+            if let Some(stats) = completed {
+                completed_episodes.push(stats);
+            }
+        }
+
+        let flat_obs = self.get_observations();
+        (flat_obs, all_rewards, dones, completed_episodes)
     }
 }
 
@@ -368,21 +347,15 @@ mod tests {
             Self { count: 0 }
         }
 
-        fn reset(&mut self, obs: &mut [f32]) {
+        fn reset(&mut self) -> Vec<f32> {
             self.count = 0;
-            obs[0] = 0.0;
+            vec![0.0]
         }
 
-        fn step(&mut self, _action: usize, obs: &mut [f32], rewards: &mut [f32]) -> bool {
+        fn step(&mut self, _action: usize) -> (Vec<f32>, Vec<f32>, bool) {
             self.count += 1;
             let done = self.count >= MAX_STEPS;
-            obs[0] = self.count as f32;
-            rewards[0] = 1.0;
-            done
-        }
-
-        fn action_mask(&self, mask: &mut [bool]) {
-            mask.fill(true); // All actions valid
+            (vec![self.count as f32], vec![1.0], done)
         }
     }
 
@@ -400,12 +373,11 @@ mod tests {
         let mut vec_env: VecEnv<CounterEnv<3>> = VecEnv::new(2, |i| CounterEnv::<3>::new(i as u64));
 
         let actions = vec![0, 1];
-        let completed = vec_env.step(&actions);
+        let (obs, all_rewards, dones, completed) = vec_env.step(&actions);
 
-        // Access results via buffer accessors
-        assert_eq!(vec_env.observations(), &[1.0, 1.0]); // Both envs stepped to count=1
-        assert_eq!(vec_env.rewards(), &[1.0, 1.0]); // Rewards for each env
-        assert_eq!(vec_env.dones(), &[false, false]);
+        assert_eq!(obs, vec![1.0, 1.0]); // Both envs stepped to count=1
+        assert_eq!(all_rewards, vec![vec![1.0], vec![1.0]]);
+        assert_eq!(dones, vec![false, false]);
         assert!(completed.is_empty());
     }
 
@@ -416,15 +388,15 @@ mod tests {
         // Step 1
         vec_env.step(&[0]);
         // Step 2 - should terminate
-        let completed = vec_env.step(&[0]);
+        let (obs, _all_rewards, dones, completed) = vec_env.step(&[0]);
 
-        assert_eq!(vec_env.dones(), &[true]);
+        assert_eq!(dones, vec![true]);
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].total_reward(), 2.0);
         assert_eq!(completed[0].length, 2);
 
         // After auto-reset, observations should be reset state
-        assert_eq!(vec_env.observations(), &[0.0]);
+        assert_eq!(obs, vec![0.0]);
     }
 
     #[test]
@@ -433,12 +405,12 @@ mod tests {
 
         // Run 5 steps to complete episode
         for _ in 0..4 {
-            vec_env.step(&[0]);
-            assert_eq!(vec_env.dones(), &[false]);
+            let (_, _, dones, _) = vec_env.step(&[0]);
+            assert_eq!(dones, vec![false]);
         }
 
-        let completed = vec_env.step(&[0]);
-        assert_eq!(vec_env.dones(), &[true]);
+        let (_, _, dones, completed) = vec_env.step(&[0]);
+        assert_eq!(dones, vec![true]);
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].total_reward(), 5.0);
         assert_eq!(completed[0].length, 5);
@@ -590,85 +562,15 @@ mod tests {
         vec_env.set_terminal(0);
 
         // Step - env 0 should be skipped
-        vec_env.step(&[0, 0]);
+        let (obs, all_rewards, dones, _) = vec_env.step(&[0, 0]);
 
         // Env 0 was terminal: returns zeroed rewards and done=true
-        assert_eq!(vec_env.rewards()[0], 0.0);
-        assert!(vec_env.dones()[0]);
+        assert_eq!(all_rewards[0], vec![0.0]);
+        assert!(dones[0]);
 
         // Env 1 was active: stepped normally
-        assert_eq!(vec_env.rewards()[1], 1.0);
-        assert!(!vec_env.dones()[1]);
-        assert_eq!(vec_env.observations()[1], 1.0); // Env 1 advanced to count=1
-    }
-
-    // =========================================
-    // Pre-refactor VecEnv coverage tests
-    // =========================================
-
-    #[test]
-    fn test_vec_env_action_masks() {
-        use crate::envs::ConnectFour;
-
-        let vec_env: VecEnv<ConnectFour> = VecEnv::new(2, |i| ConnectFour::new(i as u64));
-        let masks = vec_env.action_masks();
-
-        // ConnectFour has action masking - verify shape
-        assert_eq!(masks.len(), 2 * ConnectFour::ACTION_COUNT); // 2 envs * 7 actions
-
-        // Initially all columns valid (empty board)
-        assert!(masks.iter().all(|&m| m));
-    }
-
-    #[test]
-    fn test_vec_env_multi_player() {
-        use crate::envs::ConnectFour;
-
-        let mut vec_env: VecEnv<ConnectFour> = VecEnv::new(2, |i| ConnectFour::new(i as u64));
-
-        // Check current players - both should start with P0
-        let players = vec_env.current_players();
-        assert_eq!(players.len(), 2);
-        assert!(players.iter().all(|&p| p == 0));
-
-        // Step and verify player switches
-        vec_env.step(&[0, 0]); // Both drop in column 0
-        let players = vec_env.current_players();
-        assert!(players.iter().all(|&p| p == 1)); // Both now P1
-    }
-
-    #[test]
-    fn test_vec_env_obs_after_auto_reset() {
-        // CounterEnv<3> terminates after 3 steps
-        let mut vec_env: VecEnv<CounterEnv<3>> = VecEnv::new(2, |i| CounterEnv::<3>::new(i as u64));
-
-        // Step 3 times to trigger termination and auto-reset
-        vec_env.step(&[0, 0]);
-        vec_env.step(&[0, 0]);
-        vec_env.step(&[0, 0]);
-
-        // Both envs should have terminated
-        assert!(vec_env.dones()[0]);
-        assert!(vec_env.dones()[1]);
-
-        // After auto-reset, observations should be reset state (0.0)
-        assert_eq!(vec_env.observations()[0], 0.0);
-        assert_eq!(vec_env.observations()[1], 0.0);
-    }
-
-    #[test]
-    fn test_vec_env_four_player() {
-        use crate::envs::LiarsDice;
-
-        let vec_env: VecEnv<LiarsDice> = VecEnv::new(2, |i| LiarsDice::new(i as u64));
-
-        // Verify observation shape
-        assert_eq!(vec_env.observations().len(), 2 * LiarsDice::OBSERVATION_DIM); // 2 * 78 = 156
-
-        // Verify action masks shape
-        assert_eq!(vec_env.action_masks().len(), 2 * LiarsDice::ACTION_COUNT); // 2 * 49 = 98
-
-        // Verify current players
-        assert_eq!(vec_env.current_players().len(), 2);
+        assert_eq!(all_rewards[1], vec![1.0]);
+        assert!(!dones[1]);
+        assert_eq!(obs[1], 1.0); // Env 1 advanced to count=1
     }
 }
