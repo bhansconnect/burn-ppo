@@ -102,10 +102,10 @@ pub fn prompt_human_action<E: Environment>(
 
 /// Display all actions with validity indicators.
 fn show_actions<E: Environment>(env: &E) {
-    let mask = env.action_mask();
+    let mut mask = vec![false; E::ACTION_COUNT];
+    env.action_mask(&mut mask);
     println!("\nAvailable actions:");
-    for action in 0..E::ACTION_COUNT {
-        let valid = mask.as_ref().is_none_or(|m| m[action]);
+    for (action, &valid) in mask.iter().enumerate().take(E::ACTION_COUNT) {
         let marker = if valid { "  " } else { "X " };
         println!("  {}[{}] {}", marker, action, env.describe_action(action));
     }
@@ -115,10 +115,9 @@ fn show_actions<E: Environment>(env: &E) {
 
 /// Pick a random valid action.
 pub fn random_valid_action<E: Environment>(env: &E, rng: &mut impl Rng) -> usize {
-    let mask = env.action_mask();
-    let valid: Vec<usize> = (0..E::ACTION_COUNT)
-        .filter(|&a| mask.as_ref().is_none_or(|m| m[a]))
-        .collect();
+    let mut mask = vec![false; E::ACTION_COUNT];
+    env.action_mask(&mut mask);
+    let valid: Vec<usize> = (0..E::ACTION_COUNT).filter(|&a| mask[a]).collect();
 
     if valid.is_empty() {
         // Fallback: return 0 if somehow no valid actions (shouldn't happen)
@@ -133,7 +132,9 @@ fn is_valid_action<E: Environment>(env: &E, action: usize) -> bool {
     if action >= E::ACTION_COUNT {
         return false;
     }
-    env.action_mask().is_none_or(|m| m[action])
+    let mut mask = vec![false; E::ACTION_COUNT];
+    env.action_mask(&mut mask);
+    mask[action]
 }
 
 #[cfg(test)]
@@ -144,7 +145,7 @@ mod tests {
     // These tests cover the helper functions.
 
     struct MockEnv {
-        mask: Option<Vec<bool>>,
+        mask: Vec<bool>,
     }
 
     impl Environment for MockEnv {
@@ -153,28 +154,42 @@ mod tests {
         const NAME: &'static str = "mock";
 
         fn new(_seed: u64) -> Self {
-            Self { mask: None }
+            Self {
+                mask: vec![true; 4],
+            }
         }
 
-        fn reset(&mut self) -> Vec<f32> {
-            vec![0.0]
+        fn reset(&mut self, obs: &mut [f32]) {
+            obs[0] = 0.0;
         }
 
-        fn step(&mut self, _action: usize) -> (Vec<f32>, Vec<f32>, bool) {
-            (vec![0.0], vec![0.0], false)
+        fn step(&mut self, _action: usize, obs: &mut [f32], rewards: &mut [f32]) -> bool {
+            obs[0] = 0.0;
+            rewards[0] = 0.0;
+            false
         }
 
-        fn action_mask(&self) -> Option<Vec<bool>> {
-            self.mask.clone()
+        fn action_mask(&self, mask: &mut [bool]) {
+            mask.copy_from_slice(&self.mask);
+        }
+
+        fn describe_action(&self, action: usize) -> String {
+            format!("Action {action}")
+        }
+
+        fn parse_action(&self, _input: &str) -> Result<usize, String> {
+            Err("Not implemented".to_string())
         }
     }
 
     #[test]
     fn test_random_valid_action_no_mask() {
-        let env = MockEnv { mask: None };
+        let env = MockEnv {
+            mask: vec![true; 4],
+        }; // All actions valid
         let mut rng = rand::thread_rng();
 
-        // With no mask, any action should be valid
+        // With all true mask, any action should be valid
         for _ in 0..10 {
             let action = random_valid_action(&env, &mut rng);
             assert!(action < MockEnv::ACTION_COUNT);
@@ -184,7 +199,7 @@ mod tests {
     #[test]
     fn test_random_valid_action_with_mask() {
         let env = MockEnv {
-            mask: Some(vec![false, true, false, true]), // Only actions 1 and 3 valid
+            mask: vec![false, true, false, true], // Only actions 1 and 3 valid
         };
         let mut rng = rand::thread_rng();
 
@@ -197,7 +212,7 @@ mod tests {
     #[test]
     fn test_is_valid_action() {
         let env = MockEnv {
-            mask: Some(vec![true, false, true, false]),
+            mask: vec![true, false, true, false],
         };
 
         assert!(is_valid_action::<MockEnv>(&env, 0));
@@ -208,10 +223,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_valid_action_no_mask() {
-        let env = MockEnv { mask: None };
+    fn test_is_valid_action_all_valid() {
+        let env = MockEnv {
+            mask: vec![true; 4],
+        };
 
-        // All actions valid when no mask
+        // All actions valid when mask is all true
         for action in 0..MockEnv::ACTION_COUNT {
             assert!(is_valid_action::<MockEnv>(&env, action));
         }
@@ -223,7 +240,7 @@ mod tests {
     fn test_random_valid_action_single_valid() {
         // Edge case: only one action is valid
         let env = MockEnv {
-            mask: Some(vec![false, false, true, false]), // Only action 2 valid
+            mask: vec![false, false, true, false], // Only action 2 valid
         };
         let mut rng = rand::thread_rng();
 
@@ -237,7 +254,7 @@ mod tests {
     fn test_random_valid_action_all_invalid() {
         // Edge case: no valid actions (shouldn't happen in practice, but test fallback)
         let env = MockEnv {
-            mask: Some(vec![false, false, false, false]),
+            mask: vec![false, false, false, false],
         };
         let mut rng = rand::thread_rng();
 

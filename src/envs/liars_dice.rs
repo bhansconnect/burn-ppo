@@ -65,6 +65,8 @@ pub struct LiarsDice {
     dice: [[u8; DICE_PER_PLAYER]; NUM_PLAYERS],
     /// Dice remaining per player (0 = eliminated)
     dice_count: [usize; NUM_PLAYERS],
+    /// Cached total dice remaining (sum of `dice_count`)
+    total_dice: usize,
     /// Current player index (0-3)
     current_player: usize,
     /// Current bid: (quantity, face) or None if no bid yet
@@ -91,9 +93,9 @@ impl LiarsDice {
         }
     }
 
-    /// Count total dice remaining in game
+    /// Count total dice remaining in game (cached for performance)
     fn total_dice_remaining(&self) -> usize {
-        self.dice_count.iter().sum()
+        self.total_dice
     }
 
     /// Count how many alive players remain
@@ -176,6 +178,7 @@ impl LiarsDice {
         // Remove a die from loser
         if self.dice_count[loser] > 0 {
             self.dice_count[loser] -= 1;
+            self.total_dice -= 1;
         }
 
         // Check for elimination
@@ -213,8 +216,8 @@ impl LiarsDice {
     }
 
     /// Generate observation vector for current state
-    fn get_observation(&self) -> Vec<f32> {
-        let mut obs = vec![0.0; OBSERVATION_DIM];
+    fn write_observation(&self, obs: &mut [f32]) {
+        obs.fill(0.0);
         let mut idx = 0;
 
         // Own dice one-hot (12 floats: 2 dice × 6 faces)
@@ -266,8 +269,6 @@ impl LiarsDice {
         if let Some(bidder) = self.last_bidder {
             obs[idx + bidder] = 1.0;
         }
-
-        obs
     }
 
     /// Render the game state as ASCII art
@@ -353,6 +354,7 @@ impl Environment for LiarsDice {
         let mut env = Self {
             dice: [[0; DICE_PER_PLAYER]; NUM_PLAYERS],
             dice_count: [DICE_PER_PLAYER; NUM_PLAYERS],
+            total_dice: MAX_TOTAL_DICE,
             current_player: 0,
             current_bid: None,
             last_bidder: None,
@@ -365,10 +367,11 @@ impl Environment for LiarsDice {
         env
     }
 
-    fn reset(&mut self) -> Vec<f32> {
+    fn reset(&mut self, obs: &mut [f32]) {
         profile_function!();
 
         self.dice_count = [DICE_PER_PLAYER; NUM_PLAYERS];
+        self.total_dice = MAX_TOTAL_DICE;
         self.current_player = 0;
         self.current_bid = None;
         self.last_bidder = None;
@@ -377,17 +380,18 @@ impl Environment for LiarsDice {
         self.game_over = false;
         self.roll_all_dice();
 
-        self.get_observation()
+        self.write_observation(obs);
     }
 
-    fn step(&mut self, action: usize) -> (Vec<f32>, Vec<f32>, bool) {
+    fn step(&mut self, action: usize, obs: &mut [f32], rewards: &mut [f32]) -> bool {
         profile_function!();
 
-        let mut rewards = vec![0.0; NUM_PLAYERS];
+        rewards.fill(0.0);
 
         // Invalid if game is over or player is eliminated
         if self.game_over || self.dice_count[self.current_player] == 0 {
-            return (self.get_observation(), rewards, true);
+            self.write_observation(obs);
+            return true;
         }
 
         match decode_action(action) {
@@ -396,7 +400,8 @@ impl Environment for LiarsDice {
                 if !self.is_valid_bid(quantity, face) {
                     // Invalid bid - end episode with no rewards
                     self.game_over = true;
-                    return (self.get_observation(), rewards, true);
+                    self.write_observation(obs);
+                    return true;
                 }
 
                 // Execute the bid
@@ -407,13 +412,15 @@ impl Environment for LiarsDice {
                 // Move to next alive player
                 self.current_player = self.next_alive_player(self.current_player);
 
-                (self.get_observation(), rewards, false)
+                self.write_observation(obs);
+                false
             }
             Action::CallLiar => {
                 // Can't call if no bid exists
                 if self.current_bid.is_none() {
                     self.game_over = true;
-                    return (self.get_observation(), rewards, true);
+                    self.write_observation(obs);
+                    return true;
                 }
 
                 // Resolve the call
@@ -429,7 +436,8 @@ impl Environment for LiarsDice {
                 // Start new round (handles elimination and game end)
                 self.start_new_round(loser);
 
-                (self.get_observation(), rewards, self.game_over)
+                self.write_observation(obs);
+                self.game_over
             }
         }
     }
@@ -438,12 +446,12 @@ impl Environment for LiarsDice {
         self.current_player
     }
 
-    fn action_mask(&self) -> Option<Vec<bool>> {
-        let mut mask = vec![false; ACTION_COUNT];
+    fn action_mask(&self, mask: &mut [bool]) {
+        mask.fill(false);
 
         // Can't act if eliminated or game over
         if self.dice_count[self.current_player] == 0 || self.game_over {
-            return Some(mask);
+            return;
         }
 
         // CALL_LIAR: only valid if there's a bid to challenge
@@ -451,16 +459,29 @@ impl Environment for LiarsDice {
 
         // BID actions: must be higher than current bid AND within dice count
         let max_qty = self.total_dice_remaining();
-        for q in 1..=max_qty {
-            for f in 1..=DICE_FACES {
-                if self.is_valid_bid(q, f) {
-                    let action = encode_bid(q, f);
-                    mask[action] = true;
+
+        match self.current_bid {
+            None => {
+                // No current bid - all bids up to max_qty are valid
+                for q in 1..=max_qty {
+                    for f in 1..=DICE_FACES {
+                        mask[encode_bid(q, f)] = true;
+                    }
+                }
+            }
+            Some((cur_q, cur_f)) => {
+                // Same quantity, higher face
+                for f in (cur_f + 1)..=DICE_FACES {
+                    mask[encode_bid(cur_q, f)] = true;
+                }
+                // Higher quantities, any face
+                for q in (cur_q + 1)..=max_qty {
+                    for f in 1..=DICE_FACES {
+                        mask[encode_bid(q, f)] = true;
+                    }
                 }
             }
         }
-
-        Some(mask)
     }
 
     fn render(&self) -> Option<String> {
@@ -524,7 +545,8 @@ mod tests {
     #[test]
     fn test_reset() {
         let mut env = LiarsDice::new(42);
-        let obs = env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         assert_eq!(obs.len(), OBSERVATION_DIM);
         assert_eq!(obs.len(), 78);
@@ -542,14 +564,16 @@ mod tests {
     #[test]
     fn test_observation_dimension() {
         let env = LiarsDice::new(42);
-        let obs = env.get_observation();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        env.write_observation(&mut obs);
         assert_eq!(obs.len(), 78);
     }
 
     #[test]
     fn test_valid_bid_first() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         // Any valid bid should work as first bid
         assert!(env.is_valid_bid(1, 1));
@@ -561,7 +585,8 @@ mod tests {
     #[test]
     fn test_valid_bid_raises() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         env.current_bid = Some((3, 4)); // "3 fours"
 
@@ -585,13 +610,15 @@ mod tests {
     #[test]
     fn test_step_bid() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         let action = encode_bid(2, 3); // "2 threes"
-        let (obs, rewards, done) = env.step(action);
+        let done = env.step(action, &mut obs, &mut rewards);
 
         assert_eq!(obs.len(), OBSERVATION_DIM);
-        assert_eq!(rewards, vec![0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(rewards, [0.0, 0.0, 0.0, 0.0]);
         assert!(!done);
         assert_eq!(env.current_bid, Some((2, 3)));
         assert_eq!(env.current_player, 1); // Moved to next player
@@ -600,18 +627,22 @@ mod tests {
     #[test]
     fn test_call_liar_no_bid() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Can't call liar if no bid
-        let (_, rewards, done) = env.step(CALL_LIAR_ACTION);
+        let done = env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards);
         assert!(done);
-        assert_eq!(rewards, vec![0.0, 0.0, 0.0, 0.0]);
+        assert_eq!(rewards, [0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
     fn test_call_liar_bidder_loses() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up known dice: all players have [1, 2]
         for p in 0..NUM_PLAYERS {
@@ -622,10 +653,10 @@ mod tests {
         // Total 2s: 4 (actual) + 4 (wild 1s) = 8
 
         // Player 0 bids "5 ones" (only 4 exist) - an overbid
-        env.step(encode_bid(5, 1));
+        env.step(encode_bid(5, 1), &mut obs, &mut rewards);
 
         // Now player 1's turn, they call liar
-        let (_, rewards, done) = env.step(CALL_LIAR_ACTION);
+        let done = env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards);
 
         // Bid was false (only 4 ones, not 5), so bidder (P0) loses
         assert!(!done); // Game continues
@@ -642,7 +673,9 @@ mod tests {
     #[test]
     fn test_call_liar_caller_loses() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up known dice: all players have [3, 3]
         for p in 0..NUM_PLAYERS {
@@ -652,10 +685,10 @@ mod tests {
         // Total 3s: 8
 
         // Player 0 bids "4 threes" (8 exist, so valid)
-        env.step(encode_bid(4, 3));
+        env.step(encode_bid(4, 3), &mut obs, &mut rewards);
 
         // Player 1 calls liar (incorrectly - bid is true)
-        let (_, rewards, done) = env.step(CALL_LIAR_ACTION);
+        let done = env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards);
 
         // Bid was true (8 threes >= 4), so caller (P1) loses
         assert!(!done);
@@ -692,7 +725,9 @@ mod tests {
     #[test]
     fn test_bid_on_ones() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up: mix of 1s and other numbers
         env.dice[0] = [1, 1];
@@ -702,10 +737,10 @@ mod tests {
         // Total actual 1s: 3
 
         // Bid "4 ones" (overbid)
-        env.step(encode_bid(4, 1));
+        env.step(encode_bid(4, 1), &mut obs, &mut rewards);
 
         // Call liar
-        let (_, rewards, _) = env.step(CALL_LIAR_ACTION);
+        env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards);
 
         // Bidder (P0) should lose - only 3 ones, not 4
         assert_eq!(rewards[0], 0.0);
@@ -715,10 +750,13 @@ mod tests {
     #[test]
     fn test_elimination() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set player 0 to 1 die
         env.dice_count[0] = 1;
+        env.total_dice = 7;
 
         // Make P0 lose (set up a bad bid and call)
         // dice array is fixed size, but only dice_count[p] are "active"
@@ -728,8 +766,8 @@ mod tests {
         env.dice[3] = [2, 3];
         // No 1s, so bidding on 1s will fail
 
-        env.step(encode_bid(1, 1)); // P0 bids "1 one" (doesn't exist)
-        env.step(CALL_LIAR_ACTION); // P1 calls
+        env.step(encode_bid(1, 1), &mut obs, &mut rewards); // P0 bids "1 one" (doesn't exist)
+        env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards); // P1 calls
 
         // P0 should be eliminated
         assert_eq!(env.dice_count[0], 0);
@@ -739,10 +777,12 @@ mod tests {
     #[test]
     fn test_game_end() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         // Set up: only P3 has dice, others eliminated
         env.dice_count = [0, 0, 0, 2];
+        env.total_dice = 2;
         env.elimination_order = vec![0, 1, 2];
         env.current_player = 3;
         env.game_over = true;
@@ -766,9 +806,12 @@ mod tests {
     #[test]
     fn test_action_mask() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        let mut mask = [false; ACTION_COUNT];
+        env.reset(&mut obs);
 
-        let mask = env.action_mask().unwrap();
+        env.action_mask(&mut mask);
         assert_eq!(mask.len(), ACTION_COUNT);
 
         // No bid yet, so call liar should be invalid
@@ -783,9 +826,9 @@ mod tests {
         }
 
         // Make a bid
-        env.step(encode_bid(3, 4)); // "3 fours"
+        env.step(encode_bid(3, 4), &mut obs, &mut rewards); // "3 fours"
 
-        let mask = env.action_mask().unwrap();
+        env.action_mask(&mut mask);
 
         // Now call liar should be valid
         assert!(mask[CALL_LIAR_ACTION]);
@@ -803,39 +846,46 @@ mod tests {
     #[test]
     fn test_player_switching() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         assert_eq!(env.current_player(), 0);
 
-        env.step(encode_bid(1, 1));
+        env.step(encode_bid(1, 1), &mut obs, &mut rewards);
         assert_eq!(env.current_player(), 1);
 
-        env.step(encode_bid(1, 2));
+        env.step(encode_bid(1, 2), &mut obs, &mut rewards);
         assert_eq!(env.current_player(), 2);
 
-        env.step(encode_bid(1, 3));
+        env.step(encode_bid(1, 3), &mut obs, &mut rewards);
         assert_eq!(env.current_player(), 3);
 
-        env.step(encode_bid(1, 4));
+        env.step(encode_bid(1, 4), &mut obs, &mut rewards);
         assert_eq!(env.current_player(), 0); // Wraps around
     }
 
     #[test]
     fn test_skip_eliminated_player() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Eliminate player 1
         env.dice_count[1] = 0;
+        env.total_dice = 6;
 
-        env.step(encode_bid(1, 1)); // P0 bids
+        env.step(encode_bid(1, 1), &mut obs, &mut rewards); // P0 bids
         assert_eq!(env.current_player(), 2); // Skips P1
     }
 
     #[test]
     fn test_loser_starts_next_round() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up so P1 will lose when they call
         env.dice[0] = [3, 3];
@@ -844,8 +894,8 @@ mod tests {
         env.dice[3] = [3, 3];
         // Total 3s: 8
 
-        env.step(encode_bid(4, 3)); // P0 bids "4 threes"
-        env.step(CALL_LIAR_ACTION); // P1 calls (loses - bid was true)
+        env.step(encode_bid(4, 3), &mut obs, &mut rewards); // P0 bids "4 threes"
+        env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards); // P1 calls (loses - bid was true)
 
         // P1 lost, so P1 should start next round (if still alive)
         assert_eq!(env.current_player, 1);
@@ -854,7 +904,9 @@ mod tests {
     #[test]
     fn test_rewards_distribution() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up: P0 makes a losing bid
         env.dice[0] = [2, 2];
@@ -863,8 +915,8 @@ mod tests {
         env.dice[3] = [2, 2];
         // No 1s
 
-        env.step(encode_bid(1, 1)); // P0 bids "1 one" (none exist)
-        let (_, rewards, _) = env.step(CALL_LIAR_ACTION); // P1 calls
+        env.step(encode_bid(1, 1), &mut obs, &mut rewards); // P0 bids "1 one" (none exist)
+        env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards); // P1 calls
 
         // P0 (loser) gets 0, everyone else gets 1
         assert_eq!(rewards[0], 0.0);
@@ -876,18 +928,21 @@ mod tests {
     #[test]
     fn test_game_outcome_none_when_not_over() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         assert_eq!(env.game_outcome(), None);
 
-        env.step(encode_bid(1, 1));
+        env.step(encode_bid(1, 1), &mut obs, &mut rewards);
         assert_eq!(env.game_outcome(), None);
     }
 
     #[test]
     fn test_render() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         let rendered = env.render();
         assert!(rendered.is_some());
@@ -941,13 +996,15 @@ mod tests {
     #[test]
     fn test_observation_content() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set known dice for player 0
         env.dice[0] = [3, 5];
         env.current_player = 0;
 
-        let obs = env.get_observation();
+        env.write_observation(&mut obs);
 
         // Own dice one-hot encoding (indices 0-11, 2 dice × 6 faces)
         // Die 1 = 3: index (face-1) = 2 should be 1.0
@@ -977,8 +1034,7 @@ mod tests {
         assert_eq!(obs[72], 0.0, "No bid yet");
 
         // Now make a bid and verify observation updates
-        env.step(encode_bid(2, 4)); // "2 fours"
-        let obs = env.get_observation();
+        env.step(encode_bid(2, 4), &mut obs, &mut rewards); // "2 fours"
 
         // Current bid one-hot (indices 24-71)
         // Bid (2, 4) encodes to (2-1)*6 + (4-1) = 1*6 + 3 = 9
@@ -997,16 +1053,19 @@ mod tests {
     #[test]
     fn test_full_game_playthrough() {
         let mut env = LiarsDice::new(123);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        let mut mask = [false; ACTION_COUNT];
+        env.reset(&mut obs);
 
         let mut steps = 0;
         let max_steps = 1000;
 
         while !env.game_over && steps < max_steps {
-            let mask = env.action_mask().unwrap();
+            env.action_mask(&mut mask);
             // Pick first valid action
             let action = mask.iter().position(|&v| v).expect("No valid action");
-            env.step(action);
+            env.step(action, &mut obs, &mut rewards);
             steps += 1;
         }
 
@@ -1032,12 +1091,15 @@ mod tests {
     #[test]
     fn test_max_bid_reached() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        let mut mask = [false; ACTION_COUNT];
+        env.reset(&mut obs);
 
         // Bid the maximum possible: 8 sixes
-        env.step(encode_bid(8, 6));
+        env.step(encode_bid(8, 6), &mut obs, &mut rewards);
 
-        let mask = env.action_mask().unwrap();
+        env.action_mask(&mut mask);
 
         // Only call liar should be valid
         assert!(mask[CALL_LIAR_ACTION], "Call liar should be valid");
@@ -1056,10 +1118,13 @@ mod tests {
     #[test]
     fn test_two_player_endgame() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Eliminate P0 and P1
         env.dice_count = [0, 0, 1, 1];
+        env.total_dice = 2;
         env.elimination_order = vec![0, 1];
         env.current_player = 2;
         env.current_bid = None;
@@ -1067,15 +1132,15 @@ mod tests {
         env.dice[3] = [4, 0];
 
         // P2 bids
-        env.step(encode_bid(1, 3));
+        env.step(encode_bid(1, 3), &mut obs, &mut rewards);
         assert_eq!(env.current_player, 3, "Should skip to P3");
 
         // P3 raises
-        env.step(encode_bid(1, 4));
+        env.step(encode_bid(1, 4), &mut obs, &mut rewards);
         assert_eq!(env.current_player, 2, "Should go back to P2");
 
         // P2 calls liar (incorrectly - there is 1 four + 0 wilds = 1)
-        let (_, rewards, done) = env.step(CALL_LIAR_ACTION);
+        let done = env.step(CALL_LIAR_ACTION, &mut obs, &mut rewards);
 
         // P2 called incorrectly, P2 loses their last die
         assert!(done, "Game should be over");
@@ -1089,9 +1154,13 @@ mod tests {
     fn test_deterministic_seeding() {
         let mut env1 = LiarsDice::new(12345);
         let mut env2 = LiarsDice::new(12345);
+        let mut obs1 = [0.0; OBSERVATION_DIM];
+        let mut obs2 = [0.0; OBSERVATION_DIM];
+        let mut rewards1 = [0.0; NUM_PLAYERS];
+        let mut rewards2 = [0.0; NUM_PLAYERS];
 
-        env1.reset();
-        env2.reset();
+        env1.reset(&mut obs1);
+        env2.reset(&mut obs2);
 
         // Same seed should produce same dice
         assert_eq!(env1.dice, env2.dice, "Same seed should give same dice");
@@ -1101,11 +1170,11 @@ mod tests {
         );
 
         // Same actions should produce same results
-        env1.step(encode_bid(1, 1));
-        env2.step(encode_bid(1, 1));
+        env1.step(encode_bid(1, 1), &mut obs1, &mut rewards1);
+        env2.step(encode_bid(1, 1), &mut obs2, &mut rewards2);
 
-        env1.step(CALL_LIAR_ACTION);
-        env2.step(CALL_LIAR_ACTION);
+        env1.step(CALL_LIAR_ACTION, &mut obs1, &mut rewards1);
+        env2.step(CALL_LIAR_ACTION, &mut obs2, &mut rewards2);
 
         // After call, new dice are rolled - should still be deterministic
         assert_eq!(
@@ -1119,37 +1188,45 @@ mod tests {
     #[test]
     fn test_invalid_action_index() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Action index out of bounds (> 48) maps to invalid bid
         // decode_action(100) = Bid { quantity: 100/6 + 1 = 17, face: 100%6 + 1 = 5 }
         // quantity 17 > 8 total dice, so invalid
-        let (_, rewards, done) = env.step(100);
+        let done = env.step(100, &mut obs, &mut rewards);
         assert!(done, "Invalid action should end game");
-        assert_eq!(rewards, vec![0.0; 4], "No rewards for invalid action");
+        assert_eq!(rewards, [0.0; 4], "No rewards for invalid action");
     }
 
     #[test]
     fn test_action_after_game_over() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut rewards = [0.0; NUM_PLAYERS];
+        env.reset(&mut obs);
         env.game_over = true;
 
-        let (_, rewards, done) = env.step(encode_bid(1, 1));
+        let done = env.step(encode_bid(1, 1), &mut obs, &mut rewards);
         assert!(done, "Should return done=true");
-        assert_eq!(rewards, vec![0.0; 4], "No rewards when game already over");
+        assert_eq!(rewards, [0.0; 4], "No rewards when game already over");
     }
 
     #[test]
     fn test_reduced_dice_action_mask() {
         let mut env = LiarsDice::new(42);
-        env.reset();
+        let mut obs = [0.0; OBSERVATION_DIM];
+        let mut mask = [false; ACTION_COUNT];
+        env.reset(&mut obs);
 
         // Reduce total dice to 3 (one player with 3 dice, others eliminated)
+        // Note: dice_count[0] = 3 exceeds DICE_PER_PLAYER but tests edge case
         env.dice_count = [3, 0, 0, 0];
+        env.total_dice = 3;
         env.dice[0] = [1, 2]; // Only first dice_count elements matter
 
-        let mask = env.action_mask().unwrap();
+        env.action_mask(&mut mask);
 
         // Bids up to quantity 3 should be valid
         assert!(mask[encode_bid(1, 1)], "1 1s valid");

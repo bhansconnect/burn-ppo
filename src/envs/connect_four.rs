@@ -183,8 +183,8 @@ impl ConnectFour {
     /// - P0 plane [0..42): 1.0 if Player1 piece, else 0.0
     /// - P1 plane [42..84): 1.0 if Player2 piece, else 0.0
     /// - Turn indicator [84..86): one-hot, [1,0] if P0's turn, [0,1] if P1's turn
-    fn get_observation(&self) -> Vec<f32> {
-        let mut obs = vec![0.0; BOARD_SIZE * 2 + 2]; // 86 total
+    fn write_observation(&self, obs: &mut [f32]) {
+        obs.fill(0.0);
 
         // Board planes
         for row in 0..ROWS {
@@ -201,8 +201,6 @@ impl ConnectFour {
         // Turn indicator (one-hot) [84..86)
         let current = self.current_player_idx();
         obs[BOARD_SIZE * 2 + current] = 1.0;
-
-        obs
     }
 }
 
@@ -223,13 +221,13 @@ impl Environment for ConnectFour {
         }
     }
 
-    fn reset(&mut self) -> Vec<f32> {
+    fn reset(&mut self, obs: &mut [f32]) {
         profile_function!();
         self.board = [[Cell::Empty; COLS]; ROWS];
         self.current_player = Cell::Player1;
         self.game_over = false;
         self.winner = None;
-        self.get_observation()
+        self.write_observation(obs);
     }
 
     /// Single-move step with N-player rewards
@@ -239,16 +237,17 @@ impl Environment for ConnectFour {
     /// - Draw: 0.5 (1/N for N players)
     /// - Loss: 0.0
     /// - Invalid move: 0.0 for all (action masking should prevent this)
-    fn step(&mut self, action: usize) -> (Vec<f32>, Vec<f32>, bool) {
+    fn step(&mut self, action: usize, obs: &mut [f32], rewards: &mut [f32]) -> bool {
         profile_function!();
 
         let current = self.current_player_idx();
         let other = 1 - current;
-        let mut rewards = vec![0.0; 2]; // [P0 reward, P1 reward]
+        rewards.fill(0.0);
 
         // Invalid action: end episode (action masking should prevent this)
         if action >= COLS || self.board[0][action] != Cell::Empty || self.game_over {
-            return (self.get_observation(), rewards, true);
+            self.write_observation(obs);
+            return true;
         }
 
         // Execute move
@@ -258,7 +257,8 @@ impl Environment for ConnectFour {
                 self.winner = Some(self.current_player);
                 rewards[current] = 1.0; // Winner gets 1.0
                 rewards[other] = 0.0; // Loser gets 0.0
-                return (self.get_observation(), rewards, true);
+                self.write_observation(obs);
+                return true;
             }
         }
 
@@ -267,24 +267,24 @@ impl Environment for ConnectFour {
             self.game_over = true;
             rewards[0] = 0.5; // Both get 1/N = 0.5
             rewards[1] = 0.5;
-            return (self.get_observation(), rewards, true);
+            self.write_observation(obs);
+            return true;
         }
 
         // Switch player
         self.current_player = self.other_player();
-        (self.get_observation(), rewards, false)
+        self.write_observation(obs);
+        false
     }
 
     fn current_player(&self) -> usize {
         self.current_player_idx()
     }
 
-    fn action_mask(&self) -> Option<Vec<bool>> {
-        Some(
-            (0..COLS)
-                .map(|col| self.board[0][col] == Cell::Empty)
-                .collect(),
-        )
+    fn action_mask(&self, mask: &mut [bool]) {
+        for (col, m) in mask.iter_mut().enumerate().take(COLS) {
+            *m = self.board[0][col] == Cell::Empty;
+        }
     }
 
     fn render(&self) -> Option<String> {
@@ -328,7 +328,8 @@ mod tests {
     #[test]
     fn test_connect_four_reset() {
         let mut env = ConnectFour::new(42);
-        let obs = env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         // 86 = 42*2 + 2
         assert_eq!(obs.len(), 86);
@@ -342,10 +343,12 @@ mod tests {
     #[test]
     fn test_connect_four_step() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Make a move in column 3 (P0's turn)
-        let (obs, rewards, done) = env.step(3);
+        let done = env.step(3, &mut obs, &mut rewards);
 
         assert_eq!(obs.len(), 86);
         // Bottom row (row 5), column 3 should have P0's piece in P0 plane
@@ -356,14 +359,16 @@ mod tests {
         assert_eq!(obs[84], 0.0);
         assert_eq!(obs[85], 1.0);
         // No rewards yet
-        assert_eq!(rewards, vec![0.0, 0.0]);
+        assert_eq!(rewards, [0.0, 0.0]);
         assert!(!done);
     }
 
     #[test]
     fn test_connect_four_invalid_move() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Manually fill column 0
         for row in 0..ROWS {
@@ -371,26 +376,30 @@ mod tests {
         }
 
         // Column is full, move should end game with no rewards
-        let (_, rewards, done) = env.step(0);
-        assert_eq!(rewards, vec![0.0, 0.0]);
+        let done = env.step(0, &mut obs, &mut rewards);
+        assert_eq!(rewards, [0.0, 0.0]);
         assert!(done);
     }
 
     #[test]
     fn test_connect_four_out_of_bounds() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Out of bounds column
-        let (_, rewards, done) = env.step(10);
-        assert_eq!(rewards, vec![0.0, 0.0]);
+        let done = env.step(10, &mut obs, &mut rewards);
+        assert_eq!(rewards, [0.0, 0.0]);
         assert!(done);
     }
 
     #[test]
     fn test_connect_four_horizontal_win() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Manual setup: Player1 has 3 in a row at bottom
         env.board[5][0] = Cell::Player1;
@@ -398,7 +407,7 @@ mod tests {
         env.board[5][2] = Cell::Player1;
 
         // Winning move
-        let (_, rewards, done) = env.step(3);
+        let done = env.step(3, &mut obs, &mut rewards);
         assert!(done);
         assert_eq!(rewards[0], 1.0); // P0 wins
         assert_eq!(rewards[1], 0.0); // P1 loses
@@ -407,7 +416,9 @@ mod tests {
     #[test]
     fn test_connect_four_vertical_win() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Stack 3 in column 0 (P0's pieces)
         env.board[5][0] = Cell::Player1;
@@ -415,7 +426,7 @@ mod tests {
         env.board[3][0] = Cell::Player1;
 
         // Winning move at row 2
-        let (_, rewards, done) = env.step(0);
+        let done = env.step(0, &mut obs, &mut rewards);
         assert!(done);
         assert_eq!(rewards[0], 1.0); // P0 wins
         assert_eq!(rewards[1], 0.0); // P1 loses
@@ -424,7 +435,9 @@ mod tests {
     #[test]
     fn test_connect_four_diagonal_win() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Diagonal from (5,0) to (2,3) - need 3 pieces for P0
         env.board[5][0] = Cell::Player1;
@@ -436,7 +449,7 @@ mod tests {
         env.board[3][3] = Cell::Player2;
 
         // Winning move at (2,3)
-        let (_, rewards, done) = env.step(3);
+        let done = env.step(3, &mut obs, &mut rewards);
         assert!(done);
         assert_eq!(rewards[0], 1.0);
         assert_eq!(rewards[1], 0.0);
@@ -445,7 +458,8 @@ mod tests {
     #[test]
     fn test_valid_actions() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         assert_eq!(env.valid_actions().len(), 7);
 
@@ -461,9 +475,11 @@ mod tests {
     #[test]
     fn test_action_mask() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut mask = [false; ConnectFour::ACTION_COUNT];
+        env.reset(&mut obs);
 
-        let mask = env.action_mask().unwrap();
+        env.action_mask(&mut mask);
         assert_eq!(mask.len(), 7);
         assert!(mask.iter().all(|&v| v)); // All valid initially
 
@@ -472,7 +488,7 @@ mod tests {
             env.board[row][3] = Cell::Player1;
         }
 
-        let mask = env.action_mask().unwrap();
+        env.action_mask(&mut mask);
         assert!(mask[0]); // Col 0 valid
         assert!(!mask[3]); // Col 3 full
         assert!(mask[6]); // Col 6 valid
@@ -481,21 +497,25 @@ mod tests {
     #[test]
     fn test_current_player_switching() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         assert_eq!(env.current_player(), 0); // P0 starts
 
-        env.step(0); // P0 moves
+        env.step(0, &mut obs, &mut rewards); // P0 moves
         assert_eq!(env.current_player(), 1); // Now P1
 
-        env.step(1); // P1 moves
+        env.step(1, &mut obs, &mut rewards); // P1 moves
         assert_eq!(env.current_player(), 0); // Back to P0
     }
 
     #[test]
     fn test_draw() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Fill board in a way that creates no winner
         // Pattern that avoids 4-in-a-row
@@ -522,7 +542,7 @@ mod tests {
         // Leave one cell empty to trigger draw
         env.board[0][0] = Cell::Empty;
 
-        let (_, rewards, done) = env.step(0);
+        let done = env.step(0, &mut obs, &mut rewards);
         assert!(done);
         assert_eq!(rewards[0], 0.5);
         assert_eq!(rewards[1], 0.5);
@@ -531,12 +551,14 @@ mod tests {
     #[test]
     fn test_multi_plane_encoding() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Place P0 piece at (5, 0)
-        env.step(0);
+        env.step(0, &mut obs, &mut rewards);
         // Place P1 piece at (5, 1)
-        let (obs, _, _) = env.step(1);
+        env.step(1, &mut obs, &mut rewards);
 
         // P0 plane: (5,0) should be 1.0
         assert_eq!(obs[5 * COLS], 1.0);
@@ -550,20 +572,24 @@ mod tests {
     #[test]
     fn test_game_outcome_none_when_not_over() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Game just started - no outcome yet
         assert_eq!(env.game_outcome(), None);
 
         // Make a move, still not over
-        env.step(0);
+        env.step(0, &mut obs, &mut rewards);
         assert_eq!(env.game_outcome(), None);
     }
 
     #[test]
     fn test_game_outcome_player0_wins() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up P0 with 3 in a row at bottom
         env.board[5][0] = Cell::Player1;
@@ -571,7 +597,7 @@ mod tests {
         env.board[5][2] = Cell::Player1;
 
         // Winning move for P0
-        env.step(3);
+        env.step(3, &mut obs, &mut rewards);
 
         assert!(env.game_over);
         assert_eq!(env.game_outcome(), Some(GameOutcome::Winner(0)));
@@ -580,7 +606,9 @@ mod tests {
     #[test]
     fn test_game_outcome_player1_wins() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up board: P1 has 3 in a row, P0 plays elsewhere
         env.board[5][0] = Cell::Player2;
@@ -595,7 +623,7 @@ mod tests {
         env.current_player = Cell::Player2;
 
         // P1 wins with column 3
-        env.step(3);
+        env.step(3, &mut obs, &mut rewards);
 
         assert!(env.game_over);
         assert_eq!(env.game_outcome(), Some(GameOutcome::Winner(1)));
@@ -604,7 +632,9 @@ mod tests {
     #[test]
     fn test_game_outcome_tie() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Fill board without winner (same pattern as test_draw)
         for row in 0..ROWS {
@@ -627,7 +657,7 @@ mod tests {
 
         // Leave one cell empty to trigger draw on final move
         env.board[0][0] = Cell::Empty;
-        env.step(0);
+        env.step(0, &mut obs, &mut rewards);
 
         assert!(env.game_over);
         assert_eq!(env.game_outcome(), Some(GameOutcome::Tie));
@@ -636,7 +666,8 @@ mod tests {
     #[test]
     fn test_render_board_empty() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         let rendered = env.render_board();
 
@@ -651,7 +682,8 @@ mod tests {
     #[test]
     fn test_render_board_with_pieces() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         // Place some pieces
         env.board[5][0] = Cell::Player1;
@@ -666,13 +698,15 @@ mod tests {
     #[test]
     fn test_render_board_game_over() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        let mut rewards = [0.0; ConnectFour::NUM_PLAYERS];
+        env.reset(&mut obs);
 
         // Set up and trigger P0 win
         env.board[5][0] = Cell::Player1;
         env.board[5][1] = Cell::Player1;
         env.board[5][2] = Cell::Player1;
-        env.step(3);
+        env.step(3, &mut obs, &mut rewards);
 
         let rendered = env.render_board();
         assert!(rendered.contains("Game Over: X (Player 0) wins!"));
@@ -681,7 +715,8 @@ mod tests {
     #[test]
     fn test_render_trait_method() {
         let mut env = ConnectFour::new(42);
-        env.reset();
+        let mut obs = [0.0; ConnectFour::OBSERVATION_DIM];
+        env.reset(&mut obs);
 
         // The Environment::render() method should return Some(String)
         let rendered = env.render();

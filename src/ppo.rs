@@ -188,10 +188,10 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         profile_scope!("rollout_step");
 
         // Get current players BEFORE the step (who is about to act)
-        let current_players = vec_env.get_current_players();
+        let current_players = vec_env.current_players().to_vec();
 
-        // Get current observations
-        let mut obs_flat = vec_env.get_observations();
+        // Get current observations (copy since we may normalize)
+        let mut obs_flat = vec_env.observations().to_vec();
 
         // Store raw observations BEFORE normalization for stats update
         if collect_raw_obs {
@@ -250,40 +250,32 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         let actions_usize: Vec<usize> = actions_data.iter().map(|&a| a as usize).collect();
 
         // Step environment (CPU-bound)
-        let (player_rewards, dones, completed) = {
+        let completed = {
             profile_scope!("env_step_cpu");
-            let (_next_obs, player_rewards, dones, completed) = vec_env.step(&actions_usize);
-            (player_rewards, dones, completed)
+            vec_env.step(&actions_usize)
         };
         all_completed.extend(completed);
 
-        // Extract acting player's reward for backward-compat single-player path
-        let acting_rewards: Vec<f32> = player_rewards
-            .iter()
-            .zip(current_players.iter())
-            .map(|(r, &p)| r.get(p).copied().unwrap_or(0.0))
-            .collect();
+        // Get results from VecEnv buffers
+        let rewards_flat = vec_env.rewards();
+        let dones = vec_env.dones();
 
-        // Flatten all player rewards [num_envs, num_players] -> [num_envs * num_players]
-        let rewards_flat: Vec<f32> = player_rewards
-            .iter()
-            .flat_map(|r| {
-                // Pad with zeros if rewards vec is shorter than num_players
-                (0..num_players).map(|p| r.get(p).copied().unwrap_or(0.0))
-            })
+        // Extract acting player's reward for backward-compat single-player path
+        let acting_rewards: Vec<f32> = (0..num_envs)
+            .map(|e| rewards_flat[e * num_players + current_players[e]])
             .collect();
 
         // Append to CPU buffers
         all_obs.extend_from_slice(&obs_flat);
         all_actions.extend_from_slice(&actions_data);
         all_acting_rewards.extend_from_slice(&acting_rewards);
-        all_dones.extend(dones.iter().map(|&d| if d { 1.0 } else { 0.0 }));
+        all_dones.extend(dones.iter().map(|&d| if d { 1.0f32 } else { 0.0f32 }));
         all_acting_values.extend_from_slice(&acting_values_data);
         all_log_probs.extend_from_slice(&log_probs_data);
 
         // Multi-player data
         all_values_flat.extend_from_slice(&values_all_data);
-        all_rewards_flat.extend_from_slice(&rewards_flat);
+        all_rewards_flat.extend_from_slice(rewards_flat);
         all_acting_players.extend(current_players.iter().map(|&p| p as i64));
     }
 

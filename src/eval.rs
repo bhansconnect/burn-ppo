@@ -1053,7 +1053,10 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
         println!();
 
         let mut env = E::new(rng.next_u64());
-        let mut obs = env.reset();
+        let mut obs = vec![0.0f32; E::OBSERVATION_DIM];
+        let mut rewards = vec![0.0f32; E::NUM_PLAYERS];
+        let mut mask = vec![false; E::ACTION_COUNT];
+        env.reset(&mut obs);
         let mut total_rewards = vec![0.0f32; E::NUM_PLAYERS];
         let mut move_num = 0;
         let mut is_first_frame = true;
@@ -1067,7 +1070,7 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
             let model_idx = checkpoint_to_model[current_player];
             let model = &models[model_idx];
             let normalizer = &normalizers[model_idx];
-            let mask = env.action_mask();
+            env.action_mask(&mut mask);
 
             // Get action from model (normalize if checkpoint was trained with normalize_obs)
             let obs_for_model = if let Some(norm) = normalizer {
@@ -1084,7 +1087,7 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                 .expect("tensor data to vec conversion");
 
             let temp = temp_schedule.get_temp(move_num);
-            let action = sample_with_temperature(&logits_vec, mask.as_deref(), temp, rng);
+            let action = sample_with_temperature(&logits_vec, Some(&mask), temp, rng);
 
             // Render before step
             if let Some(rendered) = env.render() {
@@ -1122,11 +1125,10 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
             }
 
             // Step environment
-            let (new_obs, rewards, done) = env.step(action);
+            let done = env.step(action, &mut obs, &mut rewards);
             for (i, &r) in rewards.iter().enumerate() {
                 total_rewards[i] += r;
             }
-            obs = new_obs;
             move_num += 1;
 
             if done {
@@ -1216,17 +1218,17 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
         println!("\nCommands: help (h), render (r), random, hint, quit (q)\n");
 
         let mut env = E::new(rng.next_u64());
-        let obs = env.reset();
+        let mut current_obs = vec![0.0f32; E::OBSERVATION_DIM];
+        let mut rewards = vec![0.0f32; E::NUM_PLAYERS];
+        let mut mask = vec![false; E::ACTION_COUNT];
+        env.reset(&mut current_obs);
         let mut total_rewards = vec![0.0f32; num_players];
         let mut move_num = 0;
-
-        // Store observation for network hints
-        let mut current_obs = obs;
 
         loop {
             let current_player = env.current_player();
             let player_source = &player_sources[current_player];
-            let mask = env.action_mask();
+            env.action_mask(&mut mask);
 
             // Render board before human turns (or always for visibility)
             let has_human = player_sources.iter().any(PlayerSource::is_human);
@@ -1244,7 +1246,7 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                         models,
                         normalizers,
                         &current_obs,
-                        mask.as_deref(),
+                        Some(&mask),
                         device,
                     );
 
@@ -1288,7 +1290,7 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                         .expect("tensor data to vec conversion");
 
                     let temp = temp_schedule.get_temp(move_num);
-                    let action = sample_with_temperature(&logits_vec, mask.as_deref(), temp, rng);
+                    let action = sample_with_temperature(&logits_vec, Some(&mask), temp, rng);
 
                     println!(
                         "Player {} ({}) plays: {} (temp={:.2})",
@@ -1302,11 +1304,10 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
             };
 
             // Step environment
-            let (new_obs, rewards, done) = env.step(action);
+            let done = env.step(action, &mut current_obs, &mut rewards);
             for (i, &r) in rewards.iter().enumerate() {
                 total_rewards[i] += r;
             }
-            current_obs = new_obs;
             move_num += 1;
 
             if done {
@@ -1459,9 +1460,9 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
             break;
         }
 
-        let obs_flat = vec_env.get_observations();
-        let current_players = vec_env.get_current_players();
-        let masks_flat = vec_env.get_action_masks();
+        let obs_flat = vec_env.observations();
+        let current_players = vec_env.current_players();
+        let masks_flat = vec_env.action_masks();
         let terminal_mask = vec_env.terminal_mask();
 
         // Build actions for each environment
@@ -1494,11 +1495,9 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
                     let offset = env_idx * obs_dim;
                     env_obs.extend_from_slice(&obs_flat[offset..offset + obs_dim]);
 
-                    if let Some(ref masks) = masks_flat {
-                        let mask_offset = env_idx * action_count;
-                        env_masks
-                            .extend_from_slice(&masks[mask_offset..mask_offset + action_count]);
-                    }
+                    let mask_offset = env_idx * action_count;
+                    env_masks
+                        .extend_from_slice(&masks_flat[mask_offset..mask_offset + action_count]);
                 }
             }
 
@@ -1529,20 +1528,16 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
                 let logit_offset = i * action_count;
                 let logits = &logits_flat[logit_offset..logit_offset + action_count];
 
-                let mask = if env_masks.is_empty() {
-                    None
-                } else {
-                    let mask_offset = i * action_count;
-                    Some(&env_masks[mask_offset..mask_offset + action_count])
-                };
+                let mask_offset = i * action_count;
+                let mask = &env_masks[mask_offset..mask_offset + action_count];
 
                 let temp = temp_schedule.get_temp(move_counts[env_idx]);
-                actions[env_idx] = sample_with_temperature(logits, mask, temp, rng);
+                actions[env_idx] = sample_with_temperature(logits, Some(mask), temp, rng);
             }
         }
 
         // Step all environments
-        let (_, _, _, completed_episodes) = vec_env.step(&actions);
+        let completed_episodes = vec_env.step(&actions);
 
         // Update move counts
         for count in &mut move_counts {
@@ -1906,16 +1901,31 @@ mod tests {
             Self { outcome: None }
         }
 
-        fn reset(&mut self) -> Vec<f32> {
-            vec![0.0]
+        fn reset(&mut self, obs: &mut [f32]) {
+            obs[0] = 0.0;
         }
 
-        fn step(&mut self, _action: usize) -> (Vec<f32>, Vec<f32>, bool) {
-            (vec![0.0], vec![0.0, 0.0], true)
+        fn step(&mut self, _action: usize, obs: &mut [f32], rewards: &mut [f32]) -> bool {
+            obs[0] = 0.0;
+            rewards[0] = 0.0;
+            rewards[1] = 0.0;
+            true
+        }
+
+        fn action_mask(&self, mask: &mut [bool]) {
+            mask.fill(true);
         }
 
         fn game_outcome(&self) -> Option<GameOutcome> {
             self.outcome.clone()
+        }
+
+        fn describe_action(&self, action: usize) -> String {
+            format!("Action {action}")
+        }
+
+        fn parse_action(&self, _input: &str) -> Result<usize, String> {
+            Err("Not implemented".to_string())
         }
     }
 
@@ -1932,12 +1942,27 @@ mod tests {
             Self
         }
 
-        fn reset(&mut self) -> Vec<f32> {
-            vec![0.0]
+        fn reset(&mut self, obs: &mut [f32]) {
+            obs[0] = 0.0;
         }
 
-        fn step(&mut self, _action: usize) -> (Vec<f32>, Vec<f32>, bool) {
-            (vec![0.0], vec![0.0, 0.0], true)
+        fn step(&mut self, _action: usize, obs: &mut [f32], rewards: &mut [f32]) -> bool {
+            obs[0] = 0.0;
+            rewards[0] = 0.0;
+            rewards[1] = 0.0;
+            true
+        }
+
+        fn action_mask(&self, mask: &mut [bool]) {
+            mask.fill(true);
+        }
+
+        fn describe_action(&self, action: usize) -> String {
+            format!("Action {action}")
+        }
+
+        fn parse_action(&self, _input: &str) -> Result<usize, String> {
+            Err("Not implemented".to_string())
         }
         // game_outcome() uses default impl returning None
     }

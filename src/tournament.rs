@@ -1059,27 +1059,27 @@ fn run_matchup_with_random<E: Environment>(
 
     for _ in 0..num_games {
         let mut env = E::new(rng.gen());
+        let mut obs = vec![0.0f32; E::OBSERVATION_DIM];
+        let mut rewards = vec![0.0f32; E::NUM_PLAYERS];
+        let mut mask = vec![false; E::ACTION_COUNT];
+        env.reset(&mut obs);
 
         loop {
             // Random valid action
-            let mask = env.action_mask();
-            let action = if let Some(ref m) = mask {
-                let valid: Vec<usize> = m
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &v)| v)
-                    .map(|(i, _)| i)
-                    .collect();
-                if valid.is_empty() {
-                    0
-                } else {
-                    valid[rng.gen_range(0..valid.len())]
-                }
+            env.action_mask(&mut mask);
+            let valid: Vec<usize> = mask
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v)
+                .map(|(i, _)| i)
+                .collect();
+            let action = if valid.is_empty() {
+                0
             } else {
-                rng.gen_range(0..E::ACTION_COUNT)
+                valid[rng.gen_range(0..valid.len())]
             };
 
-            let (_, _, done) = env.step(action);
+            let done = env.step(action, &mut obs, &mut rewards);
             if done {
                 break;
             }

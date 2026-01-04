@@ -467,7 +467,7 @@ where
         }
 
         // Compute bootstrap value (normalize observations if normalizer is active)
-        let mut obs_flat = vec_env.get_observations();
+        let mut obs_flat = vec_env.observations().to_vec();
         if let Some(ref norm) = obs_normalizer {
             norm.normalize_batch(&mut obs_flat, obs_dim);
         }
