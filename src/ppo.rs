@@ -552,6 +552,30 @@ pub fn compute_explained_variance(values: &[f32], returns: &[f32]) -> f32 {
     1.0 - var_residuals / var_returns
 }
 
+/// Extract a scalar f32 from a 1D tensor with a single element.
+/// Used for metric extraction after backward pass.
+#[inline]
+fn scalar<B: burn::prelude::Backend>(t: Tensor<B, 1>) -> f32 {
+    t.into_data().as_slice::<f32>().expect("scalar")[0]
+}
+
+/// Scalar metrics extracted from a single minibatch update
+///
+/// These are extracted immediately after `backward()` to free the autodiff graph.
+/// Using `.inner().into_scalar()` converts autodiff tensors to plain f32 values,
+/// allowing the computation graph to be garbage collected.
+#[derive(Debug, Clone, Copy, Default)]
+struct MinibatchMetrics {
+    policy_loss: f32,
+    value_loss: f32,
+    entropy: f32,
+    approx_kl: f32,
+    clip_fraction: f32,
+    total_loss: f32,
+    value_mean: f32,
+    returns_mean: f32,
+}
+
 /// Training metrics from a single update
 #[derive(Debug, Clone)]
 pub struct UpdateMetrics {
@@ -572,11 +596,7 @@ pub struct UpdateMetrics {
 /// Implements clipped surrogate objective with value clipping.
 /// Takes buffer with inner (non-autodiff) backend tensors and converts them
 /// to autodiff tensors for gradient computation.
-#[expect(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    reason = "tensor indices and minibatch sizes are non-negative"
-)]
+#[expect(clippy::cast_possible_wrap, reason = "tensor indices are non-negative")]
 pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     model: ActorCritic<B>,
     buffer: &RolloutBuffer<B::InnerBackend>,
@@ -673,41 +693,18 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 // Single-player: just extract player 0
                 all_values.slice([0..mb_size, 0..1]).flatten(0, 1)
             } else {
-                // Multi-player: extract acting player's value for each sample
-                // This is done on CPU since gather operations on GPU can be slow for small tensors
-                let all_values_data: Vec<f32> =
-                    all_values.clone().into_data().to_vec().expect("values");
-                // Convert through float to avoid IntElem type mismatches between backends
-                let acting_data: Vec<usize> = mb_acting_players
-                    .clone()
-                    .float()
-                    .into_data()
-                    .to_vec::<f32>()
-                    .expect("acting")
-                    .into_iter()
-                    .map(|x| x as usize)
-                    .collect();
-                let values_vec: Vec<f32> = (0..mb_size)
-                    .map(|i| {
-                        let player = acting_data[i];
-                        all_values_data[i * num_players + player]
-                    })
-                    .collect();
-                Tensor::<B, 1>::from_floats(values_vec.as_slice(), &device)
+                // Multi-player: extract acting player's value using gather (maintains autodiff)
+                // gather(dim, indices) selects elements along dim using per-element indices
+                let indices_2d = mb_acting_players.unsqueeze_dim(1); // [mb_size] -> [mb_size, 1]
+                all_values.gather(1, indices_2d).squeeze_dims(&[1]) // [mb_size, num_players] -> [mb_size]
             };
 
-            // Compute losses and backward pass (combined for accurate timing)
-            let (
-                grads,
-                loss,
-                policy_loss_mean,
-                value_loss,
-                entropy,
-                approx_kl,
-                clip_fraction,
-                values_mean,
-                returns_mean,
-            ) = {
+            // Compute losses, backward pass, and extract metrics immediately
+            //
+            // CRITICAL: Extract metrics as scalars immediately after backward() to free
+            // the autodiff graph. Returning autodiff tensors would retain the entire
+            // computation graph until they're consumed, causing memory accumulation.
+            let (grads, metrics) = {
                 profile_scope!("loss_and_backward");
 
                 let new_log_probs = log_prob_categorical(logits.clone(), mb_actions);
@@ -717,12 +714,15 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 let log_ratio = new_log_probs.clone() - mb_old_log_probs;
                 let ratio = log_ratio.clone().exp();
 
+                // Capture inner versions for metrics BEFORE further loss computation
+                // These don't participate in autodiff, so they won't retain the graph
+                let ratio_inner = ratio.clone().inner();
+                let log_ratio_inner = log_ratio.inner();
+
                 let policy_loss_1 = -mb_advantages.clone() * ratio.clone();
-                let policy_loss_2 = -mb_advantages.clone()
-                    * ratio
-                        .clone()
-                        .clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
-                let policy_loss: Tensor<B, 1> = policy_loss_1.clone().max_pair(policy_loss_2);
+                let policy_loss_2 = -mb_advantages
+                    * ratio.clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
+                let policy_loss: Tensor<B, 1> = policy_loss_1.max_pair(policy_loss_2);
                 let policy_loss_mean = policy_loss.mean();
 
                 // Value loss (optionally clipped)
@@ -759,35 +759,39 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                     + value_loss.clone() * config.value_coef
                     + entropy_loss;
 
-                // Compute approximate KL divergence for logging
-                // KL ≈ (ratio - 1) - log(ratio) is the unbiased low-variance estimator
-                // from "Approximating KL Divergence" (Schulman)
-                let approx_kl = ((ratio.clone() - 1.0) - log_ratio.clone()).mean();
-
-                // Compute clip fraction for logging
-                let clip_fraction = (ratio.clone() - 1.0)
-                    .abs()
-                    .greater_elem(config.clip_epsilon)
-                    .float()
-                    .mean();
-
+                // Capture values for metrics before backward
                 let values_mean = values.mean();
                 let returns_mean = mb_returns.mean();
 
                 // Backward pass
                 let grads = loss.backward();
 
-                (
-                    grads,
-                    loss,
-                    policy_loss_mean,
-                    value_loss,
-                    entropy,
-                    approx_kl,
-                    clip_fraction,
-                    values_mean,
-                    returns_mean,
-                )
+                // Extract ALL metrics as scalars immediately (frees autodiff graph)
+                // Using inner tensors for approx_kl and clip_fraction avoids retaining
+                // the ratio/log_ratio autodiff graphs
+                let metrics = MinibatchMetrics {
+                    policy_loss: scalar((-policy_loss_mean).inner().reshape([1])),
+                    value_loss: scalar(value_loss.inner().reshape([1])),
+                    entropy: scalar(entropy.inner().mean().reshape([1])),
+                    approx_kl: scalar(
+                        ((ratio_inner.clone() - 1.0) - log_ratio_inner)
+                            .mean()
+                            .reshape([1]),
+                    ),
+                    clip_fraction: scalar(
+                        (ratio_inner - 1.0)
+                            .abs()
+                            .greater_elem(config.clip_epsilon)
+                            .float()
+                            .mean()
+                            .reshape([1]),
+                    ),
+                    total_loss: scalar(loss.inner().reshape([1])),
+                    value_mean: scalar(values_mean.inner().reshape([1])),
+                    returns_mean: scalar(returns_mean.inner().reshape([1])),
+                };
+
+                (grads, metrics)
             };
 
             // Optimizer step with GPU sync for accurate timing
@@ -802,46 +806,23 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 };
             }
 
-            // Batched metric extraction - single GPU sync instead of 8
-            //
-            // CRITICAL: Use .inner() to convert autodiff tensors to non-autodiff BEFORE
-            // any operations. This prevents creating new autodiff graph nodes and allows
-            // the backward computation graph to be freed. Without this, every operation
-            // (reshape, mean, cat, negation) creates new graph nodes that retain the
-            // entire forward/backward computation graph, causing memory leaks.
+            // Accumulate metrics from struct (scalars already extracted in loss_and_backward)
             {
                 profile_scope!("extract_metrics");
 
-                // Convert to inner (non-autodiff) tensors first to free the autodiff graph
-                let metrics_tensor: Tensor<B::InnerBackend, 1> = Tensor::cat(
-                    vec![
-                        (-policy_loss_mean.inner()).reshape([1]), // Negate for display
-                        value_loss.inner().reshape([1]),
-                        entropy.inner().mean().reshape([1]),
-                        approx_kl.inner().reshape([1]),
-                        clip_fraction.inner().reshape([1]),
-                        loss.inner().reshape([1]),
-                        values_mean.inner().reshape([1]),
-                        returns_mean.inner().reshape([1]),
-                    ],
-                    0,
-                );
-
-                let metrics_data: Vec<f32> = metrics_tensor.into_data().to_vec().expect("metrics");
-
-                total_policy_loss += metrics_data[0];
-                total_value_loss += metrics_data[1];
-                total_entropy += metrics_data[2];
-                total_approx_kl += metrics_data[3];
-                total_clip_fraction += metrics_data[4];
-                total_loss_sum += metrics_data[5];
-                total_value_mean += metrics_data[6];
-                total_returns_mean += metrics_data[7];
+                total_policy_loss += metrics.policy_loss;
+                total_value_loss += metrics.value_loss;
+                total_entropy += metrics.entropy;
+                total_approx_kl += metrics.approx_kl;
+                total_clip_fraction += metrics.clip_fraction;
+                total_loss_sum += metrics.total_loss;
+                total_value_mean += metrics.value_mean;
+                total_returns_mean += metrics.returns_mean;
                 num_updates += 1;
 
                 // KL early stopping: stop epoch if KL divergence exceeds threshold
                 if let Some(target) = config.target_kl {
-                    if metrics_data[3] > target as f32 {
+                    if metrics.approx_kl > target as f32 {
                         break 'epoch_loop;
                     }
                 }
