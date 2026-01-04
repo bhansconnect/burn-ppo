@@ -9,6 +9,7 @@ cuda = ["burn/cuda"]
 libtorch = ["burn/tch"]
 wgpu = ["burn/wgpu"]
 tracy = ["tracy-client"]
+tracy-callstack = ["tracy"]
 
 [dependencies]
 # ML framework - base features, backend selected via features above
