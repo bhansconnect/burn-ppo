@@ -446,11 +446,11 @@ impl EvalStats {
         let wl_config = WengLinConfig::new();
         let mut ratings = [
             WengLinRating {
-                rating: 0.0,
+                rating: 25.0,
                 uncertainty: 25.0 / 3.0,
             },
             WengLinRating {
-                rating: 0.0,
+                rating: 25.0,
                 uncertainty: 25.0 / 3.0,
             },
         ];

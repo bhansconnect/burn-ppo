@@ -324,7 +324,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
             let initial_seed = if single_training_run {
                 load_metadata(&path)
                     .map(|m| m.training_rating)
-                    .unwrap_or(0.0)
+                    .unwrap_or(25.0)
             } else {
                 0.0 // Will be shuffled later
             };
@@ -351,7 +351,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
                 let initial_seed = if single_training_run {
                     load_metadata(&ckpt)
                         .map(|m| m.training_rating)
-                        .unwrap_or(0.0)
+                        .unwrap_or(25.0)
                 } else {
                     0.0 // Will be shuffled later
                 };

@@ -62,7 +62,7 @@ pub struct CheckpointMetadata {
 }
 
 fn default_rating() -> f64 {
-    0.0
+    25.0
 }
 
 fn default_uncertainty() -> f64 {

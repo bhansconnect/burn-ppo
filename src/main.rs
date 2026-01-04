@@ -328,7 +328,7 @@ where
             num_hidden: config.num_hidden,
             activation: config.activation.clone(),
             env_name: E::NAME.to_string(),
-            training_rating: 0.0,
+            training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,
         };
 
@@ -336,8 +336,8 @@ where
 
         // Log initial challenger metrics for aim_watcher
         logger.log_scalar("challenger/best_step", 0.0, 0)?;
-        logger.log_scalar("challenger/current_rating", 0.0, 0)?;
-        logger.log_scalar("challenger/best_rating", 0.0, 0)?;
+        logger.log_scalar("challenger/current_rating", 25.0, 0)?;
+        logger.log_scalar("challenger/best_rating", 25.0, 0)?;
         logger.flush()?;
     }
 
@@ -745,7 +745,7 @@ where
                 num_hidden: config.num_hidden,
                 activation: config.activation.clone(),
                 env_name: E::NAME.to_string(),
-                training_rating: 0.0, // Updated after challenger eval via update_training_rating
+                training_rating: 25.0, // Updated after challenger eval via update_training_rating
                 training_uncertainty: 25.0 / 3.0,
             };
 
@@ -780,7 +780,7 @@ where
                     // Load best checkpoint's training rating for accumulating skill
                     let (best_rating, best_uncertainty) = load_metadata(&best_path)
                         .map(|m| (m.training_rating, m.training_uncertainty))
-                        .unwrap_or((0.0, 25.0 / 3.0));
+                        .unwrap_or((25.0, 25.0 / 3.0));
 
                     // Run challenger evaluation
                     match run_challenger_eval::<TrainingBackend, E>(
