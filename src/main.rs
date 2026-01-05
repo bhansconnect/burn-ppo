@@ -441,29 +441,26 @@ where
                 recent_returns.remove(0);
             }
 
-            // Multiplayer tracking
-            if num_players > 1 {
-                // Per-player returns
-                for (p, &reward) in ep.total_rewards.iter().enumerate() {
-                    if p < recent_returns_per_player.len() {
-                        recent_returns_per_player[p].push_back(reward);
-                        if recent_returns_per_player[p].len() > 100 {
-                            recent_returns_per_player[p].pop_front();
-                        }
+            // Per-player tracking (for all games, not just multiplayer)
+            for (p, &reward) in ep.total_rewards.iter().enumerate() {
+                if p < recent_returns_per_player.len() {
+                    recent_returns_per_player[p].push_back(reward);
+                    if recent_returns_per_player[p].len() > 100 {
+                        recent_returns_per_player[p].pop_front();
                     }
                 }
-
-                // Track outcome for win rate calculation
-                if let Some(ref outcome) = ep.outcome {
-                    recent_outcomes.push_back(outcome.clone());
-                    if recent_outcomes.len() > 100 {
-                        recent_outcomes.pop_front();
-                    }
-                }
-
-                // Store for logging
-                episodes_since_log_mp.push((ep.total_rewards.clone(), ep.outcome.clone()));
             }
+
+            // Track outcome for win rate calculation (multiplayer)
+            if let Some(ref outcome) = ep.outcome {
+                recent_outcomes.push_back(outcome.clone());
+                if recent_outcomes.len() > 100 {
+                    recent_outcomes.pop_front();
+                }
+            }
+
+            // Store for per-player logging
+            episodes_since_log_mp.push((ep.total_rewards.clone(), ep.outcome.clone()));
         }
 
         // Compute bootstrap value using non-autodiff inference
@@ -609,22 +606,14 @@ where
             last_log_time = now;
             last_log_step = global_step;
 
-            // Episode return metrics (since last log)
+            // Episode length metrics (since last log)
             if !episodes_since_log.is_empty() {
-                let returns: Vec<f32> = episodes_since_log.iter().map(|(r, _)| *r).collect();
                 let lengths: Vec<usize> = episodes_since_log.iter().map(|(_, l)| *l).collect();
-
-                let return_mean = returns.iter().sum::<f32>() / returns.len() as f32;
-                let return_max = returns.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let return_min = returns.iter().copied().fold(f32::INFINITY, f32::min);
 
                 let length_mean = lengths.iter().sum::<usize>() as f32 / lengths.len() as f32;
                 let length_max = *lengths.iter().max().expect("lengths non-empty") as f32;
                 let length_min = *lengths.iter().min().expect("lengths non-empty") as f32;
 
-                logger.log_scalar("episode/return_mean", return_mean, global_step)?;
-                logger.log_scalar("episode/return_max", return_max, global_step)?;
-                logger.log_scalar("episode/return_min", return_min, global_step)?;
                 logger.log_scalar("episode/length_mean", length_mean, global_step)?;
                 logger.log_scalar("episode/length_max", length_max, global_step)?;
                 logger.log_scalar("episode/length_min", length_min, global_step)?;
@@ -637,9 +626,8 @@ where
                 episodes_since_log.clear();
             }
 
-            // Multiplayer metrics (per-player returns and win rates)
-            if num_players > 1 && !episodes_since_log_mp.is_empty() {
-                // Per-player return statistics
+            // Per-player return metrics (for all games)
+            if !episodes_since_log_mp.is_empty() {
                 for player in 0..num_players_usize {
                     let player_returns: Vec<f32> = episodes_since_log_mp
                         .iter()
@@ -672,24 +660,30 @@ where
                     }
                 }
 
-                // Swiss points and draw rate
-                let total_games = episodes_since_log_mp.len();
-                let outcomes: VecDeque<GameOutcome> = episodes_since_log_mp
-                    .iter()
-                    .filter_map(|(_, o)| o.clone())
-                    .collect();
-                let (avg_points, draw_rate) = compute_avg_points(&outcomes, num_players_usize);
+                // Swiss points and draw rate (multiplayer only)
+                if num_players > 1 {
+                    let total_games = episodes_since_log_mp.len();
+                    let outcomes: VecDeque<GameOutcome> = episodes_since_log_mp
+                        .iter()
+                        .filter_map(|(_, o)| o.clone())
+                        .collect();
+                    let (avg_points, draw_rate) = compute_avg_points(&outcomes, num_players_usize);
 
-                for (player, &pts) in avg_points.iter().enumerate() {
+                    for (player, &pts) in avg_points.iter().enumerate() {
+                        logger.log_scalar(
+                            &format!("episode/avg_points_p{player}"),
+                            pts,
+                            global_step,
+                        )?;
+                    }
+
+                    logger.log_scalar("episode/draw_rate", draw_rate, global_step)?;
                     logger.log_scalar(
-                        &format!("episode/avg_points_p{player}"),
-                        pts,
+                        "episode/games_completed",
+                        total_games as f32,
                         global_step,
                     )?;
                 }
-
-                logger.log_scalar("episode/draw_rate", draw_rate, global_step)?;
-                logger.log_scalar("episode/games_completed", total_games as f32, global_step)?;
 
                 episodes_since_log_mp.clear();
             }
@@ -878,26 +872,28 @@ where
             };
 
             // Log checkpoint save message
-            let checkpoint_msg = if let Some(avg_pts) = challenger_avg_points {
-                format!(
-                    "Saved checkpoint at step {} (avg return: {:.1}, vs best: {:.2} pts) -> {}",
-                    global_step,
-                    avg_return,
-                    avg_pts,
-                    checkpoint_path
-                        .file_name()
-                        .expect("checkpoint has filename")
-                        .to_string_lossy()
-                )
+            let filename = checkpoint_path
+                .file_name()
+                .expect("checkpoint has filename")
+                .to_string_lossy();
+            let checkpoint_msg = if num_players > 1 {
+                // Multiplayer: show Swiss points instead of avg_return
+                let (avg_points, _draw_rate) =
+                    compute_avg_points(&recent_outcomes, num_players_usize);
+                let p0_points = avg_points.first().copied().unwrap_or(0.0);
+                if let Some(challenger_pts) = challenger_avg_points {
+                    format!(
+                        "Saved checkpoint at step {global_step} (avg pts: {p0_points:.2}, vs best: {challenger_pts:.2} pts) -> {filename}"
+                    )
+                } else {
+                    format!(
+                        "Saved checkpoint at step {global_step} (avg pts: {p0_points:.2}) -> {filename}"
+                    )
+                }
             } else {
+                // Single-player: show avg_return
                 format!(
-                    "Saved checkpoint at step {} (avg return: {:.1}) -> {}",
-                    global_step,
-                    avg_return,
-                    checkpoint_path
-                        .file_name()
-                        .expect("checkpoint has filename")
-                        .to_string_lossy()
+                    "Saved checkpoint at step {global_step} (avg return: {avg_return:.1}) -> {filename}"
                 )
             };
             progress.println(&checkpoint_msg);
@@ -1073,26 +1069,27 @@ where
         };
 
         // Log final checkpoint save message
-        let checkpoint_msg = if let Some(avg_pts) = challenger_avg_points {
-            format!(
-                "Saved final checkpoint at step {} (avg return: {:.1}, vs best: {:.2} pts) -> {}",
-                global_step,
-                avg_return,
-                avg_pts,
-                checkpoint_path
-                    .file_name()
-                    .expect("checkpoint has filename")
-                    .to_string_lossy()
-            )
+        let filename = checkpoint_path
+            .file_name()
+            .expect("checkpoint has filename")
+            .to_string_lossy();
+        let checkpoint_msg = if num_players > 1 {
+            // Multiplayer: show Swiss points instead of avg_return
+            let (avg_points, _draw_rate) = compute_avg_points(&recent_outcomes, num_players_usize);
+            let p0_points = avg_points.first().copied().unwrap_or(0.0);
+            if let Some(challenger_pts) = challenger_avg_points {
+                format!(
+                    "Saved final checkpoint at step {global_step} (avg pts: {p0_points:.2}, vs best: {challenger_pts:.2} pts) -> {filename}"
+                )
+            } else {
+                format!(
+                    "Saved final checkpoint at step {global_step} (avg pts: {p0_points:.2}) -> {filename}"
+                )
+            }
         } else {
+            // Single-player: show avg_return
             format!(
-                "Saved final checkpoint at step {} (avg return: {:.1}) -> {}",
-                global_step,
-                avg_return,
-                checkpoint_path
-                    .file_name()
-                    .expect("checkpoint has filename")
-                    .to_string_lossy()
+                "Saved final checkpoint at step {global_step} (avg return: {avg_return:.1}) -> {filename}"
             )
         };
         progress.println(&checkpoint_msg);
