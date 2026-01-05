@@ -15,7 +15,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Train a model (default if no subcommand given)
-    Train(TrainArgs),
+    Train(Box<TrainArgs>),
     /// Evaluate trained models
     Eval(EvalArgs),
     /// Run a tournament between checkpoints with skill ratings
@@ -62,6 +62,103 @@ pub struct TrainArgs {
 
     #[arg(long)]
     pub activation: Option<String>,
+
+    // --- Network ---
+    /// Use separate actor and critic networks instead of shared backbone
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub split_networks: Option<bool>,
+
+    #[arg(long)]
+    pub hidden_size: Option<usize>,
+
+    #[arg(long)]
+    pub num_hidden: Option<usize>,
+
+    // --- PPO Hyperparameters ---
+    #[arg(long)]
+    pub num_steps: Option<usize>,
+
+    /// Enable/disable learning rate annealing (use --lr-anneal=false to disable)
+    #[arg(long)]
+    pub lr_anneal: Option<bool>,
+
+    #[arg(long)]
+    pub gamma: Option<f64>,
+
+    #[arg(long)]
+    pub gae_lambda: Option<f64>,
+
+    #[arg(long)]
+    pub clip_epsilon: Option<f64>,
+
+    /// Enable/disable value clipping (use --clip-value=false to disable)
+    #[arg(long)]
+    pub clip_value: Option<bool>,
+
+    #[arg(long)]
+    pub entropy_coef: Option<f64>,
+
+    /// Enable entropy coefficient annealing
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub entropy_anneal: Option<bool>,
+
+    #[arg(long)]
+    pub value_coef: Option<f64>,
+
+    #[arg(long)]
+    pub max_grad_norm: Option<f64>,
+
+    /// KL divergence threshold for early stopping
+    #[arg(long)]
+    pub target_kl: Option<f64>,
+
+    /// Enable observation normalization
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub normalize_obs: Option<bool>,
+
+    // --- Training ---
+    #[arg(long)]
+    pub num_epochs: Option<usize>,
+
+    #[arg(long)]
+    pub num_minibatches: Option<usize>,
+
+    #[arg(long)]
+    pub adam_epsilon: Option<f64>,
+
+    // --- Checkpointing/Logging ---
+    #[arg(long)]
+    pub run_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    pub checkpoint_freq: Option<usize>,
+
+    #[arg(long)]
+    pub log_freq: Option<usize>,
+
+    // --- Challenger Evaluation ---
+    /// Enable challenger-style evaluation for multiplayer games
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub challenger_eval: Option<bool>,
+
+    #[arg(long)]
+    pub challenger_games: Option<usize>,
+
+    #[arg(long)]
+    pub challenger_threshold: Option<f64>,
+
+    #[arg(long)]
+    pub challenger_temp: Option<f32>,
+
+    #[arg(long)]
+    pub challenger_temp_final: Option<f32>,
+
+    #[arg(long)]
+    pub challenger_temp_cutoff: Option<usize>,
+
+    /// Enable temperature decay instead of hard cutoff
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub challenger_temp_decay: Option<bool>,
 }
 
 /// Arguments for evaluation
@@ -489,26 +586,123 @@ impl Config {
 
     /// Apply all CLI overrides to this config
     fn apply_cli_overrides(&mut self, args: &CliArgs) {
+        // Environment
         if let Some(env) = &args.env {
             self.env.clone_from(env);
         }
         if let Some(n) = args.num_envs {
             self.num_envs = NumEnvs::Explicit(n);
         }
+
+        // PPO hyperparameters
         if let Some(lr) = args.learning_rate {
             self.learning_rate = lr;
         }
+        if let Some(v) = args.lr_anneal {
+            self.lr_anneal = v;
+        }
+        if let Some(v) = args.gamma {
+            self.gamma = v;
+        }
+        if let Some(v) = args.gae_lambda {
+            self.gae_lambda = v;
+        }
+        if let Some(v) = args.clip_epsilon {
+            self.clip_epsilon = v;
+        }
+        if let Some(v) = args.clip_value {
+            self.clip_value = v;
+        }
+        if let Some(v) = args.entropy_coef {
+            self.entropy_coef = v;
+        }
+        if let Some(v) = args.entropy_anneal {
+            self.entropy_anneal = v;
+        }
+        if let Some(v) = args.value_coef {
+            self.value_coef = v;
+        }
+        if let Some(v) = args.max_grad_norm {
+            self.max_grad_norm = v;
+        }
+        if let Some(v) = args.target_kl {
+            self.target_kl = Some(v);
+        }
+        if let Some(v) = args.normalize_obs {
+            self.normalize_obs = v;
+        }
+        if let Some(v) = args.num_steps {
+            self.num_steps = v;
+        }
+
+        // Training
         if let Some(ts) = args.total_timesteps {
             self.total_timesteps = ts;
         }
+        if let Some(v) = args.num_epochs {
+            self.num_epochs = v;
+        }
+        if let Some(v) = args.num_minibatches {
+            self.num_minibatches = v;
+        }
+        if let Some(v) = args.adam_epsilon {
+            self.adam_epsilon = v;
+        }
+
+        // Network
+        if let Some(v) = args.hidden_size {
+            self.hidden_size = v;
+        }
+        if let Some(v) = args.num_hidden {
+            self.num_hidden = v;
+        }
+        if let Some(activation) = &args.activation {
+            self.activation.clone_from(activation);
+        }
+        if let Some(v) = args.split_networks {
+            self.split_networks = v;
+        }
+
+        // Checkpointing/Logging
+        if let Some(v) = &args.run_dir {
+            self.run_dir.clone_from(v);
+        }
+        if let Some(v) = args.checkpoint_freq {
+            self.checkpoint_freq = v;
+        }
+        if let Some(v) = args.log_freq {
+            self.log_freq = v;
+        }
+
+        // Challenger evaluation
+        if let Some(v) = args.challenger_eval {
+            self.challenger_eval = v;
+        }
+        if let Some(v) = args.challenger_games {
+            self.challenger_games = v;
+        }
+        if let Some(v) = args.challenger_threshold {
+            self.challenger_threshold = v;
+        }
+        if let Some(v) = args.challenger_temp {
+            self.challenger_temp = v;
+        }
+        if let Some(v) = args.challenger_temp_final {
+            self.challenger_temp_final = Some(v);
+        }
+        if let Some(v) = args.challenger_temp_cutoff {
+            self.challenger_temp_cutoff = Some(v);
+        }
+        if let Some(v) = args.challenger_temp_decay {
+            self.challenger_temp_decay = v;
+        }
+
+        // Experiment
         if let Some(s) = args.seed {
             self.seed = s;
         }
         if let Some(name) = &args.run_name {
             self.run_name = Some(name.clone());
-        }
-        if let Some(activation) = &args.activation {
-            self.activation.clone_from(activation);
         }
     }
 
@@ -522,21 +716,131 @@ impl Config {
             self.total_timesteps = ts;
         }
 
-        // Warn about ignored overrides
+        // Collect warnings for ignored overrides
+        let mut ignored = Vec::new();
+
+        // Environment
         if args.env.is_some() {
-            eprintln!("Warning: --env is ignored when resuming");
+            ignored.push("--env");
         }
         if args.num_envs.is_some() {
-            eprintln!("Warning: --num-envs is ignored when resuming");
+            ignored.push("--num-envs");
         }
+
+        // PPO hyperparameters
         if args.learning_rate.is_some() {
-            eprintln!("Warning: --learning-rate is ignored when resuming");
+            ignored.push("--learning-rate");
         }
+        if args.lr_anneal.is_some() {
+            ignored.push("--lr-anneal");
+        }
+        if args.gamma.is_some() {
+            ignored.push("--gamma");
+        }
+        if args.gae_lambda.is_some() {
+            ignored.push("--gae-lambda");
+        }
+        if args.clip_epsilon.is_some() {
+            ignored.push("--clip-epsilon");
+        }
+        if args.clip_value.is_some() {
+            ignored.push("--clip-value");
+        }
+        if args.entropy_coef.is_some() {
+            ignored.push("--entropy-coef");
+        }
+        if args.entropy_anneal.is_some() {
+            ignored.push("--entropy-anneal");
+        }
+        if args.value_coef.is_some() {
+            ignored.push("--value-coef");
+        }
+        if args.max_grad_norm.is_some() {
+            ignored.push("--max-grad-norm");
+        }
+        if args.target_kl.is_some() {
+            ignored.push("--target-kl");
+        }
+        if args.normalize_obs.is_some() {
+            ignored.push("--normalize-obs");
+        }
+        if args.num_steps.is_some() {
+            ignored.push("--num-steps");
+        }
+
+        // Training
+        if args.num_epochs.is_some() {
+            ignored.push("--num-epochs");
+        }
+        if args.num_minibatches.is_some() {
+            ignored.push("--num-minibatches");
+        }
+        if args.adam_epsilon.is_some() {
+            ignored.push("--adam-epsilon");
+        }
+
+        // Network
+        if args.hidden_size.is_some() {
+            ignored.push("--hidden-size");
+        }
+        if args.num_hidden.is_some() {
+            ignored.push("--num-hidden");
+        }
+        if args.activation.is_some() {
+            ignored.push("--activation");
+        }
+        if args.split_networks.is_some() {
+            ignored.push("--split-networks");
+        }
+
+        // Checkpointing/Logging
+        if args.run_dir.is_some() {
+            ignored.push("--run-dir");
+        }
+        if args.checkpoint_freq.is_some() {
+            ignored.push("--checkpoint-freq");
+        }
+        if args.log_freq.is_some() {
+            ignored.push("--log-freq");
+        }
+
+        // Challenger evaluation
+        if args.challenger_eval.is_some() {
+            ignored.push("--challenger-eval");
+        }
+        if args.challenger_games.is_some() {
+            ignored.push("--challenger-games");
+        }
+        if args.challenger_threshold.is_some() {
+            ignored.push("--challenger-threshold");
+        }
+        if args.challenger_temp.is_some() {
+            ignored.push("--challenger-temp");
+        }
+        if args.challenger_temp_final.is_some() {
+            ignored.push("--challenger-temp-final");
+        }
+        if args.challenger_temp_cutoff.is_some() {
+            ignored.push("--challenger-temp-cutoff");
+        }
+        if args.challenger_temp_decay.is_some() {
+            ignored.push("--challenger-temp-decay");
+        }
+
+        // Experiment
         if args.seed.is_some() {
-            eprintln!("Warning: --seed is ignored when resuming");
+            ignored.push("--seed");
         }
         if args.run_name.is_some() {
-            eprintln!("Warning: --run-name is ignored when resuming");
+            ignored.push("--run-name");
+        }
+
+        // Print single warning if any flags were ignored
+        if !ignored.is_empty() {
+            eprintln!(
+                "Warning: {} ignored when resuming (use --fork to change config)",
+                ignored.join(", ")
+            );
         }
     }
 
