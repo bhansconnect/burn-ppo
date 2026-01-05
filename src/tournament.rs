@@ -1445,9 +1445,15 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
     if use_swiss {
         // Swiss tournament
-        for round in 1..=num_rounds {
-            println!("Round {round}/{num_rounds}:");
+        let rounds_pb = multi_progress.add(ProgressBar::new(num_rounds as u64));
+        rounds_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("Round [{bar:20}] {pos}/{len} | {elapsed}/{duration} (ETA: {eta})")
+                .expect("valid template")
+                .progress_chars("=> "),
+        );
 
+        for round in 1..=num_rounds {
             // Handle byes for contestants that can't form complete pods
             let num_byes = contestants.len() % pod_size;
             let mut bye_recipients: Vec<usize> = Vec::new();
@@ -1473,10 +1479,12 @@ fn run_tournament_env<B: Backend, E: Environment>(
                     contestants[*bye_idx].swiss_points += bye_points;
                     contestants[*bye_idx].has_bye = true;
                     bye_recipients.push(*bye_idx);
-                    println!(
-                        "  {} receives bye (+{:.1} points)",
-                        contestants[*bye_idx].name, bye_points
-                    );
+                    multi_progress.suspend(|| {
+                        println!(
+                            "  {} receives bye (+{:.1} points)",
+                            contestants[*bye_idx].name, bye_points
+                        );
+                    });
                 }
             }
 
@@ -1501,8 +1509,8 @@ fn run_tournament_env<B: Backend, E: Environment>(
                 break;
             }
 
-            let round_pb = multi_progress.add(ProgressBar::new(pods.len() as u64));
-            round_pb.set_style(
+            let matchup_pb = multi_progress.add(ProgressBar::new(pods.len() as u64));
+            matchup_pb.set_style(
                 ProgressStyle::default_bar()
                     .template("  [{bar:30}] {pos}/{len} matchups")
                     .expect("valid template")
@@ -1523,8 +1531,8 @@ fn run_tournament_env<B: Backend, E: Environment>(
                     device,
                 );
 
-                // Suspend progress bar to print result
-                round_pb.suspend(|| {
+                // Suspend progress bars to print result
+                multi_progress.suspend(|| {
                     let names: Vec<&str> =
                         pod.iter().map(|&i| contestants[i].name.as_str()).collect();
                     println!("  {}", result.summary(&names));
@@ -1532,12 +1540,16 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
                 update_ratings_from_games(contestants, &result, &wl_config);
                 all_pods.push((round, result));
-                round_pb.inc(1);
+                matchup_pb.inc(1);
             }
 
-            round_pb.finish_and_clear();
-            print_standings(contestants, &format!("Standings after round {round}:"));
+            matchup_pb.finish_and_clear();
+            rounds_pb.inc(1);
+            multi_progress.suspend(|| {
+                print_standings(contestants, &format!("Standings after round {round}:"));
+            });
         }
+        rounds_pb.finish_and_clear();
     } else {
         // Round-robin
         let pods = round_robin_pods(n, pod_size);
@@ -1568,7 +1580,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
             );
 
             // Suspend progress bar to print result
-            pb.suspend(|| {
+            multi_progress.suspend(|| {
                 let names: Vec<&str> = pod.iter().map(|&i| contestants[i].name.as_str()).collect();
                 println!("  {}", result.summary(&names));
             });
