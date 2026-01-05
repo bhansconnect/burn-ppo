@@ -299,19 +299,89 @@ fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
     selected
 }
 
-/// Get display name from a checkpoint path
-fn checkpoint_name(path: &Path) -> String {
-    // Try to get step_XXXXX name, falling back to file name
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("checkpoint")
-        .to_string()
+/// Compute unique display names for a set of paths
+///
+/// Starts with just the file name. If duplicates exist, adds parent directory
+/// components until all names are unique (or paths run out of parents).
+///
+/// Example: `/a/Q/step_001` and `/a/Z/step_001` become `Q/step_001` and `Z/step_001`
+pub fn compute_display_names(paths: &[PathBuf]) -> Vec<String> {
+    use std::collections::HashMap;
+
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    // Build a list of path components for each path (in reverse order: file name first)
+    let components: Vec<Vec<String>> = paths
+        .iter()
+        .map(|p| {
+            p.iter()
+                .filter_map(|c| c.to_str())
+                .map(String::from)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
+        })
+        .collect();
+
+    // Track how many components we're using for each path's display name
+    let mut depth: Vec<usize> = vec![1; paths.len()];
+
+    // Keep expanding until all names are unique
+    loop {
+        // Build current names from the depth
+        let names: Vec<String> = components
+            .iter()
+            .zip(depth.iter())
+            .map(|(comps, &d)| {
+                comps
+                    .iter()
+                    .take(d)
+                    .rev()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+
+        // Find duplicates
+        let mut name_counts: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, name) in names.iter().enumerate() {
+            name_counts.entry(name.as_str()).or_default().push(i);
+        }
+
+        // Check if all unique
+        let duplicates: Vec<Vec<usize>> = name_counts
+            .into_values()
+            .filter(|indices| indices.len() > 1)
+            .collect();
+
+        if duplicates.is_empty() {
+            return names;
+        }
+
+        // Expand depth for duplicates that still have more components
+        let mut made_progress = false;
+        for group in duplicates {
+            for &idx in &group {
+                if depth[idx] < components[idx].len() {
+                    depth[idx] += 1;
+                    made_progress = true;
+                }
+            }
+        }
+
+        // If we can't make progress (all paths exhausted), return what we have
+        if !made_progress {
+            return names;
+        }
+    }
 }
 
 /// Discover contestants from command-line sources
 fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
-    let mut contestants = Vec::new();
-
     // Track if all checkpoints come from a single training run (same checkpoints folder)
     // Only use training_rating for seeding if this is true
     let single_training_run = args.sources.len() == 1 && {
@@ -326,6 +396,9 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
         };
         is_run_checkpoints_dir(&resolved)
     };
+
+    // First pass: collect all checkpoint paths with their initial seeds
+    let mut checkpoint_data: Vec<(PathBuf, f64)> = Vec::new();
 
     for source_path in &args.sources {
         // Resolve symlinks
@@ -347,11 +420,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
             } else {
                 0.0 // Will be shuffled later
             };
-            contestants.push(Contestant::new(
-                checkpoint_name(&path),
-                PlayerSource::Checkpoint(path),
-                initial_seed,
-            ));
+            checkpoint_data.push((path, initial_seed));
         } else if is_run_checkpoints_dir(&path) {
             // Checkpoints directory - enumerate and optionally limit
             let checkpoints = enumerate_checkpoints(&path)?;
@@ -374,11 +443,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
                 } else {
                     0.0 // Will be shuffled later
                 };
-                contestants.push(Contestant::new(
-                    checkpoint_name(&ckpt),
-                    PlayerSource::Checkpoint(ckpt),
-                    initial_seed,
-                ));
+                checkpoint_data.push((ckpt, initial_seed));
             }
         } else {
             bail!(
@@ -387,6 +452,19 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
             );
         }
     }
+
+    // Compute unique display names for all checkpoints
+    let paths: Vec<PathBuf> = checkpoint_data.iter().map(|(p, _)| p.clone()).collect();
+    let display_names = compute_display_names(&paths);
+
+    // Create contestants with computed display names
+    let mut contestants: Vec<Contestant> = checkpoint_data
+        .into_iter()
+        .zip(display_names)
+        .map(|((path, initial_seed), name)| {
+            Contestant::new(name, PlayerSource::Checkpoint(path), initial_seed)
+        })
+        .collect();
 
     // Add random player if requested (always lowest seed)
     if args.random {
@@ -1492,12 +1570,71 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_name() {
-        let path = PathBuf::from("/some/path/step_12345");
-        assert_eq!(checkpoint_name(&path), "step_12345");
+    fn test_compute_display_names_unique() {
+        // All names unique - no disambiguation needed
+        let paths = vec![
+            PathBuf::from("/a/step_001"),
+            PathBuf::from("/b/step_002"),
+            PathBuf::from("/c/step_003"),
+        ];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["step_001", "step_002", "step_003"]);
+    }
 
-        let path2 = PathBuf::from("/another/checkpoint");
-        assert_eq!(checkpoint_name(&path2), "checkpoint");
+    #[test]
+    fn test_compute_display_names_duplicate() {
+        // Same checkpoint name, different parents
+        let paths = vec![
+            PathBuf::from("/runs/Q/checkpoints/step_001"),
+            PathBuf::from("/runs/Z/checkpoints/step_001"),
+        ];
+        let names = compute_display_names(&paths);
+        // Should add parent until unique
+        assert_eq!(
+            names,
+            vec!["Q/checkpoints/step_001", "Z/checkpoints/step_001"]
+        );
+    }
+
+    #[test]
+    fn test_compute_display_names_partial_duplicates() {
+        // Some unique, some need disambiguation
+        let paths = vec![
+            PathBuf::from("/a/step_001"),
+            PathBuf::from("/b/Q/step_002"),
+            PathBuf::from("/b/Z/step_002"),
+        ];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["step_001", "Q/step_002", "Z/step_002"]);
+    }
+
+    #[test]
+    fn test_compute_display_names_deep() {
+        // Need multiple levels to disambiguate
+        let paths = vec![
+            PathBuf::from("/runs/A/Q/checkpoints/step_001"),
+            PathBuf::from("/runs/B/Q/checkpoints/step_001"),
+        ];
+        let names = compute_display_names(&paths);
+        // Should add parents until unique
+        assert_eq!(
+            names,
+            vec!["A/Q/checkpoints/step_001", "B/Q/checkpoints/step_001"]
+        );
+    }
+
+    #[test]
+    fn test_compute_display_names_single() {
+        let paths = vec![PathBuf::from("/a/b/step_001")];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["step_001"]);
+    }
+
+    #[test]
+    fn test_compute_display_names_empty() {
+        let paths: Vec<PathBuf> = vec![];
+        let names = compute_display_names(&paths);
+        assert!(names.is_empty());
     }
 
     #[test]

@@ -38,7 +38,7 @@ use crate::human::{prompt_human_action, random_valid_action};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
 use crate::profile::profile_function;
-use crate::tournament::{calculate_swiss_points, print_rating_guide};
+use crate::tournament::{calculate_swiss_points, compute_display_names, print_rating_guide};
 
 /// Source of actions for a player slot.
 ///
@@ -470,12 +470,11 @@ impl EvalStats {
             let swiss_points = self.num_players as f64 - avg_placement;
 
             println!(
-                "Checkpoint {}: {} ({:.2} pts)",
-                i,
+                "{}: {} ({:.2} pts)",
+                name,
                 placement_pcts.join(", "),
                 swiss_points
             );
-            println!("  {name}");
         }
 
         // Compute Weng-Lin ratings using per-game outcomes (N-player compatible)
@@ -533,8 +532,8 @@ impl EvalStats {
                 ""
             };
             println!(
-                "  P{}: {:.1}±{:.1} {}{marker}",
-                i, rating.rating, rating.uncertainty, name
+                "  {}: {:.1}±{:.1}{marker}",
+                name, rating.rating, rating.uncertainty
             );
         }
     }
@@ -832,6 +831,19 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     let mut checkpoint_names = Vec::new();
     let mut metadata_opt: Option<CheckpointMetadata> = None;
 
+    // First, collect all checkpoint paths for display name computation
+    let checkpoint_paths: Vec<std::path::PathBuf> = player_sources
+        .iter()
+        .filter_map(|s| match s {
+            PlayerSource::Checkpoint(path) => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Compute unique display names for checkpoints
+    let display_names = compute_display_names(&checkpoint_paths);
+    let mut display_name_iter = display_names.into_iter();
+
     for source in &player_sources {
         match source {
             PlayerSource::Checkpoint(path) => {
@@ -876,7 +888,12 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
                 };
 
                 checkpoint_to_model.push(model_idx);
-                checkpoint_names.push(path.display().to_string());
+                // Use computed display name
+                checkpoint_names.push(
+                    display_name_iter
+                        .next()
+                        .expect("display names should match checkpoint count"),
+                );
             }
             PlayerSource::Random => {
                 // Random player gets its own slot with None model
@@ -884,7 +901,7 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
                 models.push(None);
                 normalizers.push(None);
                 checkpoint_to_model.push(idx);
-                checkpoint_names.push("[Random]".to_string());
+                checkpoint_names.push("Random".to_string());
             }
             PlayerSource::Human { .. } => {
                 unreachable!("Human players should have been routed to interactive mode")
