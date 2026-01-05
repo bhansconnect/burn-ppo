@@ -312,85 +312,131 @@ fn get_best_rated_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Compute unique display names for a set of paths
+/// Compute display names for a list of paths.
 ///
-/// Starts with just the file name. If duplicates exist, adds parent directory
-/// components until all names are unique (or paths run out of parents).
+/// Algorithm:
+/// 1. Strip the longest common prefix (full folders only) from all paths
+/// 2. Collapse common middle runs (folders identical across ALL paths at the same
+///    position from the end) with "..."
 ///
-/// Example: `/a/Q/step_001` and `/a/Z/step_001` become `Q/step_001` and `Z/step_001`
+/// For a single path, just returns the filename.
 pub fn compute_display_names(paths: &[PathBuf]) -> Vec<String> {
-    use std::collections::HashMap;
-
     if paths.is_empty() {
         return Vec::new();
     }
 
-    // Build a list of path components for each path (in reverse order: file name first)
-    let components: Vec<Vec<String>> = paths
+    // Single path: just return the filename
+    if paths.len() == 1 {
+        return vec![paths[0]
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()];
+    }
+
+    // Build a list of path components for each path (in forward order)
+    let components: Vec<Vec<&str>> = paths
         .iter()
-        .map(|p| {
-            p.iter()
-                .filter_map(|c| c.to_str())
-                .map(String::from)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect()
-        })
+        .map(|p| p.iter().filter_map(|c| c.to_str()).collect())
         .collect();
 
-    // Track how many components we're using for each path's display name
-    let mut depth: Vec<usize> = vec![1; paths.len()];
+    // Find the longest common prefix
+    let prefix_len = common_prefix_len(&components);
 
-    // Keep expanding until all names are unique
-    loop {
-        // Build current names from the depth
-        let names: Vec<String> = components
-            .iter()
-            .zip(depth.iter())
-            .map(|(comps, &d)| {
-                comps
-                    .iter()
-                    .take(d)
-                    .rev()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join("/")
-            })
-            .collect();
+    // Strip the common prefix from all paths
+    let stripped: Vec<Vec<&str>> = components
+        .iter()
+        .map(|comps| comps[prefix_len..].to_vec())
+        .collect();
 
-        // Find duplicates
-        let mut name_counts: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, name) in names.iter().enumerate() {
-            name_counts.entry(name.as_str()).or_default().push(i);
-        }
+    // Find common middle runs (aligned from end)
+    let common_offsets = find_common_middle_offsets(&stripped);
 
-        // Check if all unique
-        let duplicates: Vec<Vec<usize>> = name_counts
-            .into_values()
-            .filter(|indices| indices.len() > 1)
-            .collect();
+    // Reconstruct display names, collapsing common middles
+    stripped
+        .iter()
+        .map(|comps| collapse_common_middles(comps, &common_offsets))
+        .collect()
+}
 
-        if duplicates.is_empty() {
-            return names;
-        }
+/// Find the length of the longest common prefix (in path components).
+/// Never strips the last component (filename) - always leaves at least 1.
+fn common_prefix_len(components: &[Vec<&str>]) -> usize {
+    if components.is_empty() {
+        return 0;
+    }
 
-        // Expand depth for duplicates that still have more components
-        let mut made_progress = false;
-        for group in duplicates {
-            for &idx in &group {
-                if depth[idx] < components[idx].len() {
-                    depth[idx] += 1;
-                    made_progress = true;
-                }
-            }
-        }
+    let min_len = components.iter().map(Vec::len).min().unwrap_or(0);
+    // Never strip the last component (filename)
+    let max_prefix = min_len.saturating_sub(1);
+    let first = &components[0];
 
-        // If we can't make progress (all paths exhausted), return what we have
-        if !made_progress {
-            return names;
+    for i in 0..max_prefix {
+        if !components.iter().all(|c| c[i] == first[i]) {
+            return i;
         }
     }
+    max_prefix
+}
+
+/// Find offsets from end where all paths have the same component.
+/// Returns a set of offsets (e.g., 2 means second-to-last component).
+/// Offset 1 (last component) is excluded to keep filenames distinct.
+fn find_common_middle_offsets(components: &[Vec<&str>]) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+
+    let mut common = HashSet::new();
+
+    if components.is_empty() {
+        return common;
+    }
+
+    // Find minimum length across all paths
+    let min_len = components.iter().map(Vec::len).min().unwrap_or(0);
+
+    // Check each position from the end (excluding the last component - keep filenames distinct)
+    // offset_from_end: 2 = second-to-last, 3 = third-to-last, etc.
+    for offset_from_end in 2..=min_len {
+        let first_val = components[0][components[0].len() - offset_from_end];
+        let all_match = components
+            .iter()
+            .all(|c| c[c.len() - offset_from_end] == first_val);
+        if all_match {
+            common.insert(offset_from_end);
+        }
+    }
+
+    common
+}
+
+/// Collapse consecutive common middle components into "..."
+fn collapse_common_middles(
+    comps: &[&str],
+    common_offsets: &std::collections::HashSet<usize>,
+) -> String {
+    if comps.is_empty() {
+        return String::new();
+    }
+
+    let len = comps.len();
+    let mut result = Vec::new();
+    let mut in_common_run = false;
+
+    for (i, &comp) in comps.iter().enumerate() {
+        let offset_from_end = len - i;
+        if common_offsets.contains(&offset_from_end) {
+            if !in_common_run {
+                result.push("...");
+                in_common_run = true;
+            }
+            // Skip this component (already represented by "...")
+        } else {
+            result.push(comp);
+            in_common_run = false;
+        }
+    }
+
+    result.join("/")
 }
 
 /// Discover contestants from command-line sources
@@ -1628,56 +1674,52 @@ mod tests {
 
     #[test]
     fn test_compute_display_names_unique() {
-        // All names unique - no disambiguation needed
+        // All names unique - common prefix "/" stripped, no common middle
         let paths = vec![
             PathBuf::from("/a/step_001"),
             PathBuf::from("/b/step_002"),
             PathBuf::from("/c/step_003"),
         ];
         let names = compute_display_names(&paths);
-        assert_eq!(names, vec!["step_001", "step_002", "step_003"]);
+        // Common prefix "/" stripped, different parents so full relative paths shown
+        assert_eq!(names, vec!["a/step_001", "b/step_002", "c/step_003"]);
     }
 
     #[test]
     fn test_compute_display_names_duplicate() {
-        // Same checkpoint name, different parents
+        // Same checkpoint name, common "checkpoints" folder collapsed to "..."
         let paths = vec![
             PathBuf::from("/runs/Q/checkpoints/step_001"),
             PathBuf::from("/runs/Z/checkpoints/step_001"),
         ];
         let names = compute_display_names(&paths);
-        // Should add parent until unique
-        assert_eq!(
-            names,
-            vec!["Q/checkpoints/step_001", "Z/checkpoints/step_001"]
-        );
+        // Common prefix "/runs" stripped, common middle "checkpoints" collapsed
+        assert_eq!(names, vec!["Q/.../step_001", "Z/.../step_001"]);
     }
 
     #[test]
     fn test_compute_display_names_partial_duplicates() {
-        // Some unique, some need disambiguation
+        // Different path lengths - no common middle when aligned from end
         let paths = vec![
             PathBuf::from("/a/step_001"),
             PathBuf::from("/b/Q/step_002"),
             PathBuf::from("/b/Z/step_002"),
         ];
         let names = compute_display_names(&paths);
-        assert_eq!(names, vec!["step_001", "Q/step_002", "Z/step_002"]);
+        // Common prefix "/" stripped, no common middle (different at -2 position)
+        assert_eq!(names, vec!["a/step_001", "b/Q/step_002", "b/Z/step_002"]);
     }
 
     #[test]
     fn test_compute_display_names_deep() {
-        // Need multiple levels to disambiguate
+        // Common "Q/checkpoints" middle collapsed to "..."
         let paths = vec![
             PathBuf::from("/runs/A/Q/checkpoints/step_001"),
             PathBuf::from("/runs/B/Q/checkpoints/step_001"),
         ];
         let names = compute_display_names(&paths);
-        // Should add parents until unique
-        assert_eq!(
-            names,
-            vec!["A/Q/checkpoints/step_001", "B/Q/checkpoints/step_001"]
-        );
+        // Common prefix "/runs" stripped, common middle "Q/checkpoints" collapsed
+        assert_eq!(names, vec!["A/.../step_001", "B/.../step_001"]);
     }
 
     #[test]
@@ -1692,6 +1734,82 @@ mod tests {
         let paths: Vec<PathBuf> = vec![];
         let names = compute_display_names(&paths);
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn test_compute_display_names_common_prefix_stripped() {
+        // All paths share "runs/" prefix
+        let paths = vec![
+            PathBuf::from("runs/a/step_001"),
+            PathBuf::from("runs/b/step_002"),
+        ];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["a/step_001", "b/step_002"]);
+    }
+
+    #[test]
+    fn test_compute_display_names_common_middle_collapsed() {
+        // Common "checkpoints" folder in middle
+        let paths = vec![
+            PathBuf::from("phase1/checkpoints/step_001"),
+            PathBuf::from("phase2/checkpoints/step_002"),
+        ];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["phase1/.../step_001", "phase2/.../step_002"]);
+    }
+
+    #[test]
+    fn test_compute_display_names_prefix_and_middle_combined() {
+        let paths = vec![
+            PathBuf::from("runs/phase1/checkpoints/step_001"),
+            PathBuf::from("runs/phase2/checkpoints/step_002"),
+        ];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["phase1/.../step_001", "phase2/.../step_002"]);
+    }
+
+    #[test]
+    fn test_compute_display_names_multiple_middle_runs() {
+        // Multiple non-adjacent common sections
+        let paths = vec![PathBuf::from("a/X/b/Y/c"), PathBuf::from("a/X/d/Y/e")];
+        // Common prefix "a/X/" stripped first
+        // Then Y is common middle -> collapsed to "..."
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["b/.../c", "d/.../e"]);
+    }
+
+    #[test]
+    fn test_compute_display_names_no_common_parts() {
+        let paths = vec![PathBuf::from("a/b/c"), PathBuf::from("x/y/z")];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["a/b/c", "x/y/z"]);
+    }
+
+    #[test]
+    fn test_compute_display_names_different_length_paths() {
+        // Align from end for common middle detection
+        let paths = vec![
+            PathBuf::from("runs/phase1/checkpoints/step_001"),
+            PathBuf::from("phase2/checkpoints/step_002"),
+        ];
+        let names = compute_display_names(&paths);
+        // "checkpoints" is common at -2 from end
+        assert_eq!(
+            names,
+            vec!["runs/phase1/.../step_001", "phase2/.../step_002"]
+        );
+    }
+
+    #[test]
+    fn test_compute_display_names_identical_paths() {
+        // All paths identical - should still show filename, not empty string
+        let paths = vec![
+            PathBuf::from("/runs/checkpoints/step_001"),
+            PathBuf::from("/runs/checkpoints/step_001"),
+            PathBuf::from("/runs/checkpoints/step_001"),
+        ];
+        let names = compute_display_names(&paths);
+        assert_eq!(names, vec!["step_001", "step_001", "step_001"]);
     }
 
     #[test]

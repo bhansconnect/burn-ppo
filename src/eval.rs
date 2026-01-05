@@ -386,7 +386,7 @@ impl EvalStats {
         }
 
         // Print average rewards if available
-        self.print_reward_summary();
+        self.print_reward_summary(checkpoint_names);
     }
 
     fn print_single_player_summary(&self, checkpoint_names: &[String]) {
@@ -547,23 +547,23 @@ impl EvalStats {
         self.print_n_player_summary(checkpoint_names);
     }
 
-    fn print_reward_summary(&self) {
+    fn print_reward_summary(&self, checkpoint_names: &[String]) {
         if self.game_rewards.is_empty() || self.num_players == 1 {
             return; // Already handled in single-player summary
         }
 
         println!();
-        println!("Average Rewards per Player:");
-        for player in 0..self.num_players {
+        println!("Average Rewards:");
+        for (i, name) in checkpoint_names.iter().enumerate() {
             let rewards: Vec<f64> = self
                 .game_rewards
                 .iter()
-                .filter_map(|r| r.get(player).copied())
+                .filter_map(|r| r.get(i).copied())
                 .collect();
 
             if !rewards.is_empty() {
                 let mean = rewards.iter().sum::<f64>() / rewards.len() as f64;
-                println!("  Player {player}: {mean:.3}");
+                println!("  {name}: {mean:.3}");
             }
         }
     }
