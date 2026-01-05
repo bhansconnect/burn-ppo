@@ -231,7 +231,7 @@ fn is_checkpoint_dir(path: &Path) -> bool {
     path.is_dir() && path.join("metadata.json").exists()
 }
 
-/// Check if a path is a run directory (has checkpoints subdirectory)
+/// Check if a path is a checkpoints directory (contains step_* subdirectories)
 fn is_run_checkpoints_dir(path: &Path) -> bool {
     path.is_dir()
         && std::fs::read_dir(path)
@@ -243,6 +243,11 @@ fn is_run_checkpoints_dir(path: &Path) -> bool {
                 })
             })
             .unwrap_or(false)
+}
+
+/// Check if a path is a run directory (has checkpoints subdirectory)
+fn is_run_dir(path: &Path) -> bool {
+    path.is_dir() && path.join("checkpoints").is_dir()
 }
 
 /// Enumerate checkpoint directories in a checkpoints folder
@@ -302,10 +307,39 @@ fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
     selected
 }
 
-/// Get the checkpoint with highest `training_rating` from a run directory
-fn get_best_rated_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
-    let checkpoints = enumerate_checkpoints(checkpoints_dir).ok()?;
+/// Get the "best" checkpoint from a checkpoints directory.
+/// Priority: best symlink > highest `training_rating` (with warning)
+fn get_best_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
+    let best_symlink = checkpoints_dir.join("best");
 
+    // If "best" symlink exists, use it
+    if best_symlink.exists() {
+        let resolved = if best_symlink.is_symlink() {
+            best_symlink.read_link().ok().map(|target| {
+                if target.is_absolute() {
+                    target
+                } else {
+                    checkpoints_dir.join(target)
+                }
+            })
+        } else {
+            Some(best_symlink)
+        };
+
+        if let Some(path) = resolved {
+            if is_checkpoint_dir(&path) {
+                return Some(path);
+            }
+        }
+    }
+
+    // Fallback: scan for highest training_rating (with warning)
+    eprintln!(
+        "Warning: No 'best' symlink in {}, falling back to highest training_rating",
+        checkpoints_dir.display()
+    );
+
+    let checkpoints = enumerate_checkpoints(checkpoints_dir).ok()?;
     checkpoints.into_iter().max_by(|a, b| {
         let rating_a = load_metadata(a).map(|m| m.training_rating).unwrap_or(0.0);
         let rating_b = load_metadata(b).map(|m| m.training_rating).unwrap_or(0.0);
@@ -313,6 +347,73 @@ fn get_best_rated_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
             .partial_cmp(&rating_b)
             .unwrap_or(std::cmp::Ordering::Equal)
     })
+}
+
+/// Select checkpoints with priority: best, latest, then evenly distributed
+/// - limit 1: best only
+/// - limit 2: best + latest
+/// - limit 3+: best + latest + (n-2) evenly distributed from remaining
+fn select_checkpoints_with_priority(
+    checkpoints_dir: &Path,
+    checkpoints: &[PathBuf],
+    limit: usize,
+) -> Vec<PathBuf> {
+    if limit == 0 || checkpoints.is_empty() {
+        return Vec::new();
+    }
+
+    let best = get_best_checkpoint(checkpoints_dir);
+    let latest = checkpoints.last().cloned();
+
+    match limit {
+        1 => {
+            // Just best (or latest as final fallback)
+            best.or(latest).into_iter().collect()
+        }
+        2 => {
+            // Best + latest (deduplicated if same)
+            let mut result = Vec::new();
+            if let Some(b) = &best {
+                result.push(b.clone());
+            }
+            if let Some(l) = &latest {
+                if best.as_ref() != Some(l) {
+                    result.push(l.clone());
+                }
+            }
+            result
+        }
+        _ => {
+            // Best + latest + (n-2) evenly distributed from remaining
+            let mut result = Vec::new();
+            let mut excluded: HashSet<PathBuf> = HashSet::new();
+
+            if let Some(b) = &best {
+                result.push(b.clone());
+                excluded.insert(b.clone());
+            }
+            if let Some(l) = &latest {
+                if !excluded.contains(l) {
+                    result.push(l.clone());
+                    excluded.insert(l.clone());
+                }
+            }
+
+            // Get remaining checkpoints (excluding best and latest)
+            let remaining: Vec<PathBuf> = checkpoints
+                .iter()
+                .filter(|c| !excluded.contains(*c))
+                .cloned()
+                .collect();
+
+            // Select (limit - result.len()) evenly from remaining
+            let extra_needed = limit.saturating_sub(result.len());
+            let extra = select_evenly_spaced(&remaining, extra_needed);
+            result.extend(extra);
+
+            result
+        }
+    }
 }
 
 /// Compute display names for a list of paths.
@@ -448,7 +549,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
     // Only use training_rating for seeding if this is true
     let single_training_run = args.sources.len() == 1 && {
         let path = &args.sources[0];
-        let resolved = if path.is_symlink() {
+        let mut resolved = if path.is_symlink() {
             path.read_link().map_or_else(
                 |_| path.clone(),
                 |target| path.parent().unwrap_or(path).join(target),
@@ -456,6 +557,10 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
         } else {
             path.clone()
         };
+        // Auto-append /checkpoints for run directories
+        if is_run_dir(&resolved) {
+            resolved = resolved.join("checkpoints");
+        }
         is_run_checkpoints_dir(&resolved)
     };
 
@@ -464,14 +569,19 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
         .sources
         .iter()
         .map(|source_path| {
-            if source_path.is_symlink() {
+            let mut resolved = if source_path.is_symlink() {
                 source_path.read_link().map_or_else(
                     |_| source_path.clone(),
                     |target| source_path.parent().unwrap_or(source_path).join(target),
                 )
             } else {
                 source_path.clone()
+            };
+            // Auto-append /checkpoints for run directories
+            if is_run_dir(&resolved) {
+                resolved = resolved.join("checkpoints");
             }
+            resolved
         })
         .collect();
 
@@ -524,19 +634,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
             run_dir_idx += 1;
 
             let selected = match folder_limit {
-                Some(1) => {
-                    // Special case: limit 1 means pick best-rated checkpoint
-                    get_best_rated_checkpoint(&path).map_or_else(
-                        || {
-                            vec![checkpoints
-                                .last()
-                                .expect("checkpoints verified non-empty above")
-                                .clone()]
-                        },
-                        |p| vec![p],
-                    )
-                }
-                Some(limit) => select_evenly_spaced(&checkpoints, limit),
+                Some(limit) => select_checkpoints_with_priority(&path, &checkpoints, limit),
                 None => checkpoints,
             };
 
@@ -2829,10 +2927,33 @@ mod tests {
     }
 
     #[test]
-    fn test_get_best_rated_checkpoint() {
+    fn test_get_best_checkpoint_with_symlink() {
+        let temp = TempDir::new().unwrap();
+
+        // Create checkpoints with metadata files
+        for step in [100, 200, 300] {
+            let ckpt_dir = temp.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            let metadata = format!(
+                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#
+            );
+            std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
+        }
+
+        // Create "best" symlink pointing to step_200
+        std::os::unix::fs::symlink("step_200", temp.path().join("best")).unwrap();
+
+        let best = get_best_checkpoint(temp.path()).unwrap();
+        // Should use the "best" symlink (step_200)
+        assert!(best.ends_with("step_200"));
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_fallback_to_rating() {
         let temp = TempDir::new().unwrap();
 
         // Create checkpoints with metadata files containing different training_ratings
+        // No "best" symlink - should fall back to highest rating
         for (step, rating) in [(100, 10.0), (200, 30.0), (300, 20.0)] {
             let ckpt_dir = temp.path().join(format!("step_{step}"));
             std::fs::create_dir(&ckpt_dir).unwrap();
@@ -2842,21 +2963,22 @@ mod tests {
             std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
         }
 
-        let best = get_best_rated_checkpoint(temp.path()).unwrap();
-        // Should pick step_200 which has the highest rating (30.0)
+        let best = get_best_checkpoint(temp.path()).unwrap();
+        // Should fall back to highest training_rating (step_200 with rating 30.0)
         assert!(best.ends_with("step_200"));
     }
 
     #[test]
-    fn test_get_best_rated_checkpoint_no_metadata() {
+    fn test_get_best_checkpoint_no_metadata() {
         let temp = TempDir::new().unwrap();
 
-        // Create checkpoints without metadata files
+        // Create checkpoints without metadata files and no "best" symlink
         std::fs::create_dir(temp.path().join("step_100")).unwrap();
         std::fs::create_dir(temp.path().join("step_200")).unwrap();
 
-        // Should fall back to the last checkpoint (step_200)
-        let best = get_best_rated_checkpoint(temp.path()).unwrap();
+        // Should fall back to highest training_rating (which defaults to 0.0)
+        // With equal ratings, max_by picks last evaluated, which is step_200
+        let best = get_best_checkpoint(temp.path()).unwrap();
         assert!(best.ends_with("step_200"));
     }
 
@@ -2867,11 +2989,23 @@ mod tests {
         let temp1 = TempDir::new().unwrap();
         let temp2 = TempDir::new().unwrap();
 
-        // Create 5 checkpoints in each folder
+        // Create 5 checkpoints in each folder with metadata
         for i in 0..5 {
-            std::fs::create_dir(temp1.path().join(format!("step_{}", i * 100))).unwrap();
-            std::fs::create_dir(temp2.path().join(format!("step_{}", i * 100))).unwrap();
+            let ckpt1 = temp1.path().join(format!("step_{}", i * 100));
+            let ckpt2 = temp2.path().join(format!("step_{}", i * 100));
+            std::fs::create_dir(&ckpt1).unwrap();
+            std::fs::create_dir(&ckpt2).unwrap();
+            let step = i * 100;
+            let metadata = format!(
+                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#
+            );
+            std::fs::write(ckpt1.join("metadata.json"), &metadata).unwrap();
+            std::fs::write(ckpt2.join("metadata.json"), &metadata).unwrap();
         }
+
+        // Create "best" symlinks pointing to step_200 (not latest)
+        std::os::unix::fs::symlink("step_200", temp1.path().join("best")).unwrap();
+        std::os::unix::fs::symlink("step_200", temp2.path().join("best")).unwrap();
 
         let args = TournamentArgs {
             sources: vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()],
@@ -2881,7 +3015,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
-            limit: Some(4), // 4 total = 2 per folder
+            limit: Some(4), // 4 total = 2 per folder (best + latest from each)
             rounds: None,
             output: None,
             seed: None,
@@ -2891,7 +3025,7 @@ mod tests {
 
         let contestants = discover_contestants(&args).unwrap();
 
-        // Should get 4 total (2 from each folder)
+        // Should get 4 total: best (step_200) + latest (step_400) from each folder
         assert_eq!(contestants.len(), 4);
     }
 
@@ -2921,9 +3055,10 @@ mod tests {
             std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
         }
 
-        // Verify get_best_rated_checkpoint works for each folder independently
-        let best1 = get_best_rated_checkpoint(temp1.path()).unwrap();
-        let best2 = get_best_rated_checkpoint(temp2.path()).unwrap();
+        // Verify get_best_checkpoint works for each folder independently
+        // (no "best" symlink, so falls back to training_rating)
+        let best1 = get_best_checkpoint(temp1.path()).unwrap();
+        let best2 = get_best_checkpoint(temp2.path()).unwrap();
         assert!(
             best1.ends_with("step_200"),
             "Expected best1 to be step_200, got: {}",
@@ -3774,5 +3909,160 @@ mod tests {
 
         assert_eq!(checkpoint_data.len(), 1);
         assert_eq!(checkpoint_data[0].1, 25.0); // First occurrence kept
+    }
+
+    #[test]
+    fn test_is_run_dir() {
+        let temp = TempDir::new().unwrap();
+
+        // Not a run dir (no checkpoints subdirectory)
+        assert!(!is_run_dir(temp.path()));
+
+        // Create checkpoints subdirectory
+        std::fs::create_dir(temp.path().join("checkpoints")).unwrap();
+        assert!(is_run_dir(temp.path()));
+    }
+
+    #[test]
+    fn test_select_checkpoints_with_priority_limit_1() {
+        let temp = TempDir::new().unwrap();
+
+        // Create checkpoints with metadata
+        for step in [100, 200, 300] {
+            let ckpt_dir = temp.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            std::fs::write(
+                ckpt_dir.join("metadata.json"),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+            ).unwrap();
+        }
+
+        // Create "best" symlink pointing to step_200
+        std::os::unix::fs::symlink("step_200", temp.path().join("best")).unwrap();
+
+        let checkpoints = enumerate_checkpoints(temp.path()).unwrap();
+        let selected = select_checkpoints_with_priority(temp.path(), &checkpoints, 1);
+
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].ends_with("step_200")); // best
+    }
+
+    #[test]
+    fn test_select_checkpoints_with_priority_limit_2() {
+        let temp = TempDir::new().unwrap();
+
+        // Create checkpoints with metadata
+        for step in [100, 200, 300] {
+            let ckpt_dir = temp.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            std::fs::write(
+                ckpt_dir.join("metadata.json"),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+            ).unwrap();
+        }
+
+        // Create "best" symlink pointing to step_200
+        std::os::unix::fs::symlink("step_200", temp.path().join("best")).unwrap();
+
+        let checkpoints = enumerate_checkpoints(temp.path()).unwrap();
+        let selected = select_checkpoints_with_priority(temp.path(), &checkpoints, 2);
+
+        assert_eq!(selected.len(), 2);
+        // First should be best (step_200), second should be latest (step_300)
+        assert!(selected[0].ends_with("step_200")); // best
+        assert!(selected[1].ends_with("step_300")); // latest
+    }
+
+    #[test]
+    fn test_select_checkpoints_with_priority_limit_2_best_is_latest() {
+        let temp = TempDir::new().unwrap();
+
+        // Create checkpoints with metadata
+        for step in [100, 200, 300] {
+            let ckpt_dir = temp.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            std::fs::write(
+                ckpt_dir.join("metadata.json"),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+            ).unwrap();
+        }
+
+        // Create "best" symlink pointing to step_300 (same as latest)
+        std::os::unix::fs::symlink("step_300", temp.path().join("best")).unwrap();
+
+        let checkpoints = enumerate_checkpoints(temp.path()).unwrap();
+        let selected = select_checkpoints_with_priority(temp.path(), &checkpoints, 2);
+
+        // When best == latest, should only get 1 checkpoint (deduplicated)
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].ends_with("step_300"));
+    }
+
+    #[test]
+    fn test_select_checkpoints_with_priority_limit_3plus() {
+        let temp = TempDir::new().unwrap();
+
+        // Create 5 checkpoints with metadata
+        for step in [100, 200, 300, 400, 500] {
+            let ckpt_dir = temp.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            std::fs::write(
+                ckpt_dir.join("metadata.json"),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+            ).unwrap();
+        }
+
+        // Create "best" symlink pointing to step_200
+        std::os::unix::fs::symlink("step_200", temp.path().join("best")).unwrap();
+
+        let checkpoints = enumerate_checkpoints(temp.path()).unwrap();
+        let selected = select_checkpoints_with_priority(temp.path(), &checkpoints, 4);
+
+        assert_eq!(selected.len(), 4);
+        // First should be best (step_200), second should be latest (step_500)
+        assert!(selected[0].ends_with("step_200")); // best
+        assert!(selected[1].ends_with("step_500")); // latest
+                                                    // Remaining 2 should be evenly distributed from [100, 300, 400]
+    }
+
+    #[test]
+    fn test_run_dir_path_resolution() {
+        use crate::config::TournamentArgs;
+
+        let temp = TempDir::new().unwrap();
+
+        // Create run structure: temp/checkpoints/step_*
+        let checkpoints_dir = temp.path().join("checkpoints");
+        std::fs::create_dir(&checkpoints_dir).unwrap();
+
+        for step in [100, 200] {
+            let ckpt_dir = checkpoints_dir.join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            std::fs::write(
+                ckpt_dir.join("metadata.json"),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+            ).unwrap();
+        }
+
+        // Pass the run directory (not checkpoints directory)
+        let args = TournamentArgs {
+            sources: vec![temp.path().to_path_buf()], // Note: NOT temp/checkpoints
+            backend: None,
+            num_games: 1,
+            num_envs: 1,
+            temp: Some(1.0),
+            temp_final: None,
+            temp_cutoff: None,
+            limit: None,
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+            graph: false,
+        };
+
+        let contestants = discover_contestants(&args).unwrap();
+        // Should auto-detect run directory and find checkpoints
+        assert_eq!(contestants.len(), 2);
     }
 }
