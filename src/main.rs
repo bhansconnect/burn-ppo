@@ -932,6 +932,198 @@ where
         profile::profile_frame!();
     }
 
+    // Final checkpoint - save if there have been steps since last checkpoint
+    if global_step > last_checkpoint_step && running.load(Ordering::SeqCst) {
+        // Use episodes since last checkpoint for best selection
+        let avg_return = if episodes_since_checkpoint.is_empty() {
+            // Fall back to rolling window if no episodes completed since checkpoint
+            if recent_returns.is_empty() {
+                0.0
+            } else {
+                recent_returns.iter().sum::<f32>() / recent_returns.len() as f32
+            }
+        } else {
+            episodes_since_checkpoint.iter().sum::<f32>() / episodes_since_checkpoint.len() as f32
+        };
+
+        let metadata = CheckpointMetadata {
+            step: global_step,
+            avg_return,
+            rng_seed: config.seed,
+            best_avg_return: Some(checkpoint_manager.best_avg_return()),
+            recent_returns: recent_returns.clone(),
+            forked_from: config.forked_from.clone(),
+            obs_dim,
+            action_count,
+            num_players: num_players as usize,
+            hidden_size: config.hidden_size,
+            num_hidden: config.num_hidden,
+            activation: config.activation.clone(),
+            env_name: E::NAME.to_string(),
+            training_rating: 25.0, // Updated after challenger eval via update_training_rating
+            training_uncertainty: 25.0 / 3.0,
+        };
+
+        // Disable auto-best when using challenger evaluation for multiplayer
+        let use_auto_best = !(config.challenger_eval && E::NUM_PLAYERS > 1);
+        let checkpoint_path = checkpoint_manager.save(&model, &metadata, use_auto_best)?;
+
+        // Save optimizer state alongside model
+        if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
+            eprintln!("Warning: Failed to save optimizer state: {e}");
+        }
+
+        // Save observation normalizer if enabled
+        if let Some(ref norm) = obs_normalizer {
+            if let Err(e) = save_normalizer(norm, &checkpoint_path) {
+                eprintln!("Warning: Failed to save normalizer: {e}");
+            }
+        }
+
+        // Save RNG state for reproducible continuation
+        if let Err(e) = save_rng_state(&mut rng, &checkpoint_path) {
+            eprintln!("Warning: Failed to save RNG state: {e}");
+        }
+
+        // Challenger evaluation for multiplayer games
+        let challenger_win_rate: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1 {
+            let best_path = checkpoint_manager.best_checkpoint_path();
+            if best_path.exists() {
+                // Load best checkpoint's training rating for accumulating skill
+                let (best_rating, best_uncertainty) = load_metadata(&best_path)
+                    .map(|m| (m.training_rating, m.training_uncertainty))
+                    .unwrap_or((25.0, 25.0 / 3.0));
+
+                // Run challenger evaluation with inference backend (no autodiff)
+                let challenger_model = model.valid();
+                match run_challenger_eval::<TB::InnerBackend, E>(
+                    &challenger_model,
+                    obs_normalizer.as_ref(),
+                    &best_path,
+                    best_rating,
+                    best_uncertainty,
+                    config.challenger_games,
+                    config.challenger_threshold,
+                    config,
+                    device,
+                    config.seed.wrapping_add(global_step as u64),
+                ) {
+                    Ok(result) => {
+                        // Save this checkpoint's training rating
+                        if let Err(e) = update_training_rating(
+                            &checkpoint_path,
+                            result.current_rating,
+                            result.current_uncertainty,
+                        ) {
+                            eprintln!("Warning: Failed to save training rating: {e}");
+                        }
+                        // Log metrics
+                        logger.log_scalar(
+                            "challenger/eval_time_ms",
+                            result.elapsed_ms as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/win_rate",
+                            result.win_rate as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/current_win_rate",
+                            result.current_win_rate as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/best_win_rate",
+                            result.best_win_rate as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/draw_rate",
+                            result.draw_rate as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/current_rating",
+                            result.current_rating as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/current_uncertainty",
+                            result.current_uncertainty as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/best_rating",
+                            result.best_rating as f32,
+                            global_step,
+                        )?;
+                        logger.log_scalar(
+                            "challenger/best_uncertainty",
+                            result.best_uncertainty as f32,
+                            global_step,
+                        )?;
+
+                        // Promote if win rate exceeds threshold
+                        if result.should_promote {
+                            if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
+                                eprintln!("Warning: Failed to promote checkpoint to best: {e}");
+                            }
+                        }
+
+                        // Log current best step (after potential promotion)
+                        if let Some(best_step) = get_best_checkpoint_step(&best_path) {
+                            logger.log_scalar(
+                                "challenger/best_step",
+                                best_step as f32,
+                                global_step,
+                            )?;
+                        }
+
+                        Some(result.win_rate)
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Challenger evaluation failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                // First checkpoint - becomes best automatically
+                if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
+                    eprintln!("Warning: Failed to set initial best checkpoint: {e}");
+                }
+                None
+            }
+        } else {
+            None
+        };
+
+        // Log final checkpoint save message
+        let checkpoint_msg = if let Some(win_rate) = challenger_win_rate {
+            format!(
+                "Saved final checkpoint at step {} (avg return: {:.1}, vs best: {:.1}%) -> {}",
+                global_step,
+                avg_return,
+                win_rate * 100.0,
+                checkpoint_path
+                    .file_name()
+                    .expect("checkpoint has filename")
+                    .to_string_lossy()
+            )
+        } else {
+            format!(
+                "Saved final checkpoint at step {} (avg return: {:.1}) -> {}",
+                global_step,
+                avg_return,
+                checkpoint_path
+                    .file_name()
+                    .expect("checkpoint has filename")
+                    .to_string_lossy()
+            )
+        };
+        progress.println(&checkpoint_msg);
+    }
+
     // Finish progress bar appropriately based on whether we were interrupted
     if running.load(Ordering::SeqCst) {
         progress.finish();
