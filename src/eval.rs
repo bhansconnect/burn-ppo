@@ -694,7 +694,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     best_rating: f64,
     best_uncertainty: f64,
     num_games: usize,
-    _threshold: f64, // No longer used - promotion based on current > best points
+    threshold: f64,
     config: &Config,
     device: &B::Device,
     seed: u64,
@@ -812,10 +812,13 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    // Promotion based on average points comparison
-    // For 2-player: threshold ~0.5 means equal performance
-    // For N-player: threshold should scale with num_players
-    let should_promote = current_avg_points > best_avg_points;
+    // Promotion based on average points comparison with scaled margin
+    // threshold = 0.55 means "55%" in 2-player terms (5% margin above equal)
+    // Scale margin by point range so same confidence level applies to all player counts:
+    // - 2-player: margin = (0.55 - 0.5) * 1 = 0.05
+    // - 4-player: margin = (0.55 - 0.5) * 3 = 0.15
+    let margin = (threshold - 0.5) * (num_players - 1) as f64;
+    let should_promote = current_avg_points > best_avg_points + margin;
 
     Ok(ChallengerResult {
         current_avg_points,
@@ -2369,6 +2372,39 @@ mod tests {
             elapsed_ms: 100,
         };
         assert!(!result2.should_promote);
+    }
+
+    #[test]
+    fn test_challenger_scaled_margin() {
+        // Test the scaled margin formula used for promotion decisions
+        // margin = (threshold - 0.5) * (num_players - 1)
+
+        let threshold = 0.55; // 55% threshold (5% margin in 2-player terms)
+
+        // 2-player: margin = (0.55 - 0.5) * 1 = 0.05
+        let num_players_2: i32 = 2;
+        let margin_2 = (threshold - 0.5) * f64::from(num_players_2 - 1);
+        assert!((margin_2 - 0.05).abs() < 1e-10);
+
+        // With best at 0.50, need > 0.55 to promote
+        let best_2 = 0.50;
+        assert!(0.56 > best_2 + margin_2); // Should promote
+        assert!(0.54 <= best_2 + margin_2); // Should not promote
+
+        // 4-player: margin = (0.55 - 0.5) * 3 = 0.15
+        let num_players_4: i32 = 4;
+        let margin_4 = (threshold - 0.5) * f64::from(num_players_4 - 1);
+        assert!((margin_4 - 0.15).abs() < 1e-10);
+
+        // With best at 1.50 (equal performance in 4-player), need > 1.65 to promote
+        let best_4 = 1.50;
+        assert!(1.70 > best_4 + margin_4); // Should promote
+        assert!(1.60 <= best_4 + margin_4); // Should not promote
+
+        // 3-player: margin = (0.55 - 0.5) * 2 = 0.10
+        let num_players_3: i32 = 3;
+        let margin_3 = (threshold - 0.5) * f64::from(num_players_3 - 1);
+        assert!((margin_3 - 0.10).abs() < 1e-10);
     }
 
     #[test]
