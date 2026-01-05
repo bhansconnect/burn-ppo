@@ -8,7 +8,6 @@ use std::time::Instant;
 pub struct TrainingProgress {
     main_bar: ProgressBar,
     start_time: Instant,
-    num_players: usize,
 }
 
 impl TrainingProgress {
@@ -33,7 +32,6 @@ impl TrainingProgress {
         Self {
             main_bar,
             start_time: Instant::now(),
-            num_players,
         }
     }
 
@@ -55,13 +53,13 @@ impl TrainingProgress {
 
     /// Update with multiplayer statistics
     ///
-    /// Shows per-player returns and win rates for 2-player games,
-    /// or just per-player returns for N>2 player games.
+    /// Shows per-player returns and average Swiss points.
+    /// Format: `SPS: N | P0: ret (pts) | P1: ret (pts) | ... | D%`
     pub fn update_multiplayer(
         &self,
         step: u64,
         returns_per_player: &[f32],
-        win_rates: &[f32],
+        avg_points: &[f32],
         draw_rate: f32,
     ) {
         self.main_bar.set_position(step);
@@ -73,28 +71,16 @@ impl TrainingProgress {
             0.0
         };
 
-        let msg = if self.num_players == 2 {
-            // Compact 2-player format: SPS: 1250 | P0: 0.52 (48%W) | P1: 0.51 (47%W) | 5%D
-            format!(
-                "SPS: {:.0} | P0: {:.2} ({:.0}%W) | P1: {:.2} ({:.0}%W) | {:.0}%D",
-                sps,
-                returns_per_player.first().unwrap_or(&0.0),
-                win_rates.first().unwrap_or(&0.0) * 100.0,
-                returns_per_player.get(1).unwrap_or(&0.0),
-                win_rates.get(1).unwrap_or(&0.0) * 100.0,
-                draw_rate * 100.0
-            )
-        } else {
-            // N-player format: just show returns
-            let returns_str: String = returns_per_player
-                .iter()
-                .enumerate()
-                .map(|(i, r)| format!("P{i}: {r:.2}"))
-                .collect::<Vec<_>>()
-                .join(" | ");
-            format!("SPS: {sps:.0} | {returns_str}")
-        };
+        // Unified format for all N-player games
+        let stats_str: String = returns_per_player
+            .iter()
+            .zip(avg_points.iter())
+            .enumerate()
+            .map(|(i, (r, pts))| format!("P{i}: {r:.2} ({pts:.2}pts)"))
+            .collect::<Vec<_>>()
+            .join(" | ");
 
+        let msg = format!("SPS: {sps:.0} | {stats_str} | {:.0}%D", draw_rate * 100.0);
         self.main_bar.set_message(msg);
     }
 
@@ -121,18 +107,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_training_progress_creation_single_player() {
-        let progress = TrainingProgress::new_with_players(1000, 1);
-        assert_eq!(progress.num_players, 1);
-    }
-
-    #[test]
-    fn test_training_progress_creation_multiplayer() {
-        let progress = TrainingProgress::new_with_players(1000, 2);
-        assert_eq!(progress.num_players, 2);
-
-        let progress3 = TrainingProgress::new_with_players(1000, 3);
-        assert_eq!(progress3.num_players, 3);
+    fn test_training_progress_creation_no_panic() {
+        // Test that creation works for various player counts
+        let _ = TrainingProgress::new_with_players(1000, 1);
+        let _ = TrainingProgress::new_with_players(1000, 2);
+        let _ = TrainingProgress::new_with_players(1000, 4);
     }
 
     #[test]
@@ -146,7 +125,7 @@ mod tests {
     #[test]
     fn test_training_progress_update_multiplayer_no_panic() {
         let progress = TrainingProgress::new_with_players(1000, 2);
-        // Should not panic with 2-player format
+        // Should not panic: returns=[0.5, 0.5], avg_points=[0.45, 0.45], draw_rate=0.1
         progress.update_multiplayer(500, &[0.5, 0.5], &[0.45, 0.45], 0.1);
         progress.finish();
     }
@@ -154,8 +133,8 @@ mod tests {
     #[test]
     fn test_training_progress_update_multiplayer_3player_no_panic() {
         let progress = TrainingProgress::new_with_players(1000, 3);
-        // Should not panic with N-player format
-        progress.update_multiplayer(500, &[0.33, 0.33, 0.34], &[0.3, 0.3, 0.3], 0.1);
+        // Should not panic: returns, avg_points for 3 players
+        progress.update_multiplayer(500, &[0.33, 0.33, 0.34], &[1.0, 1.0, 1.0], 0.1);
         progress.finish();
     }
 }

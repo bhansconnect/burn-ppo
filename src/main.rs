@@ -44,7 +44,7 @@ use crate::checkpoint::{
     save_optimizer, save_rng_state, update_training_rating, CheckpointManager, CheckpointMetadata,
 };
 use crate::config::{Cli, CliArgs, Command, Config};
-use crate::env::{compute_outcome_rates, Environment, GameOutcome, VecEnv};
+use crate::env::{compute_avg_points, Environment, GameOutcome, VecEnv};
 use crate::envs::{CartPole, ConnectFour, LiarsDice};
 use crate::eval::run_challenger_eval;
 use crate::metrics::MetricsLogger;
@@ -530,11 +530,11 @@ where
                     }
                 })
                 .collect();
-            let (win_rates, draw_rate) = compute_outcome_rates(&recent_outcomes, num_players_usize);
+            let (avg_points, draw_rate) = compute_avg_points(&recent_outcomes, num_players_usize);
             progress.update_multiplayer(
                 global_step as u64,
                 &returns_per_player,
-                &win_rates,
+                &avg_points,
                 draw_rate,
             );
         } else {
@@ -671,42 +671,22 @@ where
                     }
                 }
 
-                // Win/Loss/Draw rates
+                // Swiss points and draw rate
                 let total_games = episodes_since_log_mp.len();
-                let mut wins_per_player = vec![0usize; num_players_usize];
-                let mut draws = 0usize;
+                let outcomes: VecDeque<GameOutcome> = episodes_since_log_mp
+                    .iter()
+                    .filter_map(|(_, o)| o.clone())
+                    .collect();
+                let (avg_points, draw_rate) = compute_avg_points(&outcomes, num_players_usize);
 
-                for (_, outcome) in &episodes_since_log_mp {
-                    if let Some(ref outcome) = outcome {
-                        match outcome {
-                            GameOutcome::Winner(w) => wins_per_player[*w] += 1,
-                            GameOutcome::Tie => draws += 1,
-                            GameOutcome::Placements(places) => {
-                                let first_count = places.iter().filter(|&&p| p == 1).count();
-                                if first_count == places.len() {
-                                    draws += 1;
-                                } else {
-                                    for (i, &place) in places.iter().enumerate() {
-                                        if place == 1 && first_count == 1 {
-                                            wins_per_player[i] += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for (player, &wins) in wins_per_player.iter().enumerate() {
-                    let win_rate = wins as f32 / total_games as f32;
+                for (player, &pts) in avg_points.iter().enumerate() {
                     logger.log_scalar(
-                        &format!("episode/win_rate_p{player}"),
-                        win_rate,
+                        &format!("episode/avg_points_p{player}"),
+                        pts,
                         global_step,
                     )?;
                 }
 
-                let draw_rate = draws as f32 / total_games as f32;
                 logger.log_scalar("episode/draw_rate", draw_rate, global_step)?;
                 logger.log_scalar("episode/games_completed", total_games as f32, global_step)?;
 

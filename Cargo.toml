@@ -39,6 +39,7 @@ skillratings = "0.28"
 
 # Profiling (Tracy integration, only our code - not dependencies)
 tracy-client = { version = "0.18", optional = true }
+itertools = "0.14.0"
 
 [dev-dependencies]
 tempfile = "3"

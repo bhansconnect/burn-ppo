@@ -32,7 +32,7 @@ use crate::human::{prompt_human_action, random_valid_action};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
 use crate::profile::profile_function;
-use crate::tournament::print_rating_guide;
+use crate::tournament::{calculate_swiss_points, print_rating_guide};
 
 /// Source of actions for a player slot.
 ///
@@ -728,11 +728,16 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     // Use weng_lin for efficiency since best is anchored
     for outcome in &outcomes {
         if let GameOutcome::Placements(placements) = outcome {
-            // For 2-player: placements[0] is current, placements[1] is best
-            let game_outcome = if placements[0] < placements[1] {
-                Outcomes::WIN // current won
-            } else if placements[0] > placements[1] {
-                Outcomes::LOSS // current lost
+            // N-player compatible: use Swiss points for comparison
+            // Current model is at position 0, best model is at position 1
+            let points = calculate_swiss_points(placements);
+            let current_pts = points[0];
+            let best_pts = points[1];
+
+            let game_outcome = if current_pts > best_pts {
+                Outcomes::WIN // current got more points (better placement)
+            } else if current_pts < best_pts {
+                Outcomes::LOSS // current got fewer points
             } else {
                 Outcomes::DRAW
             };
@@ -1440,6 +1445,12 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
     let num_checkpoints = checkpoint_to_model.len();
     let obs_dim = E::OBSERVATION_DIM;
     let action_count = E::ACTION_COUNT;
+
+    // Validate we have enough checkpoints for this N-player game
+    assert!(
+        num_checkpoints >= num_players,
+        "Insufficient checkpoints: {num_players}-player game requires at least {num_players} checkpoints, got {num_checkpoints}"
+    );
 
     // Create vectorized environment with unique seeds per env
     let base_seed = rng.next_u64();

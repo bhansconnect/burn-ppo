@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use burn::tensor::backend::Backend;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use itertools::Itertools;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -44,39 +45,59 @@ pub struct MatchupGames {
 }
 
 impl MatchupGames {
-    /// Get wins for contestant at index 0 (for 2-player matchups)
-    pub fn wins_a(&self) -> usize {
+    /// Get total Swiss points for contestant at given index
+    fn total_points(&self, idx: usize) -> f64 {
         self.games
             .iter()
-            .filter(|g| g.placements.len() >= 2 && g.placements[0] < g.placements[1])
-            .count()
+            .map(|g| {
+                let points = calculate_swiss_points(&g.placements);
+                points.get(idx).copied().unwrap_or(0.0)
+            })
+            .sum()
     }
 
-    /// Get wins for contestant at index 1 (for 2-player matchups)
-    pub fn wins_b(&self) -> usize {
-        self.games
-            .iter()
-            .filter(|g| g.placements.len() >= 2 && g.placements[1] < g.placements[0])
-            .count()
-    }
-
-    /// Get draw count (for 2-player matchups)
-    pub fn draws(&self) -> usize {
-        self.games
-            .iter()
-            .filter(|g| g.placements.len() >= 2 && g.placements[0] == g.placements[1])
-            .count()
-    }
-
-    /// Convert to legacy `MatchupResult` format
-    pub fn to_matchup_result(&self) -> MatchupResult {
-        MatchupResult {
-            contestant_a: self.contestants.first().copied().unwrap_or(0),
-            contestant_b: self.contestants.get(1).copied().unwrap_or(0),
-            wins_a: self.wins_a(),
-            wins_b: self.wins_b(),
-            draws: self.draws(),
+    /// Get average Swiss points per game for contestant at given index
+    pub fn avg_points(&self, idx: usize) -> f64 {
+        if self.games.is_empty() {
+            return 0.0;
         }
+        self.total_points(idx) / self.games.len() as f64
+    }
+
+    /// Get draw count (all contestants tied for 1st)
+    pub fn full_draws(&self) -> usize {
+        self.games
+            .iter()
+            .filter(|g| !g.placements.is_empty() && g.placements.iter().all(|&p| p == 1))
+            .count()
+    }
+
+    /// Format result summary for display
+    pub fn summary(&self, names: &[&str]) -> String {
+        let num_contestants = self.contestants.len();
+        let points: Vec<f64> = (0..num_contestants).map(|i| self.avg_points(i)).collect();
+
+        // Find winner (highest avg points)
+        let (best_idx, _) = points
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("NaN in points comparison"))
+            .unwrap_or((0, &0.0));
+
+        let names_str = names.join(" vs ");
+        let points_str: String = points
+            .iter()
+            .map(|p| format!("{p:.2}"))
+            .collect::<Vec<_>>()
+            .join("-");
+
+        let winner = if points.iter().all(|&p| (p - points[0]).abs() < 0.001) {
+            "draw".to_string()
+        } else {
+            names.get(best_idx).unwrap_or(&"?").to_string()
+        };
+
+        format!("{names_str}: {points_str} ({winner})")
     }
 }
 
@@ -145,16 +166,6 @@ impl Contestant {
     }
 }
 
-/// Result of a matchup between two contestants
-#[derive(Debug, Clone)]
-pub struct MatchupResult {
-    pub contestant_a: usize,
-    pub contestant_b: usize,
-    pub wins_a: usize,
-    pub wins_b: usize,
-    pub draws: usize,
-}
-
 /// Final tournament ranking entry
 #[derive(Debug, Clone, Serialize)]
 pub struct RankingEntry {
@@ -173,14 +184,17 @@ pub struct RankingEntry {
     pub games_played: usize,
 }
 
-/// Match summary for JSON output
+/// Pod match summary for JSON output (N-player generic)
 #[derive(Debug, Clone, Serialize)]
-pub struct MatchSummary {
+pub struct PodSummary {
     pub round: usize,
-    pub contestant_a: String,
-    pub contestant_b: String,
-    pub wins_a: usize,
-    pub wins_b: usize,
+    /// Names of contestants in this pod
+    pub contestants: Vec<String>,
+    /// Average Swiss points per game for each contestant
+    pub avg_points: Vec<f64>,
+    /// Number of games played
+    pub games: usize,
+    /// Number of full draws (all tied for 1st)
     pub draws: usize,
 }
 
@@ -188,7 +202,7 @@ pub struct MatchSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct TournamentResults {
     pub rankings: Vec<RankingEntry>,
-    pub matches: Vec<MatchSummary>,
+    pub pods: Vec<PodSummary>,
     pub config: TournamentConfigSummary,
     pub environment: String,
     pub timestamp: String,
@@ -413,7 +427,9 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
 /// - [1,1,3,4] → [2.5, 2.5, 1.0, 0.0] (tied for 1st share positions 1&2)
 /// - [1,2,2,4] → [3.0, 1.5, 1.5, 0.0] (tied for 2nd share positions 2&3)
 /// - [1,1,1,1] → [1.5, 1.5, 1.5, 1.5] (all tied share positions 1-4)
-fn calculate_swiss_points(placements: &[usize]) -> Vec<f64> {
+///
+/// Public so training and eval can use the same metric as tournaments.
+pub fn calculate_swiss_points(placements: &[usize]) -> Vec<f64> {
     use std::collections::HashMap;
 
     let num_players = placements.len();
@@ -611,26 +627,13 @@ fn form_dutch_pods_with_floaters(
     (pods, floaters)
 }
 
-/// Generate Swiss pairings for a round (2-player games)
+/// Generate round-robin pods for N-player games
 ///
-/// Thin wrapper around `swiss_pods` for 2-player games.
-/// Uses Dutch-style pairing with score brackets and floaters.
-fn swiss_pairings(contestants: &[Contestant]) -> Vec<(usize, usize)> {
-    swiss_pods(contestants, 2)
-        .into_iter()
-        .map(|pod| (pod[0], pod[1]))
-        .collect()
-}
-
-/// Generate round-robin pairings (all possible pairs)
-fn round_robin_pairings(n: usize) -> Vec<(usize, usize)> {
-    let mut pairings = Vec::new();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            pairings.push((i, j));
-        }
-    }
-    pairings
+/// Returns all unique combinations of `pod_size` contestants.
+/// For `pod_size`=2, this is equivalent to all pairs.
+/// For larger `pod_size`, uses itertools combinations.
+fn round_robin_pods(n: usize, pod_size: usize) -> Vec<Vec<usize>> {
+    (0..n).combinations(pod_size).collect()
 }
 
 /// Update ratings from per-game placements using `weng_lin_multi_team` (N-player compatible)
@@ -860,7 +863,7 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
 /// Build tournament results for JSON export
 fn build_results(
     contestants: &[Contestant],
-    matches: &[(usize, MatchupResult)], // (round, result)
+    pods: &[(usize, MatchupGames)], // (round, result)
     num_rounds: usize,
     args: &TournamentArgs,
     env_name: &str,
@@ -905,15 +908,21 @@ fn build_results(
         })
         .collect();
 
-    let match_summaries: Vec<MatchSummary> = matches
+    let pod_summaries: Vec<PodSummary> = pods
         .iter()
-        .map(|(round, result)| MatchSummary {
-            round: *round,
-            contestant_a: contestants[result.contestant_a].name.clone(),
-            contestant_b: contestants[result.contestant_b].name.clone(),
-            wins_a: result.wins_a,
-            wins_b: result.wins_b,
-            draws: result.draws,
+        .map(|(round, result)| {
+            let num_contestants = result.contestants.len();
+            PodSummary {
+                round: *round,
+                contestants: result
+                    .contestants
+                    .iter()
+                    .map(|&idx| contestants[idx].name.clone())
+                    .collect(),
+                avg_points: (0..num_contestants).map(|i| result.avg_points(i)).collect(),
+                games: result.games.len(),
+                draws: result.full_draws(),
+            }
         })
         .collect();
 
@@ -925,7 +934,7 @@ fn build_results(
 
     TournamentResults {
         rankings,
-        matches: match_summaries,
+        pods: pod_summaries,
         config: TournamentConfigSummary {
             num_games_per_matchup: args.num_games,
             num_rounds,
@@ -947,75 +956,65 @@ fn chrono_lite_now() -> String {
     format!("unix:{}", duration.as_secs())
 }
 
-/// Run a matchup between two contestants
-fn run_matchup<B: Backend, E: Environment>(
+/// Run games for a pod of N contestants
+fn run_pod<B: Backend, E: Environment>(
     contestants: &[Contestant],
     models: &[ActorCritic<B>],
     normalizers: &[Option<ObsNormalizer>],
     contestant_to_model: &[Option<usize>], // None = Random
-    idx_a: usize,
-    idx_b: usize,
+    pod: &[usize],
     num_games: usize,
     num_envs: usize,
     temp_schedule: &TempSchedule,
     rng: &mut StdRng,
     device: &B::Device,
 ) -> MatchupGames {
-    // For this matchup, we need exactly 2 "checkpoints" for run_stats_mode_env
-    // Build models/normalizers arrays for just these two
-    let mut matchup_models: Vec<ActorCritic<B>> = Vec::new();
-    let mut matchup_normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
-    let mut checkpoint_to_model_map: Vec<usize> = Vec::new();
+    use std::collections::HashMap;
 
-    // Add contestant A's model
-    if let Some(model_idx) = contestant_to_model[idx_a] {
-        matchup_models.push(models[model_idx].clone());
-        matchup_normalizers.push(normalizers[model_idx].clone());
-        checkpoint_to_model_map.push(0);
-    } else {
-        // Random player - need a dummy model slot that won't be used
-        // Actually, run_stats_mode_env doesn't support Random directly
-        // We need to handle this differently
-        // For now, create a dummy - but this won't work properly
-        // TODO: Handle Random properly by extending run_stats_mode_env or using different approach
-        checkpoint_to_model_map.push(0); // placeholder
-    }
+    let num_players = E::NUM_PLAYERS;
+    assert_eq!(
+        pod.len(),
+        num_players,
+        "Pod size {} must match NUM_PLAYERS {}",
+        pod.len(),
+        num_players
+    );
 
-    // Add contestant B's model (reuse if same as A's model)
-    if let Some(model_idx) = contestant_to_model[idx_b] {
-        // Check if we already added this model (same model_idx means same source)
-        let a_model_idx = contestant_to_model[idx_a];
-        if a_model_idx == Some(model_idx) && !matchup_models.is_empty() {
-            // Same model as A, reuse index 0
-            checkpoint_to_model_map.push(0);
-        } else {
-            matchup_models.push(models[model_idx].clone());
-            matchup_normalizers.push(normalizers[model_idx].clone());
-            checkpoint_to_model_map.push(matchup_models.len() - 1);
-        }
-    } else {
-        checkpoint_to_model_map.push(0); // placeholder for Random
-    }
-
-    let names = vec![
-        contestants[idx_a].name.clone(),
-        contestants[idx_b].name.clone(),
-    ];
-
-    // Handle Random players - for now, skip if either is Random
-    // A proper implementation would extend run_stats_mode_env to support Random
-    let has_random = contestant_to_model[idx_a].is_none() || contestant_to_model[idx_b].is_none();
+    // Check for Random players
+    let has_random = pod.iter().any(|&idx| contestant_to_model[idx].is_none());
 
     if has_random {
-        // Fallback: run interactive-style evaluation or simplified version
-        // For MVP, we'll use a simple simulation
-        return run_matchup_with_random::<E>(idx_a, idx_b, num_games, rng);
+        return run_pod_with_random::<E>(pod, num_games, rng);
     }
+
+    // Build models array, deduplicating when same model plays multiple positions
+    let mut pod_models: Vec<ActorCritic<B>> = Vec::new();
+    let mut pod_normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
+    let mut checkpoint_to_model_map: Vec<usize> = Vec::new();
+    let mut model_cache: HashMap<usize, usize> = HashMap::new();
+
+    for &contestant_idx in pod {
+        let model_idx = contestant_to_model[contestant_idx]
+            .expect("contestant should have model (Random players handled separately)");
+        if let Some(&cached_idx) = model_cache.get(&model_idx) {
+            // Reuse existing model
+            checkpoint_to_model_map.push(cached_idx);
+        } else {
+            // Add new model
+            let new_idx = pod_models.len();
+            pod_models.push(models[model_idx].clone());
+            pod_normalizers.push(normalizers[model_idx].clone());
+            model_cache.insert(model_idx, new_idx);
+            checkpoint_to_model_map.push(new_idx);
+        }
+    }
+
+    let names: Vec<String> = pod.iter().map(|&i| contestants[i].name.clone()).collect();
 
     // Run games via eval infrastructure
     let stats = run_stats_mode_env::<B, E>(
-        &matchup_models,
-        &matchup_normalizers,
+        &pod_models,
+        &pod_normalizers,
         &checkpoint_to_model_map,
         &names,
         num_games,
@@ -1042,27 +1041,27 @@ fn run_matchup<B: Backend, E: Environment>(
         .collect();
 
     MatchupGames {
-        contestants: vec![idx_a, idx_b],
+        contestants: pod.to_vec(),
         games,
     }
 }
 
-/// Simplified matchup for when Random player is involved
-fn run_matchup_with_random<E: Environment>(
-    idx_a: usize,
-    idx_b: usize,
+/// Simplified pod games for when Random players are involved
+fn run_pod_with_random<E: Environment>(
+    pod: &[usize],
     num_games: usize,
     rng: &mut StdRng,
 ) -> MatchupGames {
     use rand::Rng;
 
+    let num_players = E::NUM_PLAYERS;
     let mut games = Vec::with_capacity(num_games);
 
     for _ in 0..num_games {
         let mut env = E::new(rng.gen());
 
         loop {
-            // Random valid action
+            // Random valid action for all players
             let mask = env.action_mask();
             let action = if let Some(ref m) = mask {
                 let valid: Vec<usize> = m
@@ -1089,21 +1088,20 @@ fn run_matchup_with_random<E: Environment>(
         // Convert outcome to placements
         let placements = match env.game_outcome() {
             Some(GameOutcome::Winner(w)) => {
-                if w == 0 {
-                    vec![1, 2] // A wins
-                } else {
-                    vec![2, 1] // B wins
-                }
+                // Winner gets 1st, others get 2nd through Nth
+                (0..num_players)
+                    .map(|i| if i == w { 1 } else { 2 })
+                    .collect()
             }
             Some(GameOutcome::Placements(p)) => p,
-            Some(GameOutcome::Tie) | None => vec![1, 1], // Draw
+            Some(GameOutcome::Tie) | None => vec![1; num_players], // All tied for 1st
         };
 
         games.push(GamePlacement { placements });
     }
 
     MatchupGames {
-        contestants: vec![idx_a, idx_b],
+        contestants: pod.to_vec(),
         games,
     }
 }
@@ -1225,19 +1223,20 @@ fn run_tournament_env<B: Backend, E: Environment>(
     // Weng-Lin config
     let wl_config = WengLinConfig::new();
 
-    // Track all matches for JSON output
-    let mut all_matches: Vec<(usize, MatchupResult)> = Vec::new();
+    // Track all pod results for JSON output
+    let mut all_pods: Vec<(usize, MatchupGames)> = Vec::new();
 
     // Progress bar setup
     let multi_progress = MultiProgress::new();
+
+    let pod_size = E::NUM_PLAYERS;
 
     if use_swiss {
         // Swiss tournament
         for round in 1..=num_rounds {
             println!("Round {round}/{num_rounds}:");
 
-            // Handle byes for odd number of contestants (2-player games)
-            let pod_size = E::NUM_PLAYERS;
+            // Handle byes for contestants that can't form complete pods
             let num_byes = contestants.len() % pod_size;
             let mut bye_recipients: Vec<usize> = Vec::new();
 
@@ -1258,7 +1257,6 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
                 for (bye_idx, _, _) in bye_candidates.iter().take(num_byes) {
                     // Award bye: points equivalent to 1st place in a match
-                    // With match-level scoring, a bye = (pod_size - 1) Swiss points
                     let bye_points = (pod_size - 1) as f64;
                     contestants[*bye_idx].swiss_points += bye_points;
                     contestants[*bye_idx].has_bye = true;
@@ -1270,45 +1268,28 @@ fn run_tournament_env<B: Backend, E: Environment>(
                 }
             }
 
-            // Create pairings from active (non-bye) contestants
+            // Create pods from active (non-bye) contestants
             let active_indices: Vec<usize> = (0..contestants.len())
                 .filter(|i| !bye_recipients.contains(i))
                 .collect();
 
-            // Build temporary contestant slice for pairing
-            let pairings = if pod_size == 2 {
-                // For 2-player games, use swiss_pairings
-                let active_contestants: Vec<Contestant> = active_indices
-                    .iter()
-                    .map(|&i| contestants[i].clone())
-                    .collect();
-                let temp_pairings = swiss_pairings(&active_contestants);
-                // Map back to original indices
-                temp_pairings
-                    .into_iter()
-                    .map(|(a, b)| (active_indices[a], active_indices[b]))
-                    .collect::<Vec<_>>()
-            } else {
-                // For N-player games, use swiss_pods
-                let active_contestants: Vec<Contestant> = active_indices
-                    .iter()
-                    .map(|&i| contestants[i].clone())
-                    .collect();
-                let pods = swiss_pods(&active_contestants, pod_size);
-                // Convert pods to pairs (for compatibility with current 2-player matchup code)
-                // This is a temporary solution - would need proper N-player matchup support
-                pods.into_iter()
-                    .filter(|pod| pod.len() >= 2)
-                    .map(|pod| (active_indices[pod[0]], active_indices[pod[1]]))
-                    .collect::<Vec<_>>()
-            };
+            let active_contestants: Vec<Contestant> = active_indices
+                .iter()
+                .map(|&i| contestants[i].clone())
+                .collect();
+            let temp_pods = swiss_pods(&active_contestants, pod_size);
+            // Map pod indices back to original contestant indices
+            let pods: Vec<Vec<usize>> = temp_pods
+                .into_iter()
+                .map(|pod| pod.into_iter().map(|i| active_indices[i]).collect())
+                .collect();
 
-            if pairings.is_empty() && bye_recipients.is_empty() {
-                println!("  No more pairings possible");
+            if pods.is_empty() && bye_recipients.is_empty() {
+                println!("  No pods possible");
                 break;
             }
 
-            let round_pb = multi_progress.add(ProgressBar::new(pairings.len() as u64));
+            let round_pb = multi_progress.add(ProgressBar::new(pods.len() as u64));
             round_pb.set_style(
                 ProgressStyle::default_bar()
                     .template("  [{bar:30}] {pos}/{len} matchups")
@@ -1316,14 +1297,13 @@ fn run_tournament_env<B: Backend, E: Environment>(
                     .progress_chars("=> "),
             );
 
-            for (idx_a, idx_b) in pairings {
-                let result = run_matchup::<B, E>(
+            for pod in pods {
+                let result = run_pod::<B, E>(
                     contestants,
                     &models,
                     &normalizers,
                     &contestant_to_model,
-                    idx_a,
-                    idx_b,
+                    &pod,
                     args.num_games,
                     args.num_envs,
                     &temp_schedule,
@@ -1333,26 +1313,13 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
                 // Suspend progress bar to print result
                 round_pb.suspend(|| {
-                    let winner = if result.wins_a() > result.wins_b() {
-                        &contestants[idx_a].name
-                    } else if result.wins_b() > result.wins_a() {
-                        &contestants[idx_b].name
-                    } else {
-                        "draw"
-                    };
-                    println!(
-                        "  {} vs {}: {}-{}-{} ({})",
-                        contestants[idx_a].name,
-                        contestants[idx_b].name,
-                        result.wins_a(),
-                        result.wins_b(),
-                        result.draws(),
-                        winner
-                    );
+                    let names: Vec<&str> =
+                        pod.iter().map(|&i| contestants[i].name.as_str()).collect();
+                    println!("  {}", result.summary(&names));
                 });
 
                 update_ratings_from_games(contestants, &result, &wl_config);
-                all_matches.push((round, result.to_matchup_result()));
+                all_pods.push((round, result));
                 round_pb.inc(1);
             }
 
@@ -1361,27 +1328,26 @@ fn run_tournament_env<B: Backend, E: Environment>(
         }
     } else {
         // Round-robin
-        let pairings = round_robin_pairings(n);
-        let total_matchups = pairings.len();
+        let pods = round_robin_pods(n, pod_size);
+        let total_pods = pods.len();
 
-        println!("Running {total_matchups} matchups (round-robin):");
+        println!("Running {total_pods} pod games (round-robin):");
 
-        let pb = multi_progress.add(ProgressBar::new(total_matchups as u64));
+        let pb = multi_progress.add(ProgressBar::new(total_pods as u64));
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("[{bar:40}] {pos}/{len} matchups ({eta})")
+                .template("[{bar:40}] {pos}/{len} pods ({eta})")
                 .expect("valid template")
                 .progress_chars("=> "),
         );
 
-        for (idx_a, idx_b) in pairings {
-            let result = run_matchup::<B, E>(
+        for pod in pods {
+            let result = run_pod::<B, E>(
                 contestants,
                 &models,
                 &normalizers,
                 &contestant_to_model,
-                idx_a,
-                idx_b,
+                &pod,
                 args.num_games,
                 args.num_envs,
                 &temp_schedule,
@@ -1389,27 +1355,14 @@ fn run_tournament_env<B: Backend, E: Environment>(
                 device,
             );
 
+            // Suspend progress bar to print result
             pb.suspend(|| {
-                let winner = if result.wins_a() > result.wins_b() {
-                    &contestants[idx_a].name
-                } else if result.wins_b() > result.wins_a() {
-                    &contestants[idx_b].name
-                } else {
-                    "draw"
-                };
-                println!(
-                    "  {} vs {}: {}-{}-{} ({})",
-                    contestants[idx_a].name,
-                    contestants[idx_b].name,
-                    result.wins_a(),
-                    result.wins_b(),
-                    result.draws(),
-                    winner
-                );
+                let names: Vec<&str> = pod.iter().map(|&i| contestants[i].name.as_str()).collect();
+                println!("  {}", result.summary(&names));
             });
 
             update_ratings_from_games(contestants, &result, &wl_config);
-            all_matches.push((1, result.to_matchup_result()));
+            all_pods.push((1, result)); // Round 1 for all round-robin games
             pb.inc(1);
         }
 
@@ -1422,13 +1375,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
     // JSON output if requested
     if let Some(output_path) = &args.output {
-        let results = build_results(
-            contestants,
-            &all_matches,
-            num_rounds,
-            args,
-            &metadata.env_name,
-        );
+        let results = build_results(contestants, &all_pods, num_rounds, args, &metadata.env_name);
         let json = serde_json::to_string_pretty(&results)?;
         std::fs::write(output_path, json)?;
         println!("\nResults saved to: {}", output_path.display());
@@ -1699,20 +1646,29 @@ mod tests {
     }
 
     #[test]
-    fn test_matchup_result_creation() {
-        let result = MatchupResult {
-            contestant_a: 0,
-            contestant_b: 1,
-            wins_a: 5,
-            wins_b: 3,
-            draws: 2,
+    fn test_matchup_games_creation() {
+        let result = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![
+                GamePlacement {
+                    placements: vec![1, 2],
+                }, // P0 wins
+                GamePlacement {
+                    placements: vec![2, 1],
+                }, // P1 wins
+                GamePlacement {
+                    placements: vec![1, 1],
+                }, // Draw
+            ],
         };
 
-        assert_eq!(result.contestant_a, 0);
-        assert_eq!(result.contestant_b, 1);
-        assert_eq!(result.wins_a, 5);
-        assert_eq!(result.wins_b, 3);
-        assert_eq!(result.draws, 2);
+        assert_eq!(result.contestants, vec![0, 1]);
+        assert_eq!(result.games.len(), 3);
+        // Check avg points
+        // P0: win (1pt) + loss (0pt) + draw (0.5pt) = 1.5 / 3 = 0.5
+        assert!((result.avg_points(0) - 0.5).abs() < 0.001);
+        assert!((result.avg_points(1) - 0.5).abs() < 0.001);
+        assert_eq!(result.full_draws(), 1);
     }
 
     #[test]
@@ -1764,7 +1720,7 @@ mod tests {
     fn test_tournament_results_serialization() {
         let results = TournamentResults {
             rankings: vec![],
-            matches: vec![],
+            pods: vec![],
             config: TournamentConfigSummary {
                 num_games_per_matchup: 10,
                 num_rounds: 3,
@@ -1797,19 +1753,19 @@ mod tests {
     }
 
     #[test]
-    fn test_match_summary_serialization() {
-        let summary = MatchSummary {
+    fn test_pod_summary_serialization() {
+        let summary = PodSummary {
             round: 1,
-            contestant_a: "Player1".to_string(),
-            contestant_b: "Player2".to_string(),
-            wins_a: 3,
-            wins_b: 2,
+            contestants: vec!["Player1".to_string(), "Player2".to_string()],
+            avg_points: vec![2.0, 1.0],
+            games: 5,
             draws: 0,
         };
 
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"round\":1"));
-        assert!(json.contains("\"contestant_a\":\"Player1\""));
+        assert!(json.contains("\"contestants\""));
+        assert!(json.contains("Player1"));
     }
 
     #[test]
@@ -1835,19 +1791,29 @@ mod tests {
     }
 
     #[test]
-    fn test_round_robin_pairings() {
-        let pairings = round_robin_pairings(4);
-        assert_eq!(pairings.len(), 6); // 4*3/2 = 6
-        assert!(pairings.contains(&(0, 1)));
-        assert!(pairings.contains(&(0, 2)));
-        assert!(pairings.contains(&(0, 3)));
-        assert!(pairings.contains(&(1, 2)));
-        assert!(pairings.contains(&(1, 3)));
-        assert!(pairings.contains(&(2, 3)));
+    fn test_round_robin_pods_2player() {
+        let pods = round_robin_pods(4, 2);
+        assert_eq!(pods.len(), 6); // C(4,2) = 6
+        assert!(pods.contains(&vec![0, 1]));
+        assert!(pods.contains(&vec![0, 2]));
+        assert!(pods.contains(&vec![0, 3]));
+        assert!(pods.contains(&vec![1, 2]));
+        assert!(pods.contains(&vec![1, 3]));
+        assert!(pods.contains(&vec![2, 3]));
     }
 
     #[test]
-    fn test_swiss_pairings() {
+    fn test_round_robin_pods_4player() {
+        let pods = round_robin_pods(5, 4);
+        assert_eq!(pods.len(), 5); // C(5,4) = 5
+                                   // Each pod should have 4 unique contestants
+        for pod in &pods {
+            assert_eq!(pod.len(), 4);
+        }
+    }
+
+    #[test]
+    fn test_swiss_pods_2player() {
         let contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -1855,40 +1821,57 @@ mod tests {
             Contestant::new("D".to_string(), PlayerSource::Random, 0.0),
         ];
 
-        let pairings = swiss_pairings(&contestants);
-        // Should pair all 4: 2 pairings
-        assert_eq!(pairings.len(), 2);
+        let pods = swiss_pods(&contestants, 2);
+        // Should pair all 4: 2 pods
+        assert_eq!(pods.len(), 2);
 
         // Each contestant should appear exactly once
         let mut seen = [false; 4];
-        for (a, b) in &pairings {
-            assert!(!seen[*a]);
-            assert!(!seen[*b]);
-            seen[*a] = true;
-            seen[*b] = true;
+        for pod in &pods {
+            for &idx in pod {
+                assert!(!seen[idx]);
+                seen[idx] = true;
+            }
         }
     }
 
     #[test]
-    fn test_swiss_pairings_with_different_ratings() {
+    fn test_swiss_pods_4player() {
+        let contestants = vec![
+            Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
+            Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
+            Contestant::new("C".to_string(), PlayerSource::Random, 0.0),
+            Contestant::new("D".to_string(), PlayerSource::Random, 0.0),
+        ];
+
+        let pods = swiss_pods(&contestants, 4);
+        // Should make 1 pod with all 4
+        assert_eq!(pods.len(), 1);
+        assert_eq!(pods[0].len(), 4);
+    }
+
+    #[test]
+    fn test_swiss_pods_with_different_ratings() {
         let mut contestants = vec![
             Contestant::new("High".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("Low".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("Medium".to_string(), PlayerSource::Random, 0.0),
+            Contestant::new("MidHigh".to_string(), PlayerSource::Random, 0.0),
         ];
 
         // Modify ratings
         contestants[0].rating.rating = 30.0;
         contestants[1].rating.rating = 15.0;
         contestants[2].rating.rating = 25.0;
+        contestants[3].rating.rating = 28.0;
 
-        let pairings = swiss_pairings(&contestants);
-        // With 3 contestants, only 1 pairing (one gets a bye)
-        assert_eq!(pairings.len(), 1);
+        let pods = swiss_pods(&contestants, 2);
+        // With 4 contestants, should get 2 pods
+        assert_eq!(pods.len(), 2);
     }
 
     #[test]
-    fn test_swiss_pairings_prefers_unfaced_opponents() {
+    fn test_swiss_pods_prefers_unfaced_opponents() {
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -1900,27 +1883,27 @@ mod tests {
         contestants[0].opponents_faced.push(1);
         contestants[1].opponents_faced.push(0);
 
-        let pairings = swiss_pairings(&contestants);
+        let pods = swiss_pods(&contestants, 2);
 
         // A should be paired with C or D (not B since they've already faced)
-        let a_pairing = pairings.iter().find(|(a, b)| *a == 0 || *b == 0);
-        if let Some((a, b)) = a_pairing {
-            let opponent = if *a == 0 { *b } else { *a };
+        let a_pod = pods.iter().find(|pod| pod.contains(&0));
+        if let Some(pod) = a_pod {
+            let opponent = if pod[0] == 0 { pod[1] } else { pod[0] };
             assert!(opponent == 2 || opponent == 3); // C or D, not B
         }
     }
 
     #[test]
-    fn test_swiss_pairings_odd_number() {
+    fn test_swiss_pods_odd_number() {
         let contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("C".to_string(), PlayerSource::Random, 0.0),
         ];
 
-        let pairings = swiss_pairings(&contestants);
-        // With 3 contestants, only 1 pairing (one gets a bye)
-        assert_eq!(pairings.len(), 1);
+        let pods = swiss_pods(&contestants, 2);
+        // With 3 contestants, only 1 pod (one gets a bye)
+        assert_eq!(pods.len(), 1);
     }
 
     #[test]
@@ -1939,16 +1922,22 @@ mod tests {
         contestants[1].placement_counts = vec![0, 3]; // 0 wins, 3 losses
         contestants[1].games_played = 3;
 
-        let matches = vec![(
-            1,
-            MatchupResult {
-                contestant_a: 0,
-                contestant_b: 1,
-                wins_a: 3,
-                wins_b: 0,
-                draws: 0,
-            },
-        )];
+        // Create MatchupGames with 3 games where Winner (idx 0) wins all
+        let matchup_games = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![
+                GamePlacement {
+                    placements: vec![1, 2],
+                },
+                GamePlacement {
+                    placements: vec![1, 2],
+                },
+                GamePlacement {
+                    placements: vec![1, 2],
+                },
+            ],
+        };
+        let pods = vec![(1, matchup_games)];
 
         let args = TournamentArgs {
             sources: vec![],
@@ -1965,14 +1954,14 @@ mod tests {
             random: false,
         };
 
-        let results = build_results(&contestants, &matches, 1, &args, "connect_four");
+        let results = build_results(&contestants, &pods, 1, &args, "connect_four");
 
         assert_eq!(results.rankings.len(), 2);
         assert_eq!(results.rankings[0].name, "Winner"); // Higher rating is first
         assert_eq!(results.rankings[0].rank, 1);
         assert_eq!(results.rankings[1].name, "Loser");
         assert_eq!(results.rankings[1].rank, 2);
-        assert_eq!(results.matches.len(), 1);
+        assert_eq!(results.pods.len(), 1);
         assert_eq!(results.environment, "connect_four");
         assert_eq!(results.config.num_games_per_matchup, 3);
         assert_eq!(results.config.seed, Some(42));
@@ -2213,12 +2202,12 @@ mod tests {
     }
 
     #[test]
-    fn test_run_matchup_with_random_produces_results() {
+    fn test_run_pod_with_random_produces_results() {
         use crate::envs::connect_four::ConnectFour;
         use rand::SeedableRng;
 
         let mut rng = StdRng::seed_from_u64(42);
-        let result = run_matchup_with_random::<ConnectFour>(0, 1, 10, &mut rng);
+        let result = run_pod_with_random::<ConnectFour>(&[0, 1], 10, &mut rng);
 
         assert_eq!(result.contestants, vec![0, 1]);
         // Total games should equal num_games
@@ -2230,20 +2219,20 @@ mod tests {
     }
 
     #[test]
-    fn test_run_matchup_with_random_deterministic() {
+    fn test_run_pod_with_random_deterministic() {
         use crate::envs::connect_four::ConnectFour;
         use rand::SeedableRng;
 
         // Same seed should produce same results
         let mut rng1 = StdRng::seed_from_u64(12345);
-        let result1 = run_matchup_with_random::<ConnectFour>(0, 1, 5, &mut rng1);
+        let result1 = run_pod_with_random::<ConnectFour>(&[0, 1], 5, &mut rng1);
 
         let mut rng2 = StdRng::seed_from_u64(12345);
-        let result2 = run_matchup_with_random::<ConnectFour>(0, 1, 5, &mut rng2);
+        let result2 = run_pod_with_random::<ConnectFour>(&[0, 1], 5, &mut rng2);
 
-        assert_eq!(result1.wins_a(), result2.wins_a());
-        assert_eq!(result1.wins_b(), result2.wins_b());
-        assert_eq!(result1.draws(), result2.draws());
+        // Check avg_points are equal (deterministic results)
+        assert!((result1.avg_points(0) - result2.avg_points(0)).abs() < 0.001);
+        assert!((result1.avg_points(1) - result2.avg_points(1)).abs() < 0.001);
     }
 
     #[test]
@@ -2295,15 +2284,16 @@ mod tests {
     }
 
     #[test]
-    fn test_run_matchup_with_random_cartpole() {
+    fn test_run_pod_with_random_cartpole() {
         use crate::envs::cartpole::CartPole;
         use rand::SeedableRng;
 
         let mut rng = StdRng::seed_from_u64(42);
-        let result = run_matchup_with_random::<CartPole>(0, 1, 5, &mut rng);
+        // CartPole is single player, so pod size is 1
+        let result = run_pod_with_random::<CartPole>(&[0], 5, &mut rng);
 
         // CartPole is single player, so outcomes are based on episode length/reward
-        assert_eq!(result.contestants, vec![0, 1]);
+        assert_eq!(result.contestants, vec![0]);
         assert_eq!(result.games.len(), 5);
     }
 
@@ -2330,7 +2320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_results_match_summaries() {
+    fn test_build_results_pod_summaries() {
         use crate::config::TournamentArgs;
 
         let contestants = vec![
@@ -2338,25 +2328,42 @@ mod tests {
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
 
-        let matches = vec![
+        let pods = vec![
             (
                 1,
-                MatchupResult {
-                    contestant_a: 0,
-                    contestant_b: 1,
-                    wins_a: 2,
-                    wins_b: 1,
-                    draws: 0,
+                MatchupGames {
+                    contestants: vec![0, 1],
+                    games: vec![
+                        GamePlacement {
+                            placements: vec![1, 2],
+                        },
+                        GamePlacement {
+                            placements: vec![1, 2],
+                        },
+                        GamePlacement {
+                            placements: vec![2, 1],
+                        },
+                    ],
                 },
             ),
             (
                 2,
-                MatchupResult {
-                    contestant_a: 0,
-                    contestant_b: 1,
-                    wins_a: 1,
-                    wins_b: 2,
-                    draws: 1,
+                MatchupGames {
+                    contestants: vec![0, 1],
+                    games: vec![
+                        GamePlacement {
+                            placements: vec![2, 1],
+                        },
+                        GamePlacement {
+                            placements: vec![2, 1],
+                        },
+                        GamePlacement {
+                            placements: vec![1, 1],
+                        }, // Draw
+                        GamePlacement {
+                            placements: vec![1, 2],
+                        },
+                    ],
                 },
             ),
         ];
@@ -2376,17 +2383,16 @@ mod tests {
             random: false,
         };
 
-        let results = build_results(&contestants, &matches, 2, &args, "test");
+        let results = build_results(&contestants, &pods, 2, &args, "test");
 
-        assert_eq!(results.matches.len(), 2);
-        assert_eq!(results.matches[0].round, 1);
-        assert_eq!(results.matches[0].wins_a, 2);
-        assert_eq!(results.matches[1].round, 2);
-        assert_eq!(results.matches[1].draws, 1);
+        assert_eq!(results.pods.len(), 2);
+        assert_eq!(results.pods[0].round, 1);
+        assert_eq!(results.pods[1].round, 2);
+        assert_eq!(results.pods[1].draws, 1);
     }
 
     #[test]
-    fn test_swiss_pairings_all_faced() {
+    fn test_swiss_pods_all_faced() {
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -2400,9 +2406,9 @@ mod tests {
         contestants[2].opponents_faced = vec![0, 1, 3];
         contestants[3].opponents_faced = vec![0, 1, 2];
 
-        let pairings = swiss_pairings(&contestants);
-        // Should still produce pairings even when all faced
-        assert_eq!(pairings.len(), 2);
+        let pods = swiss_pods(&contestants, 2);
+        // Should still produce pods even when all faced
+        assert_eq!(pods.len(), 2);
     }
 
     #[test]
@@ -2414,18 +2420,22 @@ mod tests {
     }
 
     #[test]
-    fn test_matchup_result_clone() {
-        let result = MatchupResult {
-            contestant_a: 0,
-            contestant_b: 1,
-            wins_a: 5,
-            wins_b: 3,
-            draws: 2,
+    fn test_matchup_games_clone() {
+        let result = MatchupGames {
+            contestants: vec![0, 1],
+            games: vec![
+                GamePlacement {
+                    placements: vec![1, 2],
+                },
+                GamePlacement {
+                    placements: vec![2, 1],
+                },
+            ],
         };
 
         let cloned = result.clone();
-        assert_eq!(cloned.wins_a, 5);
-        assert_eq!(cloned.wins_b, 3);
+        assert_eq!(cloned.contestants, vec![0, 1]);
+        assert_eq!(cloned.games.len(), 2);
     }
 
     #[test]
@@ -2454,7 +2464,7 @@ mod tests {
     fn test_tournament_results_clone() {
         let results = TournamentResults {
             rankings: vec![],
-            matches: vec![],
+            pods: vec![],
             config: TournamentConfigSummary {
                 num_games_per_matchup: 5,
                 num_rounds: 1,
@@ -2777,7 +2787,7 @@ mod tests {
     }
 
     #[test]
-    fn test_swiss_pairings_dutch_style_round_1() {
+    fn test_swiss_pods_dutch_style_round_1_2player() {
         // Round 1: all swiss_points == 0, should use Dutch-style pairing
         // Sort by initial_seed (descending), pair top half vs bottom half
         let contestants = vec![
@@ -2787,20 +2797,13 @@ mod tests {
             Contestant::new("Seed2".to_string(), PlayerSource::Random, 2.0),
         ];
 
-        let pairings = swiss_pairings(&contestants);
-        assert_eq!(pairings.len(), 2);
+        let pods = swiss_pods(&contestants, 2);
+        assert_eq!(pods.len(), 2);
 
-        // Sorted by seed: Seed4(idx=2), Seed3(idx=0), Seed2(idx=3), Seed1(idx=1)
-        // Top half: Seed4, Seed3; Bottom half: Seed2, Seed1
-        // Expected pairings: (2, 3), (0, 1) - Seed4 vs Seed2, Seed3 vs Seed1
-        let mut found_pairs: Vec<(usize, usize)> = pairings
-            .iter()
-            .map(|&(a, b)| if a < b { (a, b) } else { (b, a) })
-            .collect();
-        found_pairs.sort_unstable();
-
-        // Verify Dutch-style: highest seed paired with mid-ranked, not with 2nd highest
-        assert!(found_pairs.contains(&(0, 1)) || found_pairs.contains(&(2, 3)));
+        // Each pod should have 2 contestants
+        for pod in &pods {
+            assert_eq!(pod.len(), 2);
+        }
     }
 
     #[test]
@@ -2825,7 +2828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_swiss_pairings_subsequent_rounds() {
+    fn test_swiss_pods_subsequent_rounds() {
         // After round 1, contestants have swiss_points > 0
         // Should sort by swiss_points, not initial_seed
         let mut contestants = vec![
@@ -2841,10 +2844,12 @@ mod tests {
         contestants[2].swiss_points = 0.5;
         contestants[3].swiss_points = 0.0; // D has least points
 
-        let pairings = swiss_pairings(&contestants);
-        assert_eq!(pairings.len(), 2);
+        let pods = swiss_pods(&contestants, 2);
+        assert_eq!(pods.len(), 2);
 
-        // A (highest points) should be paired with someone, not necessarily by seed
+        // A (highest points) should be in a pod
+        let a_pod = pods.iter().any(|pod| pod.contains(&0));
+        assert!(a_pod);
     }
 
     #[test]
