@@ -157,12 +157,19 @@ impl CheckpointManager {
         let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json)
             .context("Failed to parse checkpoint metadata (missing required fields?)")?;
 
-        // Use dimensions directly from metadata (required fields, no fallbacks)
+        // Create config with architecture from checkpoint metadata
+        // (not current config, which may have different split_networks/hidden_size/etc.)
+        let mut load_config = config.clone();
+        load_config.hidden_size = metadata.hidden_size;
+        load_config.num_hidden = metadata.num_hidden;
+        load_config.activation.clone_from(&metadata.activation);
+        load_config.split_networks = metadata.split_networks;
+
         let default_model: ActorCritic<B> = ActorCritic::new(
             metadata.obs_dim,
             metadata.action_count,
             metadata.num_players,
-            config,
+            &load_config,
             device,
         );
 
@@ -684,5 +691,208 @@ mod tests {
             loaded.is_none(),
             "Loading from dir without rng_state should return None"
         );
+    }
+
+    // =========================================
+    // Split Network Architecture Mismatch Tests
+    // =========================================
+
+    #[test]
+    fn test_load_split_checkpoint_with_shared_config() {
+        // Save a checkpoint with split_networks=true, load with config that has split_networks=false
+        // Should succeed because load uses metadata architecture, not current config
+        let dir = tempdir().unwrap();
+        let mut manager = CheckpointManager::new(dir.path()).unwrap();
+        let device = Default::default();
+
+        // Create config with split networks
+        let split_config = Config {
+            split_networks: true,
+            ..Config::default()
+        };
+
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &split_config, &device);
+
+        let metadata = CheckpointMetadata {
+            step: 1000,
+            avg_return: 100.0,
+            rng_seed: 42,
+            best_avg_return: Some(100.0),
+            recent_returns: vec![100.0],
+            forked_from: None,
+            obs_dim: 4,
+            action_count: 2,
+            num_players: 1,
+            hidden_size: 64,
+            num_hidden: 2,
+            activation: "tanh".to_string(),
+            split_networks: true, // Saved as split
+            env_name: "test".to_string(),
+            training_rating: 25.0,
+            training_uncertainty: 25.0 / 3.0,
+        };
+
+        let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
+
+        // Load with a config that has split_networks=false (mismatched)
+        let shared_config = Config::default(); // split_networks defaults to false
+
+        let result =
+            CheckpointManager::load::<TestBackend>(&checkpoint_path, &shared_config, &device);
+        assert!(
+            result.is_ok(),
+            "Should load split checkpoint with shared config"
+        );
+
+        // Verify model structure matches saved (split), not current config (shared)
+        let (loaded_model, loaded_metadata) = result.unwrap();
+        assert!(loaded_metadata.split_networks);
+
+        // Forward pass should work
+        let (logits, values) = loaded_model.forward(burn::tensor::Tensor::zeros([1, 4], &device));
+        assert_eq!(logits.dims(), [1, 2]);
+        assert_eq!(values.dims(), [1, 1]);
+    }
+
+    #[test]
+    fn test_load_shared_checkpoint_with_split_config() {
+        // Save a checkpoint with split_networks=false, load with config that has split_networks=true
+        // This was the failing case: loading creates wrong structure, causing vec length mismatch
+        let dir = tempdir().unwrap();
+        let mut manager = CheckpointManager::new(dir.path()).unwrap();
+        let device = Default::default();
+
+        // Create config with shared backbone (default)
+        let shared_config = Config::default();
+
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &shared_config, &device);
+
+        let metadata = CheckpointMetadata {
+            step: 1000,
+            avg_return: 100.0,
+            rng_seed: 42,
+            best_avg_return: Some(100.0),
+            recent_returns: vec![100.0],
+            forked_from: None,
+            obs_dim: 4,
+            action_count: 2,
+            num_players: 1,
+            hidden_size: 64,
+            num_hidden: 2,
+            activation: "tanh".to_string(),
+            split_networks: false, // Saved as shared
+            env_name: "test".to_string(),
+            training_rating: 25.0,
+            training_uncertainty: 25.0 / 3.0,
+        };
+
+        let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
+
+        // Load with a config that has split_networks=true (mismatched)
+        let split_config = Config {
+            split_networks: true,
+            ..Config::default()
+        };
+
+        let result =
+            CheckpointManager::load::<TestBackend>(&checkpoint_path, &split_config, &device);
+        assert!(
+            result.is_ok(),
+            "Should load shared checkpoint with split config (was failing before fix)"
+        );
+
+        // Verify model structure matches saved (shared), not current config (split)
+        let (loaded_model, loaded_metadata) = result.unwrap();
+        assert!(!loaded_metadata.split_networks);
+
+        // Forward pass should work
+        let (logits, values) = loaded_model.forward(burn::tensor::Tensor::zeros([1, 4], &device));
+        assert_eq!(logits.dims(), [1, 2]);
+        assert_eq!(values.dims(), [1, 1]);
+    }
+
+    #[test]
+    fn test_load_mixed_architecture_checkpoints() {
+        // Test loading both split and shared checkpoints simultaneously
+        // This simulates eval where one player uses split network and another uses shared
+        let dir = tempdir().unwrap();
+        let mut manager = CheckpointManager::new(dir.path()).unwrap();
+        let device = Default::default();
+
+        // Create and save split network model
+        let split_config = Config {
+            split_networks: true,
+            ..Config::default()
+        };
+        let split_model: ActorCritic<TestBackend> =
+            ActorCritic::new(4, 2, 1, &split_config, &device);
+
+        let split_metadata = CheckpointMetadata {
+            step: 1000,
+            avg_return: 100.0,
+            rng_seed: 42,
+            best_avg_return: Some(100.0),
+            recent_returns: vec![100.0],
+            forked_from: None,
+            obs_dim: 4,
+            action_count: 2,
+            num_players: 1,
+            hidden_size: 64,
+            num_hidden: 2,
+            activation: "tanh".to_string(),
+            split_networks: true,
+            env_name: "test".to_string(),
+            training_rating: 25.0,
+            training_uncertainty: 25.0 / 3.0,
+        };
+        let split_path = manager.save(&split_model, &split_metadata, false).unwrap();
+
+        // Create and save shared network model
+        let shared_config = Config::default();
+        let shared_model: ActorCritic<TestBackend> =
+            ActorCritic::new(4, 2, 1, &shared_config, &device);
+
+        let shared_metadata = CheckpointMetadata {
+            step: 2000,
+            avg_return: 150.0,
+            rng_seed: 43,
+            best_avg_return: Some(150.0),
+            recent_returns: vec![150.0],
+            forked_from: None,
+            obs_dim: 4,
+            action_count: 2,
+            num_players: 1,
+            hidden_size: 64,
+            num_hidden: 2,
+            activation: "tanh".to_string(),
+            split_networks: false,
+            env_name: "test".to_string(),
+            training_rating: 25.0,
+            training_uncertainty: 25.0 / 3.0,
+        };
+        let shared_path = manager
+            .save(&shared_model, &shared_metadata, false)
+            .unwrap();
+
+        // Load both with a single config (doesn't matter which, metadata should be used)
+        let load_config = Config::default();
+
+        let (loaded_split, split_meta) =
+            CheckpointManager::load::<TestBackend>(&split_path, &load_config, &device).unwrap();
+        let (loaded_shared, shared_meta) =
+            CheckpointManager::load::<TestBackend>(&shared_path, &load_config, &device).unwrap();
+
+        // Verify architectures match what was saved
+        assert!(split_meta.split_networks);
+        assert!(!shared_meta.split_networks);
+
+        // Both models should work with same input
+        let input = burn::tensor::Tensor::zeros([1, 4], &device);
+        let (split_logits, split_values) = loaded_split.forward(input.clone());
+        let (shared_logits, shared_values) = loaded_shared.forward(input);
+
+        // Same output shapes
+        assert_eq!(split_logits.dims(), shared_logits.dims());
+        assert_eq!(split_values.dims(), shared_values.dims());
     }
 }
