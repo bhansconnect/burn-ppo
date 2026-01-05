@@ -482,7 +482,7 @@ impl Environment for LiarsDice {
             placements[player] = NUM_PLAYERS - order;
         }
 
-        Some(GameOutcome::Placements(placements))
+        Some(GameOutcome(placements))
     }
 
     fn describe_action(&self, action: usize) -> String {
@@ -752,16 +752,13 @@ mod tests {
         let outcome = env.game_outcome();
         assert!(outcome.is_some());
 
-        if let Some(GameOutcome::Placements(placements)) = outcome {
-            // P0 was eliminated first (4th place)
-            // P3 won (1st place)
-            assert_eq!(placements[0], 4);
-            assert_eq!(placements[1], 3);
-            assert_eq!(placements[2], 2);
-            assert_eq!(placements[3], 1);
-        } else {
-            panic!("Expected Placements outcome");
-        }
+        let placements = &outcome.unwrap().0;
+        // P0 was eliminated first (4th place)
+        // P3 won (1st place)
+        assert_eq!(placements[0], 4);
+        assert_eq!(placements[1], 3);
+        assert_eq!(placements[2], 2);
+        assert_eq!(placements[3], 1);
     }
 
     #[test]
@@ -1016,13 +1013,13 @@ mod tests {
         assert!(env.game_outcome().is_some(), "Should have outcome");
 
         // Verify placements
-        if let Some(GameOutcome::Placements(placements)) = env.game_outcome() {
+        if let Some(outcome) = env.game_outcome() {
             // All players should have a placement (1-4)
-            for &p in &placements {
+            for &p in &outcome.0 {
                 assert!((1..=4).contains(&p), "Placement should be 1-4");
             }
             // Should have exactly one of each placement
-            let mut sorted = placements.clone();
+            let mut sorted = outcome.0.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, vec![1, 2, 3, 4]);
         }

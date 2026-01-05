@@ -233,26 +233,8 @@ pub fn rewards_to_placements(rewards: &[f32]) -> Vec<usize> {
 
 /// Determine game outcome from environment and rewards
 pub fn determine_outcome<E: Environment>(env: &E, total_rewards: &[f32]) -> GameOutcome {
-    // 1. Check explicit outcome first
-    if let Some(outcome) = env.game_outcome() {
-        return outcome;
-    }
-
-    // 2. Infer from total_rewards
-    let placements = rewards_to_placements(total_rewards);
-    let first_place_count = placements.iter().filter(|&&p| p == 1).count();
-
-    if first_place_count == placements.len() {
-        GameOutcome::Tie
-    } else if first_place_count == 1 {
-        let winner = placements
-            .iter()
-            .position(|&p| p == 1)
-            .expect("first_place_count == 1 guarantees a winner");
-        GameOutcome::Winner(winner)
-    } else {
-        GameOutcome::Placements(placements)
-    }
+    env.game_outcome()
+        .unwrap_or_else(|| GameOutcome(rewards_to_placements(total_rewards)))
 }
 
 /// Statistics tracker for evaluation results
@@ -289,11 +271,7 @@ impl EvalStats {
         self.game_outcomes
             .iter()
             .filter(|outcome| {
-                if let GameOutcome::Placements(places) = outcome {
-                    places[player] == 1 && places.iter().filter(|&&p| p == 1).count() == 1
-                } else {
-                    false
-                }
+                outcome.0[player] == 1 && outcome.0.iter().filter(|&&p| p == 1).count() == 1
             })
             .count()
     }
@@ -303,13 +281,7 @@ impl EvalStats {
     pub fn losses(&self, player: usize) -> usize {
         self.game_outcomes
             .iter()
-            .filter(|outcome| {
-                if let GameOutcome::Placements(places) = outcome {
-                    places[player] == self.num_players
-                } else {
-                    false
-                }
-            })
+            .filter(|outcome| outcome.0[player] == self.num_players)
             .count()
     }
 
@@ -318,13 +290,7 @@ impl EvalStats {
     pub fn draws(&self) -> usize {
         self.game_outcomes
             .iter()
-            .filter(|outcome| {
-                if let GameOutcome::Placements(places) = outcome {
-                    places.iter().all(|&p| p == 1)
-                } else {
-                    false
-                }
-            })
+            .filter(|outcome| outcome.0.iter().all(|&p| p == 1))
             .count()
     }
 
@@ -339,33 +305,13 @@ impl EvalStats {
     /// Record a game outcome
     pub fn record(&mut self, outcome: &GameOutcome) {
         self.total_games += 1;
-
-        // Store the outcome for rating calculations
-        // Convert to Placements format for consistency
-        let placements_outcome = match outcome {
-            GameOutcome::Winner(winner) => {
-                let mut placements = vec![2; self.num_players];
-                placements[*winner] = 1;
-                GameOutcome::Placements(placements)
-            }
-            GameOutcome::Tie => {
-                // All players tied for 1st
-                GameOutcome::Placements(vec![1; self.num_players])
-            }
-            GameOutcome::Placements(p) => GameOutcome::Placements(p.clone()),
-        };
-        self.game_outcomes.push(placements_outcome.clone());
+        self.game_outcomes.push(outcome.clone());
 
         // Update placement counts
-        match placements_outcome {
-            GameOutcome::Placements(places) => {
-                for (i, &place) in places.iter().enumerate() {
-                    if place > 0 && place <= self.num_players {
-                        self.placements[i][place - 1] += 1;
-                    }
-                }
+        for (i, &place) in outcome.0.iter().enumerate() {
+            if place > 0 && place <= self.num_players {
+                self.placements[i][place - 1] += 1;
             }
-            _ => unreachable!("All outcomes converted to Placements above"),
         }
     }
 
@@ -494,20 +440,18 @@ impl EvalStats {
 
         // Process each game outcome with weng_lin_multi_team
         for outcome in &outcomes {
-            if let GameOutcome::Placements(placements) = outcome {
-                let rating_arrs: Vec<[WengLinRating; 1]> = ratings.iter().map(|r| [*r]).collect();
+            let rating_arrs: Vec<[WengLinRating; 1]> = ratings.iter().map(|r| [*r]).collect();
 
-                let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_arrs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, arr)| (arr.as_slice(), MultiTeamOutcome::new(placements[i])))
-                    .collect();
+            let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_arrs
+                .iter()
+                .enumerate()
+                .map(|(i, arr)| (arr.as_slice(), MultiTeamOutcome::new(outcome.0[i])))
+                .collect();
 
-                let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
-                for (i, new_rating) in new_ratings.iter().enumerate() {
-                    if !new_rating.is_empty() {
-                        ratings[i] = new_rating[0];
-                    }
+            let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
+            for (i, new_rating) in new_ratings.iter().enumerate() {
+                if !new_rating.is_empty() {
+                    ratings[i] = new_rating[0];
                 }
             }
         }
@@ -710,15 +654,13 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     let mut draw_count = 0usize;
 
     for outcome in &stats.game_outcomes {
-        if let GameOutcome::Placements(placements) = outcome {
-            let points = calculate_swiss_points(placements);
-            current_total_points += points[0]; // Current model at position 0
-            best_total_points += points[1]; // Best model at position 1
+        let points = calculate_swiss_points(&outcome.0);
+        current_total_points += points[0]; // Current model at position 0
+        best_total_points += points[1]; // Best model at position 1
 
-            // Draw = all tied for 1st
-            if placements.iter().all(|&p| p == 1) {
-                draw_count += 1;
-            }
+        // Draw = all tied for 1st
+        if outcome.0.iter().all(|&p| p == 1) {
+            draw_count += 1;
         }
     }
 
@@ -753,21 +695,19 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
 
     // Process each game using weng_lin_multi_team for N-player compatibility
     for outcome in &outcomes {
-        if let GameOutcome::Placements(placements) = outcome {
-            // Build rating groups: current at position 0, best at position 1
-            let current_arr = [current];
-            let best_arr = [best_rating_obj];
+        // Build rating groups: current at position 0, best at position 1
+        let current_arr = [current];
+        let best_arr = [best_rating_obj];
 
-            let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = vec![
-                (&current_arr[..], MultiTeamOutcome::new(placements[0])),
-                (&best_arr[..], MultiTeamOutcome::new(placements[1])),
-            ];
+        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = vec![
+            (&current_arr[..], MultiTeamOutcome::new(outcome.0[0])),
+            (&best_arr[..], MultiTeamOutcome::new(outcome.0[1])),
+        ];
 
-            let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
-            // Only update current (best is anchored)
-            if !new_ratings[0].is_empty() {
-                current = new_ratings[0][0];
-            }
+        let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
+        // Only update current (best is anchored)
+        if !new_ratings[0].is_empty() {
+            current = new_ratings[0][0];
         }
     }
 
@@ -1236,12 +1176,20 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                 let outcome = determine_outcome(&env, &total_rewards);
                 stats.record(&outcome);
 
-                match &outcome {
-                    GameOutcome::Winner(w) => println!("\nWinner: Player {w}"),
-                    GameOutcome::Tie => println!("\nGame ended in a tie"),
-                    GameOutcome::Placements(p) => {
-                        println!("\nFinal placements: {p:?}");
-                    }
+                // Print outcome based on placements
+                let winners: Vec<_> = outcome
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &place)| place == 1)
+                    .map(|(i, _)| i)
+                    .collect();
+                if winners.len() == outcome.0.len() {
+                    println!("\nGame ended in a tie");
+                } else if winners.len() == 1 {
+                    println!("\nWinner: Player {}", winners[0]);
+                } else {
+                    println!("\nFinal placements: {:?}", outcome.0);
                 }
                 println!("Total rewards: {total_rewards:?}");
                 println!("Game length: {move_num} moves");
@@ -1429,16 +1377,26 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                         println!("{rendered}");
                     }
 
-                    match &outcome {
-                        GameOutcome::Winner(w) => {
-                            println!("\nWinner: Player {} ({})", w + 1, player_names[*w]);
-                        }
-                        GameOutcome::Tie => println!("\nGame ended in a tie"),
-                        GameOutcome::Placements(p) => {
-                            println!("\nFinal placements:");
-                            for (i, &place) in p.iter().enumerate() {
-                                println!("  {}: {} ({})", place, player_names[i], ordinal(place));
-                            }
+                    // Print outcome based on placements
+                    let winners: Vec<_> = outcome
+                        .0
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &place)| place == 1)
+                        .map(|(i, _)| i)
+                        .collect();
+                    if winners.len() == outcome.0.len() {
+                        println!("\nGame ended in a tie");
+                    } else if winners.len() == 1 {
+                        println!(
+                            "\nWinner: Player {} ({})",
+                            winners[0] + 1,
+                            player_names[winners[0]]
+                        );
+                    } else {
+                        println!("\nFinal placements:");
+                        for (i, &place) in outcome.0.iter().enumerate() {
+                            println!("  {}: {} ({})", place, player_names[i], ordinal(place));
                         }
                     }
                     println!("Total rewards: {total_rewards:?}");
@@ -1739,21 +1697,22 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
                 })
                 .collect();
 
-            // Determine outcome from checkpoint rewards
-            let outcome = {
-                let placements = rewards_to_placements(&checkpoint_rewards);
-                let first_count = placements.iter().filter(|&&p| p == 1).count();
-                if first_count == placements.len() {
-                    GameOutcome::Tie
-                } else if first_count == 1 {
-                    let winner = placements
-                        .iter()
-                        .position(|&p| p == 1)
-                        .expect("first_count == 1 guarantees a winner");
-                    GameOutcome::Winner(winner)
-                } else {
-                    GameOutcome::Placements(placements)
-                }
+            // Determine outcome: use game's outcome if available, otherwise infer from rewards
+            let outcome = if let Some(game_outcome) = &ep.outcome {
+                // Remap placements from player positions to checkpoint positions
+                let checkpoint_placements: Vec<usize> = (0..num_checkpoints)
+                    .map(|checkpoint_idx| {
+                        let player_idx = perm
+                            .iter()
+                            .position(|&c| c == checkpoint_idx)
+                            .expect("checkpoint must be in permutation");
+                        game_outcome.0[player_idx]
+                    })
+                    .collect();
+                GameOutcome(checkpoint_placements)
+            } else {
+                // Fall back to rewards-based placements
+                GameOutcome(rewards_to_placements(&checkpoint_rewards))
             };
 
             stats.record_with_rewards(&outcome, &checkpoint_rewards, ep.length);
@@ -2004,7 +1963,7 @@ mod tests {
     #[test]
     fn test_eval_stats_winner() {
         let mut stats = EvalStats::new(2);
-        stats.record(&GameOutcome::Winner(0));
+        stats.record(&GameOutcome(vec![1, 2])); // Player 0 wins
         assert_eq!(stats.wins(0), 1);
         assert_eq!(stats.losses(1), 1);
         assert_eq!(stats.total_games, 1);
@@ -2013,7 +1972,7 @@ mod tests {
     #[test]
     fn test_eval_stats_tie() {
         let mut stats = EvalStats::new(2);
-        stats.record(&GameOutcome::Tie);
+        stats.record(&GameOutcome(vec![1, 1])); // Tie
         assert_eq!(stats.draws(), 1);
         assert_eq!(stats.total_games, 1);
     }
@@ -2026,13 +1985,13 @@ mod tests {
 
         // Record some games: 60 wins for p0, 30 for p1, 10 draws
         for _ in 0..60 {
-            stats.record(&GameOutcome::Winner(0));
+            stats.record(&GameOutcome(vec![1, 2])); // P0 wins
         }
         for _ in 0..30 {
-            stats.record(&GameOutcome::Winner(1));
+            stats.record(&GameOutcome(vec![2, 1])); // P1 wins
         }
         for _ in 0..10 {
-            stats.record(&GameOutcome::Tie);
+            stats.record(&GameOutcome(vec![1, 1])); // Tie
         }
 
         assert_eq!(stats.total_games, 100);
@@ -2060,9 +2019,9 @@ mod tests {
         let mut stats = EvalStats::new(1);
 
         // Record some single-player games with rewards
-        stats.record_with_rewards(&GameOutcome::Winner(0), &[100.0], 50);
-        stats.record_with_rewards(&GameOutcome::Winner(0), &[200.0], 100);
-        stats.record_with_rewards(&GameOutcome::Winner(0), &[150.0], 75);
+        stats.record_with_rewards(&GameOutcome(vec![1]), &[100.0], 50);
+        stats.record_with_rewards(&GameOutcome(vec![1]), &[200.0], 100);
+        stats.record_with_rewards(&GameOutcome(vec![1]), &[150.0], 75);
 
         assert_eq!(stats.total_games, 3);
         assert_eq!(stats.game_rewards.len(), 3);
@@ -2078,8 +2037,8 @@ mod tests {
     fn test_record_with_rewards_multiplayer() {
         let mut stats = EvalStats::new(2);
 
-        stats.record_with_rewards(&GameOutcome::Winner(0), &[1.0, 0.0], 10);
-        stats.record_with_rewards(&GameOutcome::Winner(1), &[0.0, 1.0], 15);
+        stats.record_with_rewards(&GameOutcome(vec![1, 2]), &[1.0, 0.0], 10);
+        stats.record_with_rewards(&GameOutcome(vec![2, 1]), &[0.0, 1.0], 15);
 
         assert_eq!(stats.total_games, 2);
         assert_eq!(stats.wins(0), 1);
@@ -2142,11 +2101,11 @@ mod tests {
     #[test]
     fn test_determine_outcome_uses_explicit_outcome() {
         let env = MockEnvWithOutcome {
-            outcome: Some(GameOutcome::Winner(1)),
+            outcome: Some(GameOutcome(vec![2, 1])), // Player 1 wins
         };
         // Even if rewards say player 0 wins, explicit outcome wins
         let outcome = determine_outcome(&env, &[10.0, 0.0]);
-        assert_eq!(outcome, GameOutcome::Winner(1));
+        assert_eq!(outcome, GameOutcome(vec![2, 1]));
     }
 
     #[test]
@@ -2154,17 +2113,17 @@ mod tests {
         let env = MockEnvNoOutcome;
         // No explicit outcome, should infer from rewards
         let outcome = determine_outcome(&env, &[1.0, 0.0]);
-        assert_eq!(outcome, GameOutcome::Winner(0));
+        assert_eq!(outcome, GameOutcome(vec![1, 2])); // P0 wins
 
         let outcome = determine_outcome(&env, &[0.0, 1.0]);
-        assert_eq!(outcome, GameOutcome::Winner(1));
+        assert_eq!(outcome, GameOutcome(vec![2, 1])); // P1 wins
     }
 
     #[test]
     fn test_determine_outcome_tie_from_rewards() {
         let env = MockEnvNoOutcome;
         let outcome = determine_outcome(&env, &[0.5, 0.5]);
-        assert_eq!(outcome, GameOutcome::Tie);
+        assert_eq!(outcome, GameOutcome(vec![1, 1])); // Tie
     }
 
     #[test]
@@ -2222,9 +2181,9 @@ mod tests {
         let mut stats = EvalStats::new(3);
 
         // Record outcomes using placements
-        stats.record(&GameOutcome::Placements(vec![1, 2, 3])); // P0 wins, P1 second, P2 third
-        stats.record(&GameOutcome::Placements(vec![3, 1, 2])); // P1 wins, P2 second, P0 third
-        stats.record(&GameOutcome::Placements(vec![2, 3, 1])); // P2 wins, P0 second, P1 third
+        stats.record(&GameOutcome(vec![1, 2, 3])); // P0 wins, P1 second, P2 third
+        stats.record(&GameOutcome(vec![3, 1, 2])); // P1 wins, P2 second, P0 third
+        stats.record(&GameOutcome(vec![2, 3, 1])); // P2 wins, P0 second, P1 third
 
         assert_eq!(stats.total_games, 3);
         // Each player won once

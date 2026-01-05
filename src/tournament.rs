@@ -23,7 +23,7 @@ use skillratings::MultiTeamOutcome;
 use crate::checkpoint::{load_metadata, CheckpointMetadata};
 use crate::config::TournamentArgs;
 use crate::dispatch_env;
-use crate::env::{Environment, GameOutcome};
+use crate::env::Environment;
 use crate::eval::{load_model_from_checkpoint, run_stats_mode_env, PlayerSource, TempSchedule};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
@@ -1244,14 +1244,8 @@ fn run_pod<B: Backend, E: Environment>(
     let games: Vec<GamePlacement> = stats
         .game_outcomes
         .iter()
-        .filter_map(|outcome| {
-            if let GameOutcome::Placements(p) = outcome {
-                Some(GamePlacement {
-                    placements: p.clone(),
-                })
-            } else {
-                None
-            }
+        .map(|outcome| GamePlacement {
+            placements: outcome.0.clone(),
         })
         .collect();
 
@@ -1300,17 +1294,10 @@ fn run_pod_with_random<E: Environment>(
             }
         }
 
-        // Convert outcome to placements
-        let placements = match env.game_outcome() {
-            Some(GameOutcome::Winner(w)) => {
-                // Winner gets 1st, others get 2nd through Nth
-                (0..num_players)
-                    .map(|i| if i == w { 1 } else { 2 })
-                    .collect()
-            }
-            Some(GameOutcome::Placements(p)) => p,
-            Some(GameOutcome::Tie) | None => vec![1; num_players], // All tied for 1st
-        };
+        // Get placements from game outcome (or default to all tied for 1st)
+        let placements = env
+            .game_outcome()
+            .map_or_else(|| vec![1; num_players], |outcome| outcome.0);
 
         games.push(GamePlacement { placements });
     }

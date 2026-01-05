@@ -4,16 +4,21 @@ use std::collections::VecDeque;
 
 use crate::profile::{profile_function, profile_scope};
 
-/// Game outcome for evaluation - who won/placed where
+/// Game outcome representing final placements for all players.
+///
+/// Uses standard competition ranking (1224 ranking):
+/// - Placements are 1-indexed (1 = first place)
+/// - Tied players share the same rank
+/// - After a tie, the next rank is skipped (e.g., `[1, 1, 3, 4]` not `[1, 1, 2, 3]`)
+/// - Full tie: all players get 1 (e.g., `[1, 1, 1, 1]`)
+///
+/// Examples:
+/// - Clear winner: `GameOutcome(vec![1, 2, 3, 4])` (player 0 won, player 3 last)
+/// - Two-way tie for 1st: `GameOutcome(vec![1, 1, 3, 4])`
+/// - Three-way tie for 2nd: `GameOutcome(vec![1, 2, 2, 2])`
+/// - Full tie: `GameOutcome(vec![1, 1, 1, 1])`
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GameOutcome {
-    /// Single winner (player index)
-    Winner(usize),
-    /// All players tied
-    Tie,
-    /// N-player rankings (1-indexed: 1=first, 2=second, etc.)
-    Placements(Vec<usize>),
-}
+pub struct GameOutcome(pub Vec<usize>);
 
 /// Minimal environment interface - just what PPO needs
 pub trait Environment: Send + Sync + Sized + 'static {
@@ -124,20 +129,7 @@ pub fn compute_avg_points(outcomes: &VecDeque<GameOutcome>, num_players: usize) 
     let mut draws = 0usize;
 
     for outcome in outcomes {
-        // Convert outcome to placements
-        let placements: Vec<usize> = match outcome {
-            GameOutcome::Winner(w) => {
-                // Winner gets 1st, all others get 2nd
-                (0..num_players)
-                    .map(|i| if i == *w { 1 } else { 2 })
-                    .collect()
-            }
-            GameOutcome::Tie => {
-                // All tied for 1st
-                vec![1; num_players]
-            }
-            GameOutcome::Placements(places) => places.clone(),
-        };
+        let placements = &outcome.0;
 
         // Check if all tied for first (draw)
         if placements.iter().all(|&p| p == 1) {
@@ -455,7 +447,7 @@ mod tests {
     fn test_compute_avg_points_2player_all_wins_p0() {
         let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
         for _ in 0..10 {
-            outcomes.push_back(GameOutcome::Winner(0));
+            outcomes.push_back(GameOutcome(vec![1, 2])); // P0 wins
         }
         let (avg_points, draw_rate) = compute_avg_points(&outcomes, 2);
 
@@ -469,7 +461,7 @@ mod tests {
     fn test_compute_avg_points_2player_all_ties() {
         let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
         for _ in 0..10 {
-            outcomes.push_back(GameOutcome::Tie);
+            outcomes.push_back(GameOutcome(vec![1, 1])); // Tie
         }
         let (avg_points, draw_rate) = compute_avg_points(&outcomes, 2);
 
@@ -484,13 +476,13 @@ mod tests {
         let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
         // 4 wins for P0, 4 wins for P1, 2 draws = 10 games
         for _ in 0..4 {
-            outcomes.push_back(GameOutcome::Winner(0));
+            outcomes.push_back(GameOutcome(vec![1, 2])); // P0 wins
         }
         for _ in 0..4 {
-            outcomes.push_back(GameOutcome::Winner(1));
+            outcomes.push_back(GameOutcome(vec![2, 1])); // P1 wins
         }
         for _ in 0..2 {
-            outcomes.push_back(GameOutcome::Tie);
+            outcomes.push_back(GameOutcome(vec![1, 1])); // Tie
         }
         let (avg_points, draw_rate) = compute_avg_points(&outcomes, 2);
 
@@ -505,7 +497,7 @@ mod tests {
     fn test_compute_avg_points_4player_placements() {
         let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
         // 4-player game: P0 always wins, P1 2nd, P2 3rd, P3 4th
-        outcomes.push_back(GameOutcome::Placements(vec![1, 2, 3, 4]));
+        outcomes.push_back(GameOutcome(vec![1, 2, 3, 4]));
 
         let (avg_points, draw_rate) = compute_avg_points(&outcomes, 4);
 
@@ -525,7 +517,7 @@ mod tests {
     fn test_compute_avg_points_4player_tied_for_2nd() {
         let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
         // P0 wins, P1 and P2 tied for 2nd, P3 4th
-        outcomes.push_back(GameOutcome::Placements(vec![1, 2, 2, 4]));
+        outcomes.push_back(GameOutcome(vec![1, 2, 2, 4]));
 
         let (avg_points, draw_rate) = compute_avg_points(&outcomes, 4);
 
@@ -544,7 +536,7 @@ mod tests {
     fn test_compute_avg_points_4player_all_tied() {
         let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
         // All 4 players tied for 1st
-        outcomes.push_back(GameOutcome::Placements(vec![1, 1, 1, 1]));
+        outcomes.push_back(GameOutcome(vec![1, 1, 1, 1]));
 
         let (avg_points, draw_rate) = compute_avg_points(&outcomes, 4);
 

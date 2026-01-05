@@ -296,9 +296,9 @@ impl Environment for ConnectFour {
             return None;
         }
         match self.winner {
-            Some(Cell::Player1) => Some(GameOutcome::Winner(0)),
-            Some(Cell::Player2) => Some(GameOutcome::Winner(1)),
-            _ => Some(GameOutcome::Tie),
+            Some(Cell::Player1) => Some(GameOutcome(vec![1, 2])),
+            Some(Cell::Player2) => Some(GameOutcome(vec![2, 1])),
+            _ => Some(GameOutcome(vec![1, 1])), // Tie = both 1st
         }
     }
 
@@ -574,7 +574,7 @@ mod tests {
         env.step(3);
 
         assert!(env.game_over);
-        assert_eq!(env.game_outcome(), Some(GameOutcome::Winner(0)));
+        assert_eq!(env.game_outcome(), Some(GameOutcome(vec![1, 2]))); // P0 wins
     }
 
     #[test]
@@ -598,7 +598,7 @@ mod tests {
         env.step(3);
 
         assert!(env.game_over);
-        assert_eq!(env.game_outcome(), Some(GameOutcome::Winner(1)));
+        assert_eq!(env.game_outcome(), Some(GameOutcome(vec![2, 1]))); // P1 wins
     }
 
     #[test]
@@ -630,7 +630,7 @@ mod tests {
         env.step(0);
 
         assert!(env.game_over);
-        assert_eq!(env.game_outcome(), Some(GameOutcome::Tie));
+        assert_eq!(env.game_outcome(), Some(GameOutcome(vec![1, 1]))); // Tie
     }
 
     #[test]
