@@ -50,6 +50,9 @@ pub struct CheckpointMetadata {
     pub num_hidden: usize,
     /// Activation function (for network reconstruction)
     pub activation: String,
+    /// Whether split actor/critic networks were used
+    #[serde(default)]
+    pub split_networks: bool,
     /// Environment name for dispatching at eval time
     pub env_name: String,
     /// Training skill rating (Weng-Lin mu) for challenger evaluation
@@ -393,6 +396,7 @@ mod tests {
             hidden_size: 64,
             num_hidden: 2,
             activation: "tanh".to_string(),
+            split_networks: false,
             env_name: "cartpole".to_string(),
             training_rating: 0.0,
             training_uncertainty: 25.0 / 3.0,
@@ -443,6 +447,7 @@ mod tests {
                     hidden_size: 64,
                     num_hidden: 2,
                     activation: "tanh".to_string(),
+                    split_networks: false,
                     env_name: "cartpole".to_string(),
                     training_rating: 0.0,
                     training_uncertainty: 25.0 / 3.0,
@@ -468,6 +473,7 @@ mod tests {
                     hidden_size: 64,
                     num_hidden: 2,
                     activation: "tanh".to_string(),
+                    split_networks: false,
                     env_name: "cartpole".to_string(),
                     training_rating: 0.0,
                     training_uncertainty: 25.0 / 3.0,
@@ -493,6 +499,7 @@ mod tests {
                     hidden_size: 64,
                     num_hidden: 2,
                     activation: "tanh".to_string(),
+                    split_networks: false,
                     env_name: "cartpole".to_string(),
                     training_rating: 0.0,
                     training_uncertainty: 25.0 / 3.0,
@@ -573,6 +580,7 @@ mod tests {
             hidden_size: 256,
             num_hidden: 3,
             activation: "relu".to_string(),
+            split_networks: true,
             env_name: "connect_four".to_string(),
             training_rating: 150.5,
             training_uncertainty: 5.0,
@@ -584,6 +592,7 @@ mod tests {
         assert_eq!(loaded.hidden_size, 256);
         assert_eq!(loaded.num_hidden, 3);
         assert_eq!(loaded.activation, "relu");
+        assert!(loaded.split_networks);
         assert_eq!(loaded.env_name, "connect_four");
         assert_eq!(loaded.forked_from, Some("parent_run".to_string()));
         assert!((loaded.training_rating - 150.5).abs() < f64::EPSILON);

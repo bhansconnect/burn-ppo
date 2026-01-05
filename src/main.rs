@@ -326,6 +326,7 @@ where
             hidden_size: config.hidden_size,
             num_hidden: config.num_hidden,
             activation: config.activation.clone(),
+            split_networks: config.split_networks,
             env_name: E::NAME.to_string(),
             training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,
@@ -724,6 +725,7 @@ where
                 hidden_size: config.hidden_size,
                 num_hidden: config.num_hidden,
                 activation: config.activation.clone(),
+                split_networks: config.split_networks,
                 env_name: E::NAME.to_string(),
                 training_rating: 25.0, // Updated after challenger eval via update_training_rating
                 training_uncertainty: 25.0 / 3.0,
@@ -935,6 +937,7 @@ where
             hidden_size: config.hidden_size,
             num_hidden: config.num_hidden,
             activation: config.activation.clone(),
+            split_networks: config.split_networks,
             env_name: E::NAME.to_string(),
             training_rating: 25.0, // Updated after challenger eval via update_training_rating
             training_uncertainty: 25.0 / 3.0,

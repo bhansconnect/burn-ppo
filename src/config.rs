@@ -282,6 +282,9 @@ pub struct Config {
     pub num_hidden: usize,
     #[serde(default = "default_activation")]
     pub activation: String,
+    /// Use separate actor and critic networks instead of shared backbone
+    #[serde(default)]
+    pub split_networks: bool,
 
     // Checkpointing
     #[serde(default = "default_run_dir")]
@@ -424,6 +427,7 @@ impl Default for Config {
             hidden_size: default_hidden_size(),
             num_hidden: default_num_hidden(),
             activation: default_activation(),
+            split_networks: false,
             run_dir: default_run_dir(),
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
