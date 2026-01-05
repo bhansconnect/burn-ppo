@@ -26,9 +26,15 @@ pub fn available_backends() -> Vec<&'static str> {
     ]
 }
 
-/// Returns the best available backend for this build (cuda > libtorch > wgpu > ndarray)
+/// Returns the default backend (ndarray for maximum compatibility)
 #[must_use]
 pub fn default_backend() -> &'static str {
+    "ndarray"
+}
+
+/// Returns the best available backend for this build (cuda > libtorch > wgpu > ndarray)
+#[must_use]
+pub fn best_available_backend() -> &'static str {
     #[cfg(feature = "cuda")]
     return "cuda";
     #[cfg(all(feature = "libtorch", not(feature = "cuda")))]
@@ -41,6 +47,18 @@ pub fn default_backend() -> &'static str {
         not(feature = "libtorch")
     ))]
     return "ndarray";
+}
+
+/// Warn if a better backend is available than the one being used
+pub fn warn_if_better_backend_available(current: &str) {
+    let best = best_available_backend();
+    if current == "ndarray" && best != "ndarray" {
+        eprintln!(
+            "Note: Using ndarray backend. For better performance, use --backend {} (available: {})",
+            best,
+            available_backends().join(", ")
+        );
+    }
 }
 
 /// Dispatch to the appropriate backend based on runtime string selection.

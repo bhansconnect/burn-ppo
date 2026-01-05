@@ -1161,6 +1161,7 @@ fn main() -> Result<()> {
                 .backend
                 .as_deref()
                 .unwrap_or_else(|| backend::default_backend());
+            backend::warn_if_better_backend_available(backend_name);
             dispatch_backend!(backend_name, device, {
                 eval::run_evaluation::<TB>(&eval_args, &device)
             })
@@ -1170,6 +1171,7 @@ fn main() -> Result<()> {
                 .backend
                 .as_deref()
                 .unwrap_or_else(|| backend::default_backend());
+            backend::warn_if_better_backend_available(backend_name);
             dispatch_backend!(backend_name, device, {
                 tournament::run_tournament::<TB>(&tournament_args, &device)
             })
@@ -1312,6 +1314,7 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
         backend::get_backend_display_name(backend_name),
         backend_name
     );
+    backend::warn_if_better_backend_available(backend_name);
 
     // Print rating guide for understanding Openskill ratings
     print_rating_guide();
