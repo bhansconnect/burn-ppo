@@ -299,6 +299,19 @@ fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
     selected
 }
 
+/// Get the checkpoint with highest `training_rating` from a run directory
+fn get_best_rated_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
+    let checkpoints = enumerate_checkpoints(checkpoints_dir).ok()?;
+
+    checkpoints.into_iter().max_by(|a, b| {
+        let rating_a = load_metadata(a).map(|m| m.training_rating).unwrap_or(0.0);
+        let rating_b = load_metadata(b).map(|m| m.training_rating).unwrap_or(0.0);
+        rating_a
+            .partial_cmp(&rating_b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
 /// Compute unique display names for a set of paths
 ///
 /// Starts with just the file name. If duplicates exist, adds parent directory
@@ -397,20 +410,49 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
         is_run_checkpoints_dir(&resolved)
     };
 
+    // Resolve all source paths and identify run directories
+    let resolved_sources: Vec<PathBuf> = args
+        .sources
+        .iter()
+        .map(|source_path| {
+            if source_path.is_symlink() {
+                source_path.read_link().map_or_else(
+                    |_| source_path.clone(),
+                    |target| source_path.parent().unwrap_or(source_path).join(target),
+                )
+            } else {
+                source_path.clone()
+            }
+        })
+        .collect();
+
+    // Count run directories for limit splitting
+    let num_run_dirs = resolved_sources
+        .iter()
+        .filter(|p| is_run_checkpoints_dir(p))
+        .count();
+
+    // Calculate per-folder limits if limit is set and there are multiple run dirs
+    let per_folder_limits: Vec<usize> = if let Some(total_limit) = args.limit {
+        if num_run_dirs > 0 {
+            let base = total_limit / num_run_dirs;
+            let remainder = total_limit % num_run_dirs;
+            // Distribute remainder to earlier folders
+            (0..num_run_dirs)
+                .map(|i| base + usize::from(i < remainder))
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let mut run_dir_idx = 0;
+
     // First pass: collect all checkpoint paths with their initial seeds
     let mut checkpoint_data: Vec<(PathBuf, f64)> = Vec::new();
 
-    for source_path in &args.sources {
-        // Resolve symlinks
-        let path = if source_path.is_symlink() {
-            source_path.read_link().map_or_else(
-                |_| source_path.clone(),
-                |target| source_path.parent().unwrap_or(source_path).join(target),
-            )
-        } else {
-            source_path.clone()
-        };
-
+    for path in resolved_sources {
         if is_checkpoint_dir(&path) {
             // Single checkpoint - load training_rating from metadata
             let initial_seed = if single_training_run {
@@ -428,10 +470,25 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
                 bail!("No checkpoints found in {}", path.display());
             }
 
-            let selected = if let Some(limit) = args.limit {
-                select_evenly_spaced(&checkpoints, limit)
-            } else {
-                checkpoints
+            // Get per-folder limit (if any)
+            let folder_limit = per_folder_limits.get(run_dir_idx).copied();
+            run_dir_idx += 1;
+
+            let selected = match folder_limit {
+                Some(1) => {
+                    // Special case: limit 1 means pick best-rated checkpoint
+                    get_best_rated_checkpoint(&path).map_or_else(
+                        || {
+                            vec![checkpoints
+                                .last()
+                                .expect("checkpoints verified non-empty above")
+                                .clone()]
+                        },
+                        |p| vec![p],
+                    )
+                }
+                Some(limit) => select_evenly_spaced(&checkpoints, limit),
+                None => checkpoints,
             };
 
             for ckpt in selected {
@@ -448,7 +505,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
         } else {
             bail!(
                 "Invalid source: {} (expected checkpoint dir or checkpoints folder)",
-                source_path.display()
+                path.display()
             );
         }
     }
@@ -2368,6 +2425,157 @@ mod tests {
         // Empty dir isn't a valid checkpoint or checkpoints dir
         let result = discover_contestants(&args);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_best_rated_checkpoint() {
+        let temp = TempDir::new().unwrap();
+
+        // Create checkpoints with metadata files containing different training_ratings
+        for (step, rating) in [(100, 10.0), (200, 30.0), (300, 20.0)] {
+            let ckpt_dir = temp.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            let metadata = format!(
+                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":{rating},"training_uncertainty":8.333}}"#
+            );
+            std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
+        }
+
+        let best = get_best_rated_checkpoint(temp.path()).unwrap();
+        // Should pick step_200 which has the highest rating (30.0)
+        assert!(best.ends_with("step_200"));
+    }
+
+    #[test]
+    fn test_get_best_rated_checkpoint_no_metadata() {
+        let temp = TempDir::new().unwrap();
+
+        // Create checkpoints without metadata files
+        std::fs::create_dir(temp.path().join("step_100")).unwrap();
+        std::fs::create_dir(temp.path().join("step_200")).unwrap();
+
+        // Should fall back to the last checkpoint (step_200)
+        let best = get_best_rated_checkpoint(temp.path()).unwrap();
+        assert!(best.ends_with("step_200"));
+    }
+
+    #[test]
+    fn test_discover_contestants_limit_split_between_folders() {
+        use crate::config::TournamentArgs;
+
+        let temp1 = TempDir::new().unwrap();
+        let temp2 = TempDir::new().unwrap();
+
+        // Create 5 checkpoints in each folder
+        for i in 0..5 {
+            std::fs::create_dir(temp1.path().join(format!("step_{}", i * 100))).unwrap();
+            std::fs::create_dir(temp2.path().join(format!("step_{}", i * 100))).unwrap();
+        }
+
+        let args = TournamentArgs {
+            sources: vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()],
+            backend: None,
+            num_games: 1,
+            num_envs: 1,
+            temp: Some(1.0),
+            temp_final: None,
+            temp_cutoff: None,
+            limit: Some(4), // 4 total = 2 per folder
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let contestants = discover_contestants(&args).unwrap();
+
+        // Should get 4 total (2 from each folder)
+        assert_eq!(contestants.len(), 4);
+    }
+
+    #[test]
+    fn test_discover_contestants_limit_1_per_folder_picks_best() {
+        use crate::config::TournamentArgs;
+
+        let temp1 = TempDir::new().unwrap();
+        let temp2 = TempDir::new().unwrap();
+
+        // Create checkpoints with metadata - different best in each folder
+        for (step, rating) in [(100, 10.0), (200, 30.0), (300, 20.0)] {
+            let ckpt_dir = temp1.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            let metadata = format!(
+                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":{rating},"training_uncertainty":8.333}}"#
+            );
+            std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
+        }
+
+        for (step, rating) in [(100, 5.0), (200, 15.0), (300, 25.0)] {
+            let ckpt_dir = temp2.path().join(format!("step_{step}"));
+            std::fs::create_dir(&ckpt_dir).unwrap();
+            let metadata = format!(
+                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":{rating},"training_uncertainty":8.333}}"#
+            );
+            std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
+        }
+
+        // Verify get_best_rated_checkpoint works for each folder independently
+        let best1 = get_best_rated_checkpoint(temp1.path()).unwrap();
+        let best2 = get_best_rated_checkpoint(temp2.path()).unwrap();
+        assert!(
+            best1.ends_with("step_200"),
+            "Expected best1 to be step_200, got: {}",
+            best1.display()
+        );
+        assert!(
+            best2.ends_with("step_300"),
+            "Expected best2 to be step_300, got: {}",
+            best2.display()
+        );
+
+        let args = TournamentArgs {
+            sources: vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()],
+            backend: None,
+            num_games: 1,
+            num_envs: 1,
+            temp: Some(1.0),
+            temp_final: None,
+            temp_cutoff: None,
+            limit: Some(2), // 2 total = 1 per folder, should pick best-rated
+            rounds: None,
+            output: None,
+            seed: None,
+            random: false,
+        };
+
+        let contestants = discover_contestants(&args).unwrap();
+
+        // Should get 2 total (1 best from each folder)
+        assert_eq!(contestants.len(), 2);
+
+        // First should be step_200 from temp1 (rating 30.0)
+        // Second should be step_300 from temp2 (rating 25.0)
+        let paths: Vec<_> = contestants
+            .iter()
+            .filter_map(|c| match &c.source {
+                PlayerSource::Checkpoint(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Contestants are shuffled when not single_training_run, so check unordered
+        let path_strs: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            path_strs.iter().any(|p| p.contains("step_200")),
+            "Expected one path to contain step_200, got: {path_strs:?}"
+        );
+        assert!(
+            path_strs.iter().any(|p| p.contains("step_300")),
+            "Expected one path to contain step_300, got: {path_strs:?}"
+        );
     }
 
     #[test]
