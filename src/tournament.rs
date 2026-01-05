@@ -1011,7 +1011,53 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
     );
     println!();
 
+    // Determine number of players from first contestant's placement_counts
+    let num_players = contestants.first().map_or(2, |c| c.placement_counts.len());
+
+    // Build header dynamically based on num_players
+    let placement_headers: Vec<String> = (1..=num_players).map(ordinal).collect();
+    let placement_header_str: String =
+        placement_headers.iter().fold(String::new(), |mut acc, h| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{h:>4}");
+            acc
+        });
+
+    // First, print results sorted by name (reverse order: newest networks first)
+    let mut by_name: Vec<&Contestant> = contestants.iter().collect();
+    by_name.sort_by(|a, b| b.name.cmp(&a.name));
+
+    println!("=== Results by Name (newest first) ===");
+    println!(
+        "     {:20}  {:>8}  {:>7}  {:>16}  {}",
+        "Name", "Points", "Rating", "95% CI", placement_header_str
+    );
+    let width = 60 + placement_headers.len() * 4;
+    println!("{:-<width$}", "");
+
+    for c in &by_name {
+        let sigma = c.rating.uncertainty;
+        let low = c.rating.rating - 2.0 * sigma;
+        let high = c.rating.rating + 2.0 * sigma;
+
+        let placement_str: String =
+            c.placement_counts
+                .iter()
+                .fold(String::new(), |mut acc, &count| {
+                    use std::fmt::Write;
+                    let _ = write!(acc, "{count:>4}");
+                    acc
+                });
+
+        println!(
+            "     {:20}  {:>8.1}  {:>7.1}  [{:>5.1}, {:>5.1}]  {}",
+            c.name, c.swiss_points, c.rating.rating, low, high, placement_str
+        );
+    }
+    println!();
+
     // Sort by Swiss points (descending), rating as tiebreaker
+    println!("=== Results by Swiss Points ===");
     let mut ranked: Vec<(usize, &Contestant)> = contestants.iter().enumerate().collect();
     ranked.sort_by(|a, b| {
         b.1.swiss_points
@@ -1024,18 +1070,6 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
-
-    // Determine number of players from first contestant's placement_counts
-    let num_players = contestants.first().map_or(2, |c| c.placement_counts.len());
-
-    // Build header dynamically based on num_players
-    let placement_headers: Vec<String> = (1..=num_players).map(ordinal).collect();
-    let placement_header_str: String =
-        placement_headers.iter().fold(String::new(), |mut acc, h| {
-            use std::fmt::Write;
-            let _ = write!(acc, "{h:>4}");
-            acc
-        });
 
     println!(
         " {:>2}  {:20}  {:>8}  {:>7}  {:>16}  {}",
