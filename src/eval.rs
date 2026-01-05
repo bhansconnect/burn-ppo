@@ -21,8 +21,14 @@ use burn::tensor::Tensor;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use skillratings::weng_lin::{weng_lin, weng_lin_multi_team, WengLinConfig, WengLinRating};
-use skillratings::{MultiTeamOutcome, Outcomes};
+use skillratings::weng_lin::{weng_lin_multi_team, WengLinConfig, WengLinRating};
+use skillratings::MultiTeamOutcome;
+
+// weng_lin and Outcomes are only used in tests
+#[cfg(test)]
+use skillratings::weng_lin::weng_lin;
+#[cfg(test)]
+use skillratings::Outcomes;
 
 use crate::checkpoint::{load_normalizer, CheckpointManager, CheckpointMetadata};
 use crate::config::{Config, EvalArgs};
@@ -252,12 +258,6 @@ pub fn determine_outcome<E: Environment>(env: &E, total_rewards: &[f32]) -> Game
 /// Statistics tracker for evaluation results
 pub struct EvalStats {
     num_players: usize,
-    /// Wins per checkpoint [`num_checkpoints`]
-    pub wins: Vec<usize>,
-    /// Losses per checkpoint [`num_checkpoints`]
-    pub losses: Vec<usize>,
-    /// Draws count (all tied)
-    pub draws: usize,
     /// Placement counts per checkpoint [`num_checkpoints`][num_placements]
     pub placements: Vec<Vec<usize>>,
     /// Total games played
@@ -274,15 +274,58 @@ impl EvalStats {
     pub fn new(num_players: usize) -> Self {
         Self {
             num_players,
-            wins: vec![0; num_players],
-            losses: vec![0; num_players],
-            draws: 0,
             placements: vec![vec![0; num_players]; num_players],
             total_games: 0,
             game_rewards: Vec::new(),
             episode_lengths: Vec::new(),
             game_outcomes: Vec::new(),
         }
+    }
+
+    /// Get wins for a player (1st place finishes, excluding draws) - for test assertions
+    #[cfg(test)]
+    pub fn wins(&self, player: usize) -> usize {
+        // Count games where this player got 1st alone
+        self.game_outcomes
+            .iter()
+            .filter(|outcome| {
+                if let GameOutcome::Placements(places) = outcome {
+                    places[player] == 1 && places.iter().filter(|&&p| p == 1).count() == 1
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
+    /// Get losses for a player (last place finishes) - for test assertions
+    #[cfg(test)]
+    pub fn losses(&self, player: usize) -> usize {
+        self.game_outcomes
+            .iter()
+            .filter(|outcome| {
+                if let GameOutcome::Placements(places) = outcome {
+                    places[player] == self.num_players
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
+    /// Get total draws (all players tied for 1st) - for test assertions
+    #[cfg(test)]
+    pub fn draws(&self) -> usize {
+        self.game_outcomes
+            .iter()
+            .filter(|outcome| {
+                if let GameOutcome::Placements(places) = outcome {
+                    places.iter().all(|&p| p == 1)
+                } else {
+                    false
+                }
+            })
+            .count()
     }
 
     /// Record a game outcome with optional rewards and length
@@ -293,7 +336,7 @@ impl EvalStats {
         self.record(outcome);
     }
 
-    /// Record a game outcome (backward-compatible)
+    /// Record a game outcome
     pub fn record(&mut self, outcome: &GameOutcome) {
         self.total_games += 1;
 
@@ -311,49 +354,18 @@ impl EvalStats {
             }
             GameOutcome::Placements(p) => GameOutcome::Placements(p.clone()),
         };
-        self.game_outcomes.push(placements_outcome);
+        self.game_outcomes.push(placements_outcome.clone());
 
-        match outcome {
-            GameOutcome::Winner(winner) => {
-                self.wins[*winner] += 1;
-                for i in 0..self.num_players {
-                    if i != *winner {
-                        self.losses[i] += 1;
-                    }
-                }
-                // Record placements: winner gets 1st, others share 2nd
-                self.placements[*winner][0] += 1;
-                for i in 0..self.num_players {
-                    if i != *winner {
-                        self.placements[i][1] += 1;
-                    }
-                }
-            }
-            GameOutcome::Tie => {
-                self.draws += 1;
-                // All players get 1st place in a tie
-                for i in 0..self.num_players {
-                    self.placements[i][0] += 1;
-                }
-            }
+        // Update placement counts
+        match placements_outcome {
             GameOutcome::Placements(places) => {
                 for (i, &place) in places.iter().enumerate() {
                     if place > 0 && place <= self.num_players {
                         self.placements[i][place - 1] += 1;
                     }
-                    // Win if got 1st place alone
-                    let first_count = places.iter().filter(|&&p| p == 1).count();
-                    if place == 1 && first_count == 1 {
-                        self.wins[i] += 1;
-                    } else if place == self.num_players {
-                        self.losses[i] += 1;
-                    }
-                }
-                // Check for tie (all got 1st)
-                if places.iter().all(|&p| p == 1) {
-                    self.draws += 1;
                 }
             }
+            _ => unreachable!("All outcomes converted to Placements above"),
         }
     }
 
@@ -432,29 +444,48 @@ impl EvalStats {
         }
     }
 
-    fn print_two_player_summary(&self, checkpoint_names: &[String]) {
+    /// Unified N-player summary with Swiss points and Weng-Lin ratings
+    /// Works for 2-player, 4-player, or any N-player games
+    fn print_n_player_summary(&self, checkpoint_names: &[String]) {
+        let num_checkpoints = checkpoint_names.len();
+
+        // Show placement distribution and Swiss points per checkpoint
         for (i, name) in checkpoint_names.iter().enumerate() {
-            let win_pct = 100.0 * self.wins[i] as f64 / self.total_games as f64;
-            let loss_pct = 100.0 * self.losses[i] as f64 / self.total_games as f64;
-            let draw_pct = 100.0 * self.draws as f64 / self.total_games as f64;
+            let placement_pcts: Vec<String> = self.placements[i]
+                .iter()
+                .enumerate()
+                .map(|(p, &count)| {
+                    let pct = 100.0 * count as f64 / self.total_games as f64;
+                    format!("{:.0}% {}", pct, ordinal(p + 1))
+                })
+                .collect();
+
+            // Compute Swiss points: num_players - avg_placement (higher = better)
+            let avg_placement: f64 = self.placements[i]
+                .iter()
+                .enumerate()
+                .map(|(p, &count)| (p + 1) as f64 * count as f64)
+                .sum::<f64>()
+                / self.total_games as f64;
+            let swiss_points = self.num_players as f64 - avg_placement;
+
             println!(
-                "Checkpoint {} ({}): {} wins ({:.1}%), {} losses ({:.1}%), {} draws ({:.1}%)",
-                i, name, self.wins[i], win_pct, self.losses[i], loss_pct, self.draws, draw_pct
+                "Checkpoint {}: {} ({:.2} pts)",
+                i,
+                placement_pcts.join(", "),
+                swiss_points
             );
+            println!("  {name}");
         }
 
-        // Compute Weng-Lin ratings using per-game outcomes
+        // Compute Weng-Lin ratings using per-game outcomes (N-player compatible)
         let wl_config = WengLinConfig::new();
-        let mut ratings = [
-            WengLinRating {
+        let mut ratings: Vec<WengLinRating> = (0..num_checkpoints)
+            .map(|_| WengLinRating {
                 rating: 25.0,
                 uncertainty: 25.0 / 3.0,
-            },
-            WengLinRating {
-                rating: 25.0,
-                uncertainty: 25.0 / 3.0,
-            },
-        ];
+            })
+            .collect();
 
         // Shuffle games to avoid completion-order bias
         let mut outcomes = self.game_outcomes.clone();
@@ -482,45 +513,39 @@ impl EvalStats {
             }
         }
 
-        let stronger = if ratings[0].rating > ratings[1].rating {
-            format!("{} stronger", checkpoint_names[0])
-        } else {
-            format!("{} stronger", checkpoint_names[1])
-        };
+        // Find strongest checkpoint
+        let (strongest_idx, _) = ratings
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                a.1.rating
+                    .partial_cmp(&b.1.rating)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap_or((0, &ratings[0]));
 
         print_rating_guide();
-        println!(
-            "Rating: P0={:.1}±{:.1}, P1={:.1}±{:.1} ({stronger})",
-            ratings[0].rating, ratings[0].uncertainty, ratings[1].rating, ratings[1].uncertainty
-        );
+        println!("\nRatings:");
+        for (i, (name, rating)) in checkpoint_names.iter().zip(ratings.iter()).enumerate() {
+            let marker = if i == strongest_idx {
+                " <- strongest"
+            } else {
+                ""
+            };
+            println!(
+                "  P{}: {:.1}±{:.1} {}{marker}",
+                i, rating.rating, rating.uncertainty, name
+            );
+        }
+    }
+
+    // Keep old names as aliases for backward compatibility in tests
+    fn print_two_player_summary(&self, checkpoint_names: &[String]) {
+        self.print_n_player_summary(checkpoint_names);
     }
 
     fn print_multi_player_summary(&self, checkpoint_names: &[String]) {
-        for (i, name) in checkpoint_names.iter().enumerate() {
-            let placement_pcts: Vec<String> = self.placements[i]
-                .iter()
-                .enumerate()
-                .map(|(p, &count)| {
-                    let pct = 100.0 * count as f64 / self.total_games as f64;
-                    format!("{:.0}% {}", pct, ordinal(p + 1))
-                })
-                .collect();
-
-            let avg_placement: f64 = self.placements[i]
-                .iter()
-                .enumerate()
-                .map(|(p, &count)| (p + 1) as f64 * count as f64)
-                .sum::<f64>()
-                / self.total_games as f64;
-
-            println!(
-                "Checkpoint {}: {} (avg placement: {:.2})",
-                i,
-                placement_pcts.join(", "),
-                avg_placement
-            );
-            println!("  {name}");
-        }
+        self.print_n_player_summary(checkpoint_names);
     }
 
     fn print_reward_summary(&self) {
@@ -548,14 +573,13 @@ impl EvalStats {
 /// Result of challenger evaluation between current model and best checkpoint
 #[derive(Debug, Clone)]
 pub struct ChallengerResult {
-    /// Win rate for current (challenger) model (0.0 - 1.0)
-    pub current_win_rate: f64,
-    /// Win rate for best checkpoint model (0.0 - 1.0)
-    pub best_win_rate: f64,
-    /// Draw rate (0.0 - 1.0)
+    /// Average Swiss points for current (challenger) model
+    /// Swiss points = `num_players` - `avg_position` (higher = better)
+    pub current_avg_points: f64,
+    /// Average Swiss points for best checkpoint model
+    pub best_avg_points: f64,
+    /// Draw rate (0.0 - 1.0) - all players tied for 1st
     pub draw_rate: f64,
-    /// Win rate for current model (0.0 - 1.0), accounting for draws
-    pub win_rate: f64,
     /// Current model's skill rating (Weng-Lin mu) after evaluation
     pub current_rating: f64,
     /// Current model's skill uncertainty (Weng-Lin sigma) after evaluation
@@ -628,7 +652,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     best_rating: f64,
     best_uncertainty: f64,
     num_games: usize,
-    threshold: f64,
+    _threshold: f64, // No longer used - promotion based on current > best points
     config: &Config,
     device: &B::Device,
     seed: u64,
@@ -649,7 +673,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     // Setup models and checkpoint mapping
     // models = [new, best], checkpoint_to_model = [0, 1, 1, 1, ...]
     // This means: checkpoint 0 = new model, checkpoints 1..N-1 = best model
-    let models = vec![current_model.clone(), best_model];
+    let models = vec![Some(current_model.clone()), Some(best_model)];
     let normalizers = vec![current_normalizer.cloned(), best_normalizer];
     let checkpoint_to_model: Vec<usize> = (0..num_players).map(|i| usize::from(i != 0)).collect();
     let names: Vec<String> = (0..num_players)
@@ -680,32 +704,36 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         true, // silent
     );
 
-    // Extract stats for checkpoint 0 (the "new" model)
-    let current_wins = stats.wins[0];
-    let best_wins = stats.losses[0];
-    let draws = stats.draws;
+    // Compute average Swiss points per player from game outcomes
+    let total_games = stats.game_outcomes.len();
+    let mut current_total_points = 0.0;
+    let mut best_total_points = 0.0;
+    let mut draw_count = 0usize;
 
-    // Compute rates from counts
-    let total = (current_wins + best_wins + draws) as f64;
-    let (current_win_rate, best_win_rate, draw_rate) = if total > 0.0 {
+    for outcome in &stats.game_outcomes {
+        if let GameOutcome::Placements(placements) = outcome {
+            let points = calculate_swiss_points(placements);
+            current_total_points += points[0]; // Current model at position 0
+            best_total_points += points[1]; // Best model at position 1
+
+            // Draw = all tied for 1st
+            if placements.iter().all(|&p| p == 1) {
+                draw_count += 1;
+            }
+        }
+    }
+
+    let (current_avg_points, best_avg_points, draw_rate) = if total_games > 0 {
         (
-            current_wins as f64 / total,
-            best_wins as f64 / total,
-            draws as f64 / total,
+            current_total_points / total_games as f64,
+            best_total_points / total_games as f64,
+            draw_count as f64 / total_games as f64,
         )
     } else {
         (0.0, 0.0, 0.0)
     };
 
-    // Tie value = 1/N for N-player games
-    let tie_value = 1.0 / num_players as f64;
-    let win_rate = if total > 0.0 {
-        (current_wins as f64 + tie_value * draws as f64) / total
-    } else {
-        tie_value // Expected value if no games played
-    };
-
-    // Compute Weng-Lin ratings (challenger inherits best's rating as starting point)
+    // Compute Weng-Lin ratings using weng_lin_multi_team (N-player compatible)
     let wl_config = WengLinConfig::new();
 
     // For challenger eval, current starts with best's rating, best is anchored
@@ -713,7 +741,7 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         rating: best_rating,
         uncertainty: best_uncertainty,
     };
-    let best = WengLinRating {
+    let best_rating_obj = WengLinRating {
         rating: best_rating,
         uncertainty: best_uncertainty,
     };
@@ -724,40 +752,42 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
     let mut shuffle_rng = StdRng::seed_from_u64(seed);
     outcomes.shuffle(&mut shuffle_rng);
 
-    // Process each game - best is anchor (doesn't update)
-    // Use weng_lin for efficiency since best is anchored
+    // Process each game using weng_lin_multi_team for N-player compatibility
     for outcome in &outcomes {
         if let GameOutcome::Placements(placements) = outcome {
-            // N-player compatible: use Swiss points for comparison
-            // Current model is at position 0, best model is at position 1
-            let points = calculate_swiss_points(placements);
-            let current_pts = points[0];
-            let best_pts = points[1];
+            // Build rating groups: current at position 0, best at position 1
+            let current_arr = [current];
+            let best_arr = [best_rating_obj];
 
-            let game_outcome = if current_pts > best_pts {
-                Outcomes::WIN // current got more points (better placement)
-            } else if current_pts < best_pts {
-                Outcomes::LOSS // current got fewer points
-            } else {
-                Outcomes::DRAW
-            };
-            let (new_current, _) = weng_lin(&current, &best, &game_outcome, &wl_config);
-            current = new_current;
+            let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = vec![
+                (&current_arr[..], MultiTeamOutcome::new(placements[0])),
+                (&best_arr[..], MultiTeamOutcome::new(placements[1])),
+            ];
+
+            let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
+            // Only update current (best is anchored)
+            if !new_ratings[0].is_empty() {
+                current = new_ratings[0][0];
+            }
         }
     }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
+    // Promotion based on average points comparison
+    // For 2-player: threshold ~0.5 means equal performance
+    // For N-player: threshold should scale with num_players
+    let should_promote = current_avg_points > best_avg_points;
+
     Ok(ChallengerResult {
-        current_win_rate,
-        best_win_rate,
+        current_avg_points,
+        best_avg_points,
         draw_rate,
-        win_rate,
         current_rating: current.rating,
         current_uncertainty: 25.0 / 3.0, // Reset sigma for new checkpoint
-        best_rating: best.rating,
-        best_uncertainty: best.uncertainty,
-        should_promote: win_rate > threshold,
+        best_rating: best_rating_obj.rating,
+        best_uncertainty: best_rating_obj.uncertainty,
+        should_promote,
         elapsed_ms,
     })
 }
@@ -769,7 +799,6 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
     // Check if we have human or random players
     let has_human = !args.humans.is_empty();
     let has_random = args.random;
-    let has_mixed_players = has_human || has_random;
 
     // Build player sources list
     let mut player_sources: Vec<PlayerSource> = Vec::new();
@@ -789,61 +818,78 @@ pub fn run_evaluation<B: Backend>(args: &EvalArgs, device: &B::Device) -> Result
         player_sources.push(PlayerSource::Random);
     }
 
-    // If we have human/random players, use interactive mode
-    if has_mixed_players {
+    // Route to interactive evaluation only for human players
+    // Random players can use stats mode (parallel)
+    if has_human {
         return run_interactive_evaluation::<B>(args, &player_sources, device);
     }
 
-    // Original checkpoint-only flow below
-    let mut models: Vec<ActorCritic<B>> = Vec::new();
+    // Stats mode flow - supports checkpoints and random players
+    let mut models: Vec<Option<ActorCritic<B>>> = Vec::new();
     let mut normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
     let mut path_to_model_idx: HashMap<std::path::PathBuf, usize> = HashMap::new();
     let mut checkpoint_to_model: Vec<usize> = Vec::new();
     let mut checkpoint_names = Vec::new();
     let mut metadata_opt: Option<CheckpointMetadata> = None;
 
-    for path in &args.checkpoints {
-        // Resolve symlinks (latest, best)
-        let resolved = if path.is_symlink() {
-            path.read_link().map_or_else(
-                |_| path.clone(),
-                |target| path.parent().unwrap_or(path).join(target),
-            )
-        } else {
-            path.clone()
-        };
+    for source in &player_sources {
+        match source {
+            PlayerSource::Checkpoint(path) => {
+                // Resolve symlinks (latest, best)
+                let resolved = if path.is_symlink() {
+                    path.read_link().map_or_else(
+                        |_| path.clone(),
+                        |target| path.parent().unwrap_or(path).join(target),
+                    )
+                } else {
+                    path.clone()
+                };
 
-        // Check if this path was already loaded (deduplication)
-        let model_idx = if let Some(&idx) = path_to_model_idx.get(&resolved) {
-            idx
-        } else {
-            let (model, metadata, normalizer) = load_model_from_checkpoint::<B>(&resolved, device)?;
+                // Check if this path was already loaded (deduplication)
+                let model_idx = if let Some(&idx) = path_to_model_idx.get(&resolved) {
+                    idx
+                } else {
+                    let (model, metadata, normalizer) =
+                        load_model_from_checkpoint::<B>(&resolved, device)?;
 
-            // Store first metadata for environment info
-            if let Some(first) = &metadata_opt {
-                // Verify all checkpoints are for the same environment
-                if metadata.obs_dim != first.obs_dim
-                    || metadata.action_count != first.action_count
-                    || metadata.num_players != first.num_players
-                {
-                    anyhow::bail!(
-                        "Checkpoint {} has different dimensions than first checkpoint",
-                        path.display()
-                    );
-                }
-            } else {
-                metadata_opt = Some(metadata.clone());
+                    // Store first metadata for environment info
+                    if let Some(first) = &metadata_opt {
+                        // Verify all checkpoints are for the same environment
+                        if metadata.obs_dim != first.obs_dim
+                            || metadata.action_count != first.action_count
+                            || metadata.num_players != first.num_players
+                        {
+                            anyhow::bail!(
+                                "Checkpoint {} has different dimensions than first checkpoint",
+                                path.display()
+                            );
+                        }
+                    } else {
+                        metadata_opt = Some(metadata.clone());
+                    }
+
+                    let idx = models.len();
+                    models.push(Some(model));
+                    normalizers.push(normalizer);
+                    path_to_model_idx.insert(resolved, idx);
+                    idx
+                };
+
+                checkpoint_to_model.push(model_idx);
+                checkpoint_names.push(path.display().to_string());
             }
-
-            let idx = models.len();
-            models.push(model);
-            normalizers.push(normalizer);
-            path_to_model_idx.insert(resolved, idx);
-            idx
-        };
-
-        checkpoint_to_model.push(model_idx);
-        checkpoint_names.push(path.display().to_string());
+            PlayerSource::Random => {
+                // Random player gets its own slot with None model
+                let idx = models.len();
+                models.push(None);
+                normalizers.push(None);
+                checkpoint_to_model.push(idx);
+                checkpoint_names.push("[Random]".to_string());
+            }
+            PlayerSource::Human { .. } => {
+                unreachable!("Human players should have been routed to interactive mode")
+            }
+        }
     }
 
     let metadata = metadata_opt.context("No checkpoints provided")?;
@@ -966,8 +1012,12 @@ fn run_interactive_evaluation<B: Backend>(
     let seed = args.seed.unwrap_or(42);
     let mut rng = StdRng::seed_from_u64(seed);
 
-    let num_games = if args.num_games == 100 {
-        1
+    // Default to 1 game for interactive human play or watch mode
+    // Random-only games (without watch) should use default 100 games
+    let has_human = player_sources.iter().any(PlayerSource::is_human);
+    let watch = args.watch || args.step;
+    let num_games = if (has_human || watch) && args.num_games == 100 {
+        1 // Default to single game for interactive human play
     } else {
         args.num_games
     };
@@ -989,6 +1039,7 @@ fn run_interactive_evaluation<B: Backend>(
             );
         }
 
+        let watch = args.watch || args.step;
         run_interactive_game::<B, E>(
             player_sources,
             &models,
@@ -997,14 +1048,17 @@ fn run_interactive_evaluation<B: Backend>(
             &temp_schedule,
             &mut rng,
             device,
+            watch,
         );
         Ok(())
     })
 }
 
 /// Run evaluation in watch mode (sequential, with rendering)
+///
+/// Models can be `None` for random players.
 fn run_watch_mode<B: Backend>(
-    models: &[ActorCritic<B>],
+    models: &[Option<ActorCritic<B>>],
     normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
@@ -1039,8 +1093,10 @@ fn run_watch_mode<B: Backend>(
 }
 
 /// Watch mode implementation for a specific environment type
+///
+/// Models can be `None` for random players.
 fn run_watch_mode_env<B: Backend, E: Environment>(
-    models: &[ActorCritic<B>],
+    models: &[Option<ActorCritic<B>>],
     normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
@@ -1075,23 +1131,30 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
             let current_player = env.current_player();
             // In watch mode, checkpoint_idx == player_idx (no position swapping)
             let model_idx = checkpoint_to_model[current_player];
-            let model = &models[model_idx];
+            let model_opt = &models[model_idx];
             let normalizer = &normalizers[model_idx];
             let mask = env.action_mask();
 
-            // Get action from model (normalize if checkpoint was trained with normalize_obs)
-            let obs_for_model = if let Some(norm) = normalizer {
-                norm.normalize(&obs)
+            // Get logits - either from model or uniform for random players
+            let logits_vec: Vec<f32> = if let Some(model) = model_opt {
+                // Get action from model (normalize if checkpoint was trained with normalize_obs)
+                let obs_for_model = if let Some(norm) = normalizer {
+                    norm.normalize(&obs)
+                } else {
+                    obs.clone()
+                };
+                let obs_tensor: Tensor<B, 2> =
+                    Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
+                        .reshape([1, E::OBSERVATION_DIM]);
+                let (logits, _) = model.forward(obs_tensor);
+                logits
+                    .to_data()
+                    .to_vec()
+                    .expect("tensor data to vec conversion")
             } else {
-                obs.clone()
+                // Random player: uniform logits
+                vec![0.0f32; E::ACTION_COUNT]
             };
-            let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
-                .reshape([1, E::OBSERVATION_DIM]);
-            let (logits, _) = model.forward(obs_tensor);
-            let logits_vec: Vec<f32> = logits
-                .to_data()
-                .to_vec()
-                .expect("tensor data to vec conversion");
 
             let temp = temp_schedule.get_temp(move_num);
             let action = sample_with_temperature(&logits_vec, mask.as_deref(), temp, rng);
@@ -1187,6 +1250,8 @@ fn wait_for_enter() {
 ///
 /// This is used when any player is human or random.
 /// Always runs in sequential mode (single env, one game at a time).
+/// Output is suppressed when there are no human players for batch evaluation,
+/// unless `watch` is true for rendering games.
 pub fn run_interactive_game<B: Backend, E: Environment>(
     player_sources: &[PlayerSource],
     models: &[Option<ActorCritic<B>>],
@@ -1195,6 +1260,7 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
     temp_schedule: &TempSchedule,
     rng: &mut StdRng,
     device: &B::Device,
+    watch: bool,
 ) {
     use rand::RngCore;
 
@@ -1205,6 +1271,11 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
         "Expected {num_players} player sources for {num_players}-player game"
     );
 
+    // Check if there are any human players (affects verbosity)
+    // Also show output in watch mode
+    let has_human = player_sources.iter().any(PlayerSource::is_human);
+    let verbose = has_human || watch;
+
     // Build display names for players
     let player_names: Vec<String> = player_sources
         .iter()
@@ -1213,17 +1284,26 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
 
     let mut stats = EvalStats::new(num_players);
 
+    if !verbose && num_games > 1 {
+        println!("Running {num_games} games...");
+    }
+
     for game_idx in 0..num_games {
-        println!("\n=== Game {} of {} ===", game_idx + 1, num_games);
-        for (i, name) in player_names.iter().enumerate() {
-            let source_type = match &player_sources[i] {
-                PlayerSource::Checkpoint(_) => "[Network]",
-                PlayerSource::Human { .. } => "[Human]",
-                PlayerSource::Random => "[Random]",
-            };
-            println!("Player {}: {} {}", i + 1, name, source_type);
+        if verbose {
+            println!("\n=== Game {} of {} ===", game_idx + 1, num_games);
+            for (i, name) in player_names.iter().enumerate() {
+                let source_type = match &player_sources[i] {
+                    PlayerSource::Checkpoint(_) => "[Network]",
+                    PlayerSource::Human { .. } => "[Human]",
+                    PlayerSource::Random => "[Random]",
+                };
+                println!("Player {}: {} {}", i + 1, name, source_type);
+            }
+            println!("\nCommands: help (h), render (r), random, hint, quit (q)\n");
+        } else if num_games > 1 && (game_idx + 1) % 10 == 0 {
+            // Progress indicator for batch runs
+            println!("  {} / {} games completed", game_idx + 1, num_games);
         }
-        println!("\nCommands: help (h), render (r), random, hint, quit (q)\n");
 
         let mut env = E::new(rng.next_u64());
         let obs = env.reset();
@@ -1238,9 +1318,8 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
             let player_source = &player_sources[current_player];
             let mask = env.action_mask();
 
-            // Render board before human turns (or always for visibility)
-            let has_human = player_sources.iter().any(PlayerSource::is_human);
-            if has_human {
+            // Render board before human turns
+            if verbose {
                 if let Some(rendered) = env.render() {
                     println!("{rendered}");
                 }
@@ -1269,11 +1348,13 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                 }
                 PlayerSource::Random => {
                     let action = random_valid_action(&env, rng);
-                    println!(
-                        "Player {} (Random) plays: {}",
-                        current_player + 1,
-                        env.describe_action(action)
-                    );
+                    if verbose {
+                        println!(
+                            "Player {} (Random) plays: {}",
+                            current_player + 1,
+                            env.describe_action(action)
+                        );
+                    }
                     action
                 }
                 PlayerSource::Checkpoint(_) => {
@@ -1300,13 +1381,15 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                     let temp = temp_schedule.get_temp(move_num);
                     let action = sample_with_temperature(&logits_vec, mask.as_deref(), temp, rng);
 
-                    println!(
-                        "Player {} ({}) plays: {} (temp={:.2})",
-                        current_player + 1,
-                        player_names[current_player],
-                        env.describe_action(action),
-                        temp
-                    );
+                    if verbose {
+                        println!(
+                            "Player {} ({}) plays: {} (temp={:.2})",
+                            current_player + 1,
+                            player_names[current_player],
+                            env.describe_action(action),
+                            temp
+                        );
+                    }
                     action
                 }
             };
@@ -1320,28 +1403,30 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
             move_num += 1;
 
             if done {
-                // Show final state
-                if let Some(rendered) = env.render() {
-                    println!("{rendered}");
-                }
-
                 let outcome = determine_outcome(&env, &total_rewards);
                 stats.record(&outcome);
 
-                match &outcome {
-                    GameOutcome::Winner(w) => {
-                        println!("\nWinner: Player {} ({})", w + 1, player_names[*w]);
+                if verbose {
+                    // Show final state
+                    if let Some(rendered) = env.render() {
+                        println!("{rendered}");
                     }
-                    GameOutcome::Tie => println!("\nGame ended in a tie"),
-                    GameOutcome::Placements(p) => {
-                        println!("\nFinal placements:");
-                        for (i, &place) in p.iter().enumerate() {
-                            println!("  {}: {} ({})", place, player_names[i], ordinal(place));
+
+                    match &outcome {
+                        GameOutcome::Winner(w) => {
+                            println!("\nWinner: Player {} ({})", w + 1, player_names[*w]);
+                        }
+                        GameOutcome::Tie => println!("\nGame ended in a tie"),
+                        GameOutcome::Placements(p) => {
+                            println!("\nFinal placements:");
+                            for (i, &place) in p.iter().enumerate() {
+                                println!("  {}: {} ({})", place, player_names[i], ordinal(place));
+                            }
                         }
                     }
+                    println!("Total rewards: {total_rewards:?}");
+                    println!("Game length: {move_num} moves");
                 }
-                println!("Total rewards: {total_rewards:?}");
-                println!("Game length: {move_num} moves");
                 break;
             }
         }
@@ -1389,8 +1474,10 @@ fn build_hint_closure<'a, B: Backend, E: Environment>(
 }
 
 /// Run evaluation in stats mode (parallel)
+///
+/// Models can be `None` for random players.
 fn run_stats_mode<B: Backend>(
-    models: &[ActorCritic<B>],
+    models: &[Option<ActorCritic<B>>],
     normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
@@ -1428,8 +1515,11 @@ fn run_stats_mode<B: Backend>(
 ///
 /// When `silent` is true, suppresses output (used by challenger eval).
 /// Returns `EvalStats` for further processing.
+///
+/// Models can be `None` for random players - these will output uniform logits
+/// which get sampled with the action mask for uniform random valid actions.
 pub fn run_stats_mode_env<B: Backend, E: Environment>(
-    models: &[ActorCritic<B>],
+    models: &[Option<ActorCritic<B>>],
     normalizers: &[Option<ObsNormalizer>],
     checkpoint_to_model: &[usize],
     checkpoint_names: &[String],
@@ -1487,7 +1577,7 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
         let mut actions = vec![0usize; num_envs];
 
         // Group environments by which model should act (based on position mapping)
-        for (model_idx, model) in models.iter().enumerate() {
+        for (model_idx, model_opt) in models.iter().enumerate() {
             // Find environments where this model's checkpoint is the current player
             let mut env_indices = Vec::new();
             let mut env_obs = Vec::new();
@@ -1525,23 +1615,31 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
                 continue;
             }
 
-            // Batch inference for this model (normalize if checkpoint was trained with normalize_obs)
             let batch_size = env_indices.len();
-            let normalizer = &normalizers[model_idx];
-            let obs_for_model = if let Some(norm) = normalizer {
-                let mut obs_copy = env_obs.clone();
-                norm.normalize_batch(&mut obs_copy, obs_dim);
-                obs_copy
+
+            // Get logits - either from model or uniform for random players
+            let logits_flat: Vec<f32> = if let Some(model) = model_opt {
+                // Batch inference for this model (normalize if checkpoint was trained with normalize_obs)
+                let normalizer = &normalizers[model_idx];
+                let obs_for_model = if let Some(norm) = normalizer {
+                    let mut obs_copy = env_obs.clone();
+                    norm.normalize_batch(&mut obs_copy, obs_dim);
+                    obs_copy
+                } else {
+                    env_obs.clone()
+                };
+                let obs_tensor: Tensor<B, 2> =
+                    Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
+                        .reshape([batch_size, obs_dim]);
+                let (logits_tensor, _) = model.forward(obs_tensor.clone());
+                logits_tensor
+                    .to_data()
+                    .to_vec()
+                    .expect("tensor data to vec conversion")
             } else {
-                env_obs.clone()
+                // Random player: uniform logits (all zeros = equal probability after softmax)
+                vec![0.0f32; batch_size * action_count]
             };
-            let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
-                .reshape([batch_size, obs_dim]);
-            let (logits_tensor, _) = model.forward(obs_tensor.clone());
-            let logits_flat: Vec<f32> = logits_tensor
-                .to_data()
-                .to_vec()
-                .expect("tensor data to vec conversion");
 
             // Sample actions
             for (i, &env_idx) in env_indices.iter().enumerate() {
@@ -1830,8 +1928,8 @@ mod tests {
     fn test_eval_stats_winner() {
         let mut stats = EvalStats::new(2);
         stats.record(&GameOutcome::Winner(0));
-        assert_eq!(stats.wins[0], 1);
-        assert_eq!(stats.losses[1], 1);
+        assert_eq!(stats.wins(0), 1);
+        assert_eq!(stats.losses(1), 1);
         assert_eq!(stats.total_games, 1);
     }
 
@@ -1839,7 +1937,7 @@ mod tests {
     fn test_eval_stats_tie() {
         let mut stats = EvalStats::new(2);
         stats.record(&GameOutcome::Tie);
-        assert_eq!(stats.draws, 1);
+        assert_eq!(stats.draws(), 1);
         assert_eq!(stats.total_games, 1);
     }
 
@@ -1861,9 +1959,9 @@ mod tests {
         }
 
         assert_eq!(stats.total_games, 100);
-        assert_eq!(stats.wins[0], 60);
-        assert_eq!(stats.wins[1], 30);
-        assert_eq!(stats.draws, 10);
+        assert_eq!(stats.wins(0), 60);
+        assert_eq!(stats.wins(1), 30);
+        assert_eq!(stats.draws(), 10);
 
         // This exercises the Weng-Lin code path in print_two_player_summary
         let names = vec!["checkpoint_a".to_string(), "checkpoint_b".to_string()];
@@ -1907,8 +2005,8 @@ mod tests {
         stats.record_with_rewards(&GameOutcome::Winner(1), &[0.0, 1.0], 15);
 
         assert_eq!(stats.total_games, 2);
-        assert_eq!(stats.wins[0], 1);
-        assert_eq!(stats.wins[1], 1);
+        assert_eq!(stats.wins(0), 1);
+        assert_eq!(stats.wins(1), 1);
         assert_eq!(stats.game_rewards.len(), 2);
         assert_eq!(stats.game_rewards[0], vec![1.0, 0.0]);
     }
@@ -2053,9 +2151,9 @@ mod tests {
 
         assert_eq!(stats.total_games, 3);
         // Each player won once
-        assert_eq!(stats.wins[0], 1);
-        assert_eq!(stats.wins[1], 1);
-        assert_eq!(stats.wins[2], 1);
+        assert_eq!(stats.wins(0), 1);
+        assert_eq!(stats.wins(1), 1);
+        assert_eq!(stats.wins(2), 1);
 
         // Check placement counts: placements[player][place-1] = count
         assert_eq!(stats.placements[0][0], 1); // P0 got 1st once
@@ -2107,13 +2205,12 @@ mod tests {
 
     #[test]
     fn test_challenger_result_should_promote() {
-        // Win rate above threshold should promote
-        // 60 wins, 30 losses, 10 draws out of 100 games
+        // Current model outperforms best - should promote
+        // current_avg_points > best_avg_points
         let result = ChallengerResult {
-            current_win_rate: 0.60,
-            best_win_rate: 0.30,
+            current_avg_points: 0.70, // Higher Swiss points = better
+            best_avg_points: 0.30,
             draw_rate: 0.10,
-            win_rate: 0.65,
             current_rating: 5.0,
             current_uncertainty: 6.0,
             best_rating: -5.0,
@@ -2123,13 +2220,12 @@ mod tests {
         };
         assert!(result.should_promote);
 
-        // Win rate below threshold should not promote
-        // 30 wins, 60 losses, 10 draws out of 100 games
+        // Current model underperforms best - should not promote
+        // current_avg_points < best_avg_points
         let result2 = ChallengerResult {
-            current_win_rate: 0.30,
-            best_win_rate: 0.60,
+            current_avg_points: 0.30,
+            best_avg_points: 0.70,
             draw_rate: 0.10,
-            win_rate: 0.35,
             current_rating: -5.0,
             current_uncertainty: 6.0,
             best_rating: 5.0,

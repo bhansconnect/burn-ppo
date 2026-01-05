@@ -751,7 +751,8 @@ where
             }
 
             // Challenger evaluation for multiplayer games
-            let challenger_win_rate: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1 {
+            let challenger_avg_points: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1
+            {
                 let best_path = checkpoint_manager.best_checkpoint_path();
                 if best_path.exists() {
                     // Load best checkpoint's training rating for accumulating skill
@@ -789,18 +790,13 @@ where
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/win_rate",
-                                result.win_rate as f32,
+                                "challenger/current_avg_points",
+                                result.current_avg_points as f32,
                                 global_step,
                             )?;
                             logger.log_scalar(
-                                "challenger/current_win_rate",
-                                result.current_win_rate as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/best_win_rate",
-                                result.best_win_rate as f32,
+                                "challenger/best_avg_points",
+                                result.best_avg_points as f32,
                                 global_step,
                             )?;
                             logger.log_scalar(
@@ -861,7 +857,7 @@ where
                                 )?;
                             }
 
-                            Some(result.win_rate)
+                            Some(result.current_avg_points)
                         }
                         Err(e) => {
                             eprintln!("Warning: Challenger evaluation failed: {e}");
@@ -880,12 +876,12 @@ where
             };
 
             // Log checkpoint save message
-            let checkpoint_msg = if let Some(win_rate) = challenger_win_rate {
+            let checkpoint_msg = if let Some(avg_pts) = challenger_avg_points {
                 format!(
-                    "Saved checkpoint at step {} (avg return: {:.1}, vs best: {:.1}%) -> {}",
+                    "Saved checkpoint at step {} (avg return: {:.1}, vs best: {:.2} pts) -> {}",
                     global_step,
                     avg_return,
-                    win_rate * 100.0,
+                    avg_pts,
                     checkpoint_path
                         .file_name()
                         .expect("checkpoint has filename")
@@ -966,7 +962,7 @@ where
         }
 
         // Challenger evaluation for multiplayer games
-        let challenger_win_rate: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1 {
+        let challenger_avg_points: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1 {
             let best_path = checkpoint_manager.best_checkpoint_path();
             if best_path.exists() {
                 // Load best checkpoint's training rating for accumulating skill
@@ -1004,18 +1000,13 @@ where
                             global_step,
                         )?;
                         logger.log_scalar(
-                            "challenger/win_rate",
-                            result.win_rate as f32,
+                            "challenger/current_avg_points",
+                            result.current_avg_points as f32,
                             global_step,
                         )?;
                         logger.log_scalar(
-                            "challenger/current_win_rate",
-                            result.current_win_rate as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/best_win_rate",
-                            result.best_win_rate as f32,
+                            "challenger/best_avg_points",
+                            result.best_avg_points as f32,
                             global_step,
                         )?;
                         logger.log_scalar(
@@ -1044,7 +1035,7 @@ where
                             global_step,
                         )?;
 
-                        // Promote if win rate exceeds threshold
+                        // Promote if avg points exceeds best
                         if result.should_promote {
                             if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
                                 eprintln!("Warning: Failed to promote checkpoint to best: {e}");
@@ -1060,7 +1051,7 @@ where
                             )?;
                         }
 
-                        Some(result.win_rate)
+                        Some(result.current_avg_points)
                     }
                     Err(e) => {
                         eprintln!("Warning: Challenger evaluation failed: {e}");
@@ -1079,12 +1070,12 @@ where
         };
 
         // Log final checkpoint save message
-        let checkpoint_msg = if let Some(win_rate) = challenger_win_rate {
+        let checkpoint_msg = if let Some(avg_pts) = challenger_avg_points {
             format!(
-                "Saved final checkpoint at step {} (avg return: {:.1}, vs best: {:.1}%) -> {}",
+                "Saved final checkpoint at step {} (avg return: {:.1}, vs best: {:.2} pts) -> {}",
                 global_step,
                 avg_return,
-                win_rate * 100.0,
+                avg_pts,
                 checkpoint_path
                     .file_name()
                     .expect("checkpoint has filename")

@@ -142,7 +142,8 @@ impl Contestant {
         }
     }
 
-    /// Get wins (1st place finishes, excluding draws) for 2-player compatibility
+    /// Get wins (1st place finishes, excluding draws) - for test assertions
+    #[cfg(test)]
     pub fn wins(&self) -> usize {
         self.placement_counts
             .first()
@@ -151,7 +152,8 @@ impl Contestant {
             .saturating_sub(self.draw_count)
     }
 
-    /// Get losses (last place finishes) for 2-player compatibility
+    /// Get losses (last place finishes) - for test assertions
+    #[cfg(test)]
     pub fn losses(&self) -> usize {
         if self.placement_counts.len() >= 2 {
             self.placement_counts.last().copied().unwrap_or(0)
@@ -160,7 +162,8 @@ impl Contestant {
         }
     }
 
-    /// Get draws (ties)
+    /// Get draws (ties) - for test assertions
+    #[cfg(test)]
     pub fn draws(&self) -> usize {
         self.draw_count
     }
@@ -178,9 +181,10 @@ pub struct RankingEntry {
     pub uncertainty: f64,
     pub rating_low: f64,
     pub rating_high: f64,
-    pub wins: usize,
-    pub losses: usize,
-    pub draws: usize,
+    /// Placement counts: [1st place finishes, 2nd place finishes, ...]
+    pub placement_counts: Vec<usize>,
+    /// Number of full draws (all players tied for 1st)
+    pub draw_count: usize,
     pub games_played: usize,
 }
 
@@ -830,34 +834,65 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
             })
     });
 
-    // Header
+    // Determine number of players from first contestant's placement_counts
+    let num_players = contestants.first().map_or(2, |c| c.placement_counts.len());
+
+    // Build header dynamically based on num_players
+    let placement_headers: Vec<String> = (1..=num_players).map(ordinal).collect();
+    let placement_header_str: String =
+        placement_headers.iter().fold(String::new(), |mut acc, h| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{h:>4}");
+            acc
+        });
+
     println!(
-        " {:>2}  {:20}  {:>8}  {:>7}  {:>16}  {:>4}  {:>4}  {:>4}",
-        "#", "Name", "Points", "Rating", "95% CI", "W", "L", "D"
+        " {:>2}  {:20}  {:>8}  {:>7}  {:>16}  {}",
+        "#", "Name", "Points", "Rating", "95% CI", placement_header_str
     );
-    println!("{:-<80}", "");
+    let width = 60 + placement_headers.len() * 4;
+    println!("{:-<width$}", "");
 
     for (rank, (_, c)) in ranked.iter().enumerate() {
         let sigma = c.rating.uncertainty;
         let low = c.rating.rating - 2.0 * sigma;
         let high = c.rating.rating + 2.0 * sigma;
 
+        // Build placement counts string
+        let placement_str: String =
+            c.placement_counts
+                .iter()
+                .fold(String::new(), |mut acc, &count| {
+                    use std::fmt::Write;
+                    let _ = write!(acc, "{count:>4}");
+                    acc
+                });
+
         println!(
-            " {:>2}  {:20}  {:>8.1}  {:>7.1}  [{:>5.1}, {:>5.1}]  {:>4}  {:>4}  {:>4}",
+            " {:>2}  {:20}  {:>8.1}  {:>7.1}  [{:>5.1}, {:>5.1}]  {}",
             rank + 1,
             c.name,
             c.swiss_points,
             c.rating.rating,
             low,
             high,
-            c.wins(),
-            c.losses(),
-            c.draws()
+            placement_str
         );
     }
 
     println!();
     println!("Note: Ranked by Swiss points. Rating 95% CI = rating ± 2×sigma");
+}
+
+/// Get ordinal suffix (1st, 2nd, 3rd, 4th, ...)
+fn ordinal(n: usize) -> String {
+    let suffix = match n % 10 {
+        1 if n % 100 != 11 => "st",
+        2 if n % 100 != 12 => "nd",
+        3 if n % 100 != 13 => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 /// Build tournament results for JSON export
@@ -900,9 +935,8 @@ fn build_results(
                 uncertainty: sigma,
                 rating_low: c.rating.rating - 2.0 * sigma,
                 rating_high: c.rating.rating + 2.0 * sigma,
-                wins: c.wins(),
-                losses: c.losses(),
-                draws: c.draws(),
+                placement_counts: c.placement_counts.clone(),
+                draw_count: c.draw_count,
                 games_played: c.games_played,
             }
         })
@@ -988,7 +1022,7 @@ fn run_pod<B: Backend, E: Environment>(
     }
 
     // Build models array, deduplicating when same model plays multiple positions
-    let mut pod_models: Vec<ActorCritic<B>> = Vec::new();
+    let mut pod_models: Vec<Option<ActorCritic<B>>> = Vec::new();
     let mut pod_normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
     let mut checkpoint_to_model_map: Vec<usize> = Vec::new();
     let mut model_cache: HashMap<usize, usize> = HashMap::new();
@@ -1002,7 +1036,7 @@ fn run_pod<B: Backend, E: Environment>(
         } else {
             // Add new model
             let new_idx = pod_models.len();
-            pod_models.push(models[model_idx].clone());
+            pod_models.push(Some(models[model_idx].clone()));
             pod_normalizers.push(normalizers[model_idx].clone());
             model_cache.insert(model_idx, new_idx);
             checkpoint_to_model_map.push(new_idx);
@@ -1682,9 +1716,8 @@ mod tests {
             uncertainty: 4.2,
             rating_low: 20.1,
             rating_high: 36.9,
-            wins: 10,
-            losses: 2,
-            draws: 1,
+            placement_counts: vec![10, 2, 1], // 10 1st, 2 2nd, 1 3rd
+            draw_count: 1,
             games_played: 13,
         };
 
@@ -1705,9 +1738,8 @@ mod tests {
             uncertainty: 8.333,
             rating_low: 8.334,
             rating_high: 41.666,
-            wins: 5,
-            losses: 5,
-            draws: 0,
+            placement_counts: vec![5, 5], // 5 wins, 5 losses
+            draw_count: 0,
             games_played: 10,
         };
 
@@ -2449,9 +2481,8 @@ mod tests {
             uncertainty: 8.333,
             rating_low: 8.334,
             rating_high: 41.666,
-            wins: 0,
-            losses: 0,
-            draws: 0,
+            placement_counts: vec![0, 0],
+            draw_count: 0,
             games_played: 0,
         };
 
