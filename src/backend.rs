@@ -54,8 +54,7 @@ pub fn warn_if_better_backend_available(current: &str) {
     let best = best_available_backend();
     if current == "ndarray" && best != "ndarray" {
         eprintln!(
-            "Note: Using ndarray backend. For better performance, use --backend {} (available: {})",
-            best,
+            "Note: Using ndarray backend (default for small networks). Other backends available: {}. GPU acceleration may help for larger models, though performance varies by network size.",
             available_backends().join(", ")
         );
     }

@@ -70,7 +70,7 @@ pub struct TrainArgs {
     #[arg(long, conflicts_with = "resume")]
     pub fork: Option<PathBuf>,
 
-    /// Compute backend (defaults to best available: cuda > libtorch > wgpu > ndarray)
+    /// Compute backend (defaults to ndarray; small networks often don't benefit from GPU due to data transfer overhead, though performance varies)
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -210,7 +210,7 @@ pub struct EvalArgs {
     #[arg(long = "checkpoint", short = 'c')]
     pub checkpoints: Vec<PathBuf>,
 
-    /// Compute backend (defaults to best available: cuda > libtorch > wgpu > ndarray)
+    /// Compute backend (defaults to ndarray; small networks often don't benefit from GPU due to data transfer overhead, though performance varies)
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -280,7 +280,7 @@ pub struct TournamentArgs {
     #[arg(required = true)]
     pub sources: Vec<PathBuf>,
 
-    /// Compute backend (defaults to best available: cuda > libtorch > wgpu > ndarray)
+    /// Compute backend (defaults to ndarray; small networks often don't benefit from GPU due to data transfer overhead, though performance varies)
     #[arg(long)]
     pub backend: Option<String>,
 
