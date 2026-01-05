@@ -1511,6 +1511,30 @@ fn run_stats_mode<B: Backend>(
     })
 }
 
+/// Generate all permutations of 0..n using Heap's algorithm
+fn generate_permutations(n: usize) -> Vec<Vec<usize>> {
+    let mut result = Vec::new();
+    let mut arr: Vec<usize> = (0..n).collect();
+    heap_permute(&mut arr, n, &mut result);
+    result
+}
+
+fn heap_permute(arr: &mut [usize], k: usize, result: &mut Vec<Vec<usize>>) {
+    if k == 1 {
+        result.push(arr.to_vec());
+        return;
+    }
+    heap_permute(arr, k - 1, result);
+    for i in 0..k - 1 {
+        if k.is_multiple_of(2) {
+            arr.swap(i, k - 1);
+        } else {
+            arr.swap(0, k - 1);
+        }
+        heap_permute(arr, k - 1, result);
+    }
+}
+
 /// Stats mode implementation for a specific environment type
 ///
 /// When `silent` is true, suppresses output (used by challenger eval).
@@ -1551,10 +1575,13 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
     // Track move counts per environment (for temperature schedule)
     let mut move_counts = vec![0usize; num_envs];
 
-    // Track permutation offset per environment for position rotation
-    // checkpoint i plays as player (i + perm_offset) % num_players
-    // This rotates all checkpoints through all positions for fairness
-    let mut perm_offsets: Vec<usize> = (0..num_envs).map(|env_idx| env_idx % num_players).collect();
+    // Pre-generate all permutations for fair position coverage
+    // This cycles through all N! permutations instead of just N rotations
+    let all_perms = generate_permutations(num_players);
+    let num_perms = all_perms.len();
+
+    // Track which permutation each env uses (cycles through all N!)
+    let mut perm_indices: Vec<usize> = (0..num_envs).map(|env_idx| env_idx % num_perms).collect();
 
     if !silent {
         println!("Running {num_games} games across {num_envs} parallel environments...");
@@ -1591,10 +1618,9 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
 
                 let current_player = current_players[env_idx];
                 // Which checkpoint controls this player position in this env?
-                // checkpoint i plays as player (i + perm_offset) % num_players
-                // So checkpoint_for_player = (player - perm_offset + num_players) % num_players
-                let checkpoint_for_player =
-                    (current_player + num_players - perm_offsets[env_idx]) % num_players;
+                // perm[player_idx] = checkpoint that plays as that player
+                let perm = &all_perms[perm_indices[env_idx]];
+                let checkpoint_for_player = perm[current_player];
 
                 // Check if this checkpoint uses the current model (supports deduplication)
                 if checkpoint_to_model[checkpoint_for_player] == model_idx {
@@ -1680,13 +1706,18 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
 
             // Use the env_index from the completed episode
             let env_idx = ep.env_index;
-            let perm_offset = perm_offsets[env_idx];
+            let perm = &all_perms[perm_indices[env_idx]];
 
-            // Map player rewards to checkpoint rewards using permutation offset
-            // checkpoint i was at player position (i + perm_offset) % num_players
+            // Map player rewards to checkpoint rewards using permutation
+            // perm[player_idx] = checkpoint that played as that player
+            // We need reward for each checkpoint, so find which player they were
             let checkpoint_rewards: Vec<f32> = (0..num_checkpoints)
                 .map(|checkpoint_idx| {
-                    let player_idx = (checkpoint_idx + perm_offset) % num_players;
+                    // Find which player position this checkpoint was at
+                    let player_idx = perm
+                        .iter()
+                        .position(|&c| c == checkpoint_idx)
+                        .expect("checkpoint must be in permutation");
                     ep.total_rewards[player_idx]
                 })
                 .collect();
@@ -1710,9 +1741,9 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
 
             stats.record_with_rewards(&outcome, &checkpoint_rewards, ep.length);
 
-            // Reset move count and rotate to next permutation for fairness
+            // Reset move count and cycle to next permutation for fairness
             move_counts[env_idx] = 0;
-            perm_offsets[env_idx] = (perm_offset + 1) % num_players;
+            perm_indices[env_idx] = (perm_indices[env_idx] + 1) % num_perms;
 
             // Progress indicator
             if !silent && games_completed % 100 == 0 {
@@ -1763,6 +1794,35 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_generate_permutations() {
+        // Test 2-player: 2! = 2 permutations
+        let perms_2 = generate_permutations(2);
+        assert_eq!(perms_2.len(), 2);
+        let unique_2: HashSet<_> = perms_2.iter().collect();
+        assert_eq!(unique_2.len(), 2);
+
+        // Test 3-player: 3! = 6 permutations
+        let perms_3 = generate_permutations(3);
+        assert_eq!(perms_3.len(), 6);
+        let unique_3: HashSet<_> = perms_3.iter().collect();
+        assert_eq!(unique_3.len(), 6);
+
+        // Test 4-player: 4! = 24 permutations
+        let perms_4 = generate_permutations(4);
+        assert_eq!(perms_4.len(), 24);
+        let unique_4: HashSet<_> = perms_4.iter().collect();
+        assert_eq!(unique_4.len(), 24);
+
+        // Verify each permutation contains 0..n exactly once
+        for perm in &perms_4 {
+            let mut sorted = perm.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![0, 1, 2, 3]);
+        }
+    }
 
     #[test]
     fn test_temp_schedule_constant() {
