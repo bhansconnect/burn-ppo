@@ -1,8 +1,8 @@
 //! Tournament mode for evaluating multiple checkpoints with skill ratings
 //!
 //! Features:
-//! - Swiss-style tournaments for efficient skill estimation (N > 8 contestants)
-//! - Round-robin for complete coverage (N <= 8 contestants)
+//! - Swiss-style tournaments for efficient skill estimation (>50 matchups)
+//! - Round-robin for complete coverage (<=50 matchups)
 //! - Weng-Lin (`OpenSkill`) rating system with uncertainty tracking
 //! - Progress bars and intermediate standings
 
@@ -1432,6 +1432,7 @@ fn build_results(
     contestants: &[Contestant],
     pods: &[(usize, MatchupGames)], // (round, result)
     num_rounds: usize,
+    use_swiss: bool,
     args: &TournamentArgs,
     env_name: &str,
 ) -> TournamentResults {
@@ -1492,11 +1493,7 @@ fn build_results(
         })
         .collect();
 
-    let format = if contestants.len() <= 8 {
-        "round-robin"
-    } else {
-        "swiss"
-    };
+    let format = if use_swiss { "swiss" } else { "round-robin" };
 
     TournamentResults {
         rankings,
@@ -1745,8 +1742,9 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
     println!("Loaded {} unique models", models.len());
 
-    // Determine tournament format
-    let use_swiss = n > 8;
+    // Determine tournament format based on matchup count
+    let matchups = (0..n).combinations(E::NUM_PLAYERS).count();
+    let use_swiss = matchups > 50;
     let num_rounds = if use_swiss {
         args.rounds.unwrap_or_else(|| {
             #[expect(clippy::cast_sign_loss, reason = "log2 of positive n is positive")]
@@ -1947,7 +1945,14 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
     // JSON output if requested
     if let Some(output_path) = &args.output {
-        let results = build_results(contestants, &all_pods, num_rounds, args, &metadata.env_name);
+        let results = build_results(
+            contestants,
+            &all_pods,
+            num_rounds,
+            use_swiss,
+            args,
+            &metadata.env_name,
+        );
         let json = serde_json::to_string_pretty(&results)?;
         std::fs::write(output_path, json)?;
         println!("\nResults saved to: {}", output_path.display());
@@ -2665,7 +2670,7 @@ mod tests {
             graph: false,
         };
 
-        let results = build_results(&contestants, &pods, 1, &args, "connect_four");
+        let results = build_results(&contestants, &pods, 1, false, &args, "connect_four");
 
         assert_eq!(results.rankings.len(), 2);
         assert_eq!(results.rankings[0].name, "Winner"); // Higher rating is first
@@ -2702,9 +2707,9 @@ mod tests {
             graph: false,
         };
 
-        let results = build_results(&contestants, &[], 1, &args, "cartpole");
+        let results = build_results(&contestants, &[], 1, false, &args, "cartpole");
 
-        // 4 contestants = round-robin format
+        // round-robin format
         assert_eq!(results.config.format, "round-robin");
     }
 
@@ -2733,7 +2738,7 @@ mod tests {
             graph: false,
         };
 
-        let results = build_results(&contestants, &[], 3, &args, "connect_four");
+        let results = build_results(&contestants, &[], 3, true, &args, "connect_four");
 
         assert_eq!(results.config.format, "swiss");
     }
@@ -3183,7 +3188,7 @@ mod tests {
             graph: false,
         };
 
-        let results = build_results(&contestants, &[], 1, &args, "test_env");
+        let results = build_results(&contestants, &[], 1, false, &args, "test_env");
 
         assert_eq!(results.rankings.len(), 1);
         assert_eq!(
@@ -3294,7 +3299,7 @@ mod tests {
             graph: false,
         };
 
-        let results = build_results(&contestants, &pods, 2, &args, "test");
+        let results = build_results(&contestants, &pods, 2, true, &args, "test");
 
         assert_eq!(results.pods.len(), 2);
         assert_eq!(results.pods[0].round, 1);
