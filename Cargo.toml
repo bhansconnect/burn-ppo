@@ -4,16 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "metal"]
 cuda = ["burn/cuda"]
 libtorch = ["burn/tch"]
+metal = ["burn/metal"]
 wgpu = ["burn/wgpu"]
 tracy = ["tracy-client"]
 tracy-callstack = ["tracy"]
 
 [dependencies]
 # ML framework - base features, backend selected via features above
-burn = { version = "0.19", features = ["autodiff", "fusion", "ndarray"] }
+burn = { version = "0.19", features = ["autodiff", "autotune", "fusion", "ndarray"] }
 
 # CLI and config
 clap = { version = "4", features = ["derive"] }
