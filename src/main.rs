@@ -350,10 +350,20 @@ where
     // For LR annealing, we need to know how many updates have already happened
     let update_offset = global_step / steps_per_update;
 
-    println!(
-        "Training for {} timesteps ({} updates of {} steps each)",
-        config.total_timesteps, num_updates, steps_per_update
-    );
+    // Parse time limit (fail fast if invalid)
+    let time_limit = config.max_training_duration()?;
+
+    if let Some(ref limit_str) = config.max_training_time {
+        println!(
+            "Training for {} timesteps ({} updates) or {}, whichever comes first",
+            config.total_timesteps, num_updates, limit_str
+        );
+    } else {
+        println!(
+            "Training for {} timesteps ({} updates of {} steps each)",
+            config.total_timesteps, num_updates, steps_per_update
+        );
+    }
     println!("---");
 
     // Progress bar (with multiplayer support)
@@ -394,6 +404,19 @@ where
         if !running.load(Ordering::SeqCst) {
             println!("\nInterrupted by user");
             break;
+        }
+
+        // Check time limit
+        if let Some(limit) = time_limit {
+            if training_start.elapsed() >= limit {
+                // Safe: time_limit is Some only when max_training_time is Some
+                let limit_str = config
+                    .max_training_time
+                    .as_ref()
+                    .expect("max_training_time set when time_limit is Some");
+                println!("\nTime limit reached ({limit_str})");
+                break;
+            }
         }
 
         // Learning rate annealing (using total updates for proper continuation)

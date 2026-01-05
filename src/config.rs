@@ -4,6 +4,39 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Parse a duration string with unit suffix (e.g., "30s", "5m", "2h")
+/// Supports: s (seconds), m (minutes), h (hours)
+fn parse_duration(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration string");
+    }
+
+    let (num_str, unit) = if let Some(num) = s.strip_suffix('s') {
+        (num, 's')
+    } else if let Some(num) = s.strip_suffix('m') {
+        (num, 'm')
+    } else if let Some(num) = s.strip_suffix('h') {
+        (num, 'h')
+    } else {
+        // Default to seconds if no unit
+        (s, 's')
+    };
+
+    let value: u64 = num_str
+        .parse()
+        .with_context(|| format!("invalid duration number: {num_str}"))?;
+
+    let secs = match unit {
+        's' => value,
+        'm' => value * 60,
+        'h' => value * 3600,
+        _ => unreachable!(),
+    };
+
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 /// PPO training and evaluation for discrete games
 #[derive(Parser, Debug)]
 #[command(name = "burn-ppo", version, about)]
@@ -53,6 +86,11 @@ pub struct TrainArgs {
 
     #[arg(long)]
     pub total_timesteps: Option<usize>,
+
+    /// Maximum training time with unit suffix (e.g., "30s", "5m", "2h")
+    /// Training stops early if this time is reached before `total_timesteps`
+    #[arg(long)]
+    pub max_training_time: Option<String>,
 
     #[arg(long)]
     pub seed: Option<u64>,
@@ -375,6 +413,10 @@ pub struct Config {
     pub num_minibatches: usize,
     #[serde(default = "default_adam_epsilon")]
     pub adam_epsilon: f64,
+    /// Maximum training wall-clock time (e.g., "30s", "5m", "2h")
+    /// Training stops when this time is reached OR `total_timesteps`, whichever first
+    #[serde(default)]
+    pub max_training_time: Option<String>,
 
     // Network
     #[serde(default = "default_hidden_size")]
@@ -525,6 +567,7 @@ impl Default for Config {
             num_epochs: default_num_epochs(),
             num_minibatches: default_num_minibatches(),
             adam_epsilon: default_adam_epsilon(),
+            max_training_time: None,
             hidden_size: default_hidden_size(),
             num_hidden: default_num_hidden(),
             activation: default_activation(),
@@ -643,6 +686,9 @@ impl Config {
         if let Some(ts) = args.total_timesteps {
             self.total_timesteps = ts;
         }
+        if let Some(ref t) = args.max_training_time {
+            self.max_training_time = Some(t.clone());
+        }
         if let Some(v) = args.num_epochs {
             self.num_epochs = v;
         }
@@ -712,12 +758,15 @@ impl Config {
 
     /// Apply limited CLI overrides for resume mode
     ///
-    /// When resuming, we only allow extending `total_timesteps`.
+    /// When resuming, we only allow extending `total_timesteps` and setting `max_training_time`.
     /// Other parameters are locked to the original run config.
     pub fn apply_resume_overrides(&mut self, args: &CliArgs) {
-        // Only allow extending training duration
+        // Only allow extending training duration and setting time limit
         if let Some(ts) = args.total_timesteps {
             self.total_timesteps = ts;
+        }
+        if let Some(ref t) = args.max_training_time {
+            self.max_training_time = Some(t.clone());
         }
 
         // Collect warnings for ignored overrides
@@ -846,6 +895,14 @@ impl Config {
                 ignored.join(", ")
             );
         }
+    }
+
+    /// Get max training time as a Duration (if set)
+    pub fn max_training_duration(&self) -> Result<Option<std::time::Duration>> {
+        self.max_training_time
+            .as_ref()
+            .map(|s| parse_duration(s))
+            .transpose()
     }
 
     /// Get the full path to the run directory
