@@ -316,7 +316,11 @@ impl EvalStats {
     }
 
     /// Print statistics summary
-    pub fn print_summary(&self, checkpoint_names: &[String]) {
+    ///
+    /// If `slot_to_model` is provided, stats will be aggregated by unique model.
+    /// This merges placements and rewards for slots sharing the same model index,
+    /// but keeps ratings separate (per-slot).
+    pub fn print_summary(&self, checkpoint_names: &[String], slot_to_model: Option<&[usize]>) {
         println!("\n=== Evaluation Results ({}-player) ===", self.num_players);
         println!("Total games: {}\n", self.total_games);
 
@@ -325,14 +329,14 @@ impl EvalStats {
             self.print_single_player_summary(checkpoint_names);
         } else if self.num_players == 2 {
             // 2-player format with win/loss/draw and ELO
-            self.print_two_player_summary(checkpoint_names);
+            self.print_two_player_summary(checkpoint_names, slot_to_model);
         } else {
             // N-player format with placement percentages
-            self.print_multi_player_summary(checkpoint_names);
+            self.print_multi_player_summary(checkpoint_names, slot_to_model);
         }
 
         // Print average rewards if available
-        self.print_reward_summary(checkpoint_names);
+        self.print_reward_summary(checkpoint_names, slot_to_model);
     }
 
     fn print_single_player_summary(&self, checkpoint_names: &[String]) {
@@ -392,27 +396,80 @@ impl EvalStats {
 
     /// Unified N-player summary with Swiss points and Weng-Lin ratings
     /// Works for 2-player, 4-player, or any N-player games
-    fn print_n_player_summary(&self, checkpoint_names: &[String]) {
+    ///
+    /// If `slot_to_model` is provided, placements are aggregated by model index.
+    fn print_n_player_summary(&self, checkpoint_names: &[String], slot_to_model: Option<&[usize]>) {
         let num_checkpoints = checkpoint_names.len();
 
-        // Show placement distribution and Swiss points per checkpoint
-        for (i, name) in checkpoint_names.iter().enumerate() {
-            let placement_pcts: Vec<String> = self.placements[i]
+        // Build aggregated placements if merging by model
+        let (merged_names, merged_placements, num_slots_per_model): (
+            Vec<String>,
+            Vec<Vec<usize>>,
+            Vec<usize>,
+        ) = if let Some(mapping) = slot_to_model {
+            // Find unique model indices and aggregate
+            let num_models = mapping.iter().copied().max().map_or(0, |m| m + 1);
+            let mut names: Vec<String> = vec![String::new(); num_models];
+            let mut placements: Vec<Vec<usize>> = vec![vec![0; self.num_players]; num_models];
+            let mut slot_counts: Vec<usize> = vec![0; num_models];
+
+            for (slot, &model_idx) in mapping.iter().enumerate() {
+                if model_idx < num_models {
+                    // Use first slot's name for each model
+                    if names[model_idx].is_empty() && slot < checkpoint_names.len() {
+                        names[model_idx].clone_from(&checkpoint_names[slot]);
+                    }
+                    // Sum placements
+                    if slot < self.placements.len() {
+                        for (p, &count) in self.placements[slot].iter().enumerate() {
+                            if p < placements[model_idx].len() {
+                                placements[model_idx][p] += count;
+                            }
+                        }
+                    }
+                    slot_counts[model_idx] += 1;
+                }
+            }
+
+            (names, placements, slot_counts)
+        } else {
+            // No merging - use original data
+            let slot_counts = vec![1; num_checkpoints];
+            (
+                checkpoint_names.to_vec(),
+                self.placements.clone(),
+                slot_counts,
+            )
+        };
+
+        // Show placement distribution and Swiss points per checkpoint (or merged model)
+        for (i, name) in merged_names.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+
+            // Total games for this model = total_games * num_slots
+            let total_observations = self.total_games * num_slots_per_model[i];
+            if total_observations == 0 {
+                continue;
+            }
+
+            let placement_pcts: Vec<String> = merged_placements[i]
                 .iter()
                 .enumerate()
                 .map(|(p, &count)| {
-                    let pct = 100.0 * count as f64 / self.total_games as f64;
+                    let pct = 100.0 * count as f64 / total_observations as f64;
                     format!("{:.0}% {}", pct, ordinal(p + 1))
                 })
                 .collect();
 
             // Compute Swiss points: num_players - avg_placement (higher = better)
-            let avg_placement: f64 = self.placements[i]
+            let avg_placement: f64 = merged_placements[i]
                 .iter()
                 .enumerate()
                 .map(|(p, &count)| (p + 1) as f64 * count as f64)
                 .sum::<f64>()
-                / self.total_games as f64;
+                / total_observations as f64;
             let swiss_points = self.num_players as f64 - avg_placement;
 
             println!(
@@ -424,6 +481,7 @@ impl EvalStats {
         }
 
         // Compute Weng-Lin ratings using per-game outcomes (N-player compatible)
+        // Ratings are NOT merged - computed per slot
         let wl_config = WengLinConfig::new();
         let mut ratings: Vec<WengLinRating> = (0..num_checkpoints)
             .map(|_| WengLinRating {
@@ -483,31 +541,72 @@ impl EvalStats {
     }
 
     // Keep old names as aliases for backward compatibility in tests
-    fn print_two_player_summary(&self, checkpoint_names: &[String]) {
-        self.print_n_player_summary(checkpoint_names);
+    fn print_two_player_summary(
+        &self,
+        checkpoint_names: &[String],
+        slot_to_model: Option<&[usize]>,
+    ) {
+        self.print_n_player_summary(checkpoint_names, slot_to_model);
     }
 
-    fn print_multi_player_summary(&self, checkpoint_names: &[String]) {
-        self.print_n_player_summary(checkpoint_names);
+    fn print_multi_player_summary(
+        &self,
+        checkpoint_names: &[String],
+        slot_to_model: Option<&[usize]>,
+    ) {
+        self.print_n_player_summary(checkpoint_names, slot_to_model);
     }
 
-    fn print_reward_summary(&self, checkpoint_names: &[String]) {
+    fn print_reward_summary(&self, checkpoint_names: &[String], slot_to_model: Option<&[usize]>) {
         if self.game_rewards.is_empty() || self.num_players == 1 {
             return; // Already handled in single-player summary
         }
 
         println!();
         println!("Average Rewards:");
-        for (i, name) in checkpoint_names.iter().enumerate() {
-            let rewards: Vec<f64> = self
-                .game_rewards
-                .iter()
-                .filter_map(|r| r.get(i).copied())
-                .collect();
 
-            if !rewards.is_empty() {
-                let mean = rewards.iter().sum::<f64>() / rewards.len() as f64;
-                println!("  {name}: {mean:.3}");
+        if let Some(mapping) = slot_to_model {
+            // Aggregate rewards by model
+            let num_models = mapping.iter().copied().max().map_or(0, |m| m + 1);
+            let mut model_names: Vec<String> = vec![String::new(); num_models];
+            let mut model_reward_sums: Vec<f64> = vec![0.0; num_models];
+            let mut model_reward_counts: Vec<usize> = vec![0; num_models];
+
+            for (slot, &model_idx) in mapping.iter().enumerate() {
+                if model_idx < num_models {
+                    // Use first slot's name for each model
+                    if model_names[model_idx].is_empty() && slot < checkpoint_names.len() {
+                        model_names[model_idx].clone_from(&checkpoint_names[slot]);
+                    }
+                    // Sum rewards for this slot
+                    for game_rewards in &self.game_rewards {
+                        if let Some(&reward) = game_rewards.get(slot) {
+                            model_reward_sums[model_idx] += reward;
+                            model_reward_counts[model_idx] += 1;
+                        }
+                    }
+                }
+            }
+
+            for (model_idx, name) in model_names.iter().enumerate() {
+                if !name.is_empty() && model_reward_counts[model_idx] > 0 {
+                    let mean = model_reward_sums[model_idx] / model_reward_counts[model_idx] as f64;
+                    println!("  {name}: {mean:.3}");
+                }
+            }
+        } else {
+            // No merging - original behavior
+            for (i, name) in checkpoint_names.iter().enumerate() {
+                let rewards: Vec<f64> = self
+                    .game_rewards
+                    .iter()
+                    .filter_map(|r| r.get(i).copied())
+                    .collect();
+
+                if !rewards.is_empty() {
+                    let mean = rewards.iter().sum::<f64>() / rewards.len() as f64;
+                    println!("  {name}: {mean:.3}");
+                }
             }
         }
     }
@@ -1199,7 +1298,7 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
     }
 
     if num_games > 1 {
-        stats.print_summary(checkpoint_names);
+        stats.print_summary(checkpoint_names, Some(checkpoint_to_model));
     }
 }
 
@@ -1408,7 +1507,7 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
     }
 
     if num_games > 1 {
-        stats.print_summary(&player_names);
+        stats.print_summary(&player_names, None);
     }
 }
 
@@ -1761,7 +1860,7 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
     }
 
     if !silent {
-        stats.print_summary(checkpoint_names);
+        stats.print_summary(checkpoint_names, Some(checkpoint_to_model));
     }
 
     stats
@@ -2001,7 +2100,7 @@ mod tests {
 
         // This exercises the Weng-Lin code path in print_two_player_summary
         let names = vec!["checkpoint_a".to_string(), "checkpoint_b".to_string()];
-        stats.print_two_player_summary(&names);
+        stats.print_two_player_summary(&names, None);
     }
 
     #[test]
@@ -2409,5 +2508,104 @@ mod tests {
 
         assert!(p0.rating < -10.0); // Should have significant negative rating
         assert!(p1.rating > 10.0); // P1 should have significant positive rating
+    }
+
+    #[test]
+    fn test_eval_stats_merge_placements() {
+        // Test that placements are correctly aggregated when slot_to_model is provided
+        let mut stats = EvalStats::new(4); // 4-player game
+
+        // Record some game outcomes (GameOutcome is a newtype struct)
+        // Game 1: placements [1, 2, 3, 4] for slots 0, 1, 2, 3
+        stats.record(&GameOutcome(vec![1, 2, 3, 4]));
+        // Game 2: placements [2, 1, 4, 3]
+        stats.record(&GameOutcome(vec![2, 1, 4, 3]));
+        // Game 3: placements [1, 3, 2, 4]
+        stats.record(&GameOutcome(vec![1, 3, 2, 4]));
+
+        // Verify raw placements per slot
+        assert_eq!(stats.placements[0], vec![2, 1, 0, 0]); // slot 0: 2x 1st, 1x 2nd
+        assert_eq!(stats.placements[1], vec![1, 1, 1, 0]); // slot 1: 1x 1st, 1x 2nd, 1x 3rd
+        assert_eq!(stats.placements[2], vec![0, 1, 1, 1]); // slot 2: 1x 2nd, 1x 3rd, 1x 4th
+        assert_eq!(stats.placements[3], vec![0, 0, 1, 2]); // slot 3: 1x 3rd, 2x 4th
+    }
+
+    #[test]
+    fn test_eval_stats_slot_to_model_aggregation() {
+        // Test the aggregation logic used in print_n_player_summary
+        let mut stats = EvalStats::new(4);
+
+        // Record outcomes where slots 0,1,2 use model 0 and slot 3 uses model 1
+        stats.record(&GameOutcome(vec![1, 2, 3, 4]));
+        stats.record(&GameOutcome(vec![2, 1, 4, 3]));
+
+        // slot_to_model: slots 0,1,2 -> model 0, slot 3 -> model 1
+        let slot_to_model = [0, 0, 0, 1];
+
+        // Simulate the aggregation logic from print_n_player_summary
+        let num_models = slot_to_model.iter().copied().max().map_or(0, |m| m + 1);
+        let mut merged_placements: Vec<Vec<usize>> = vec![vec![0; 4]; num_models];
+        let mut slot_counts: Vec<usize> = vec![0; num_models];
+
+        for (slot, &model_idx) in slot_to_model.iter().enumerate() {
+            for (p, &count) in stats.placements[slot].iter().enumerate() {
+                merged_placements[model_idx][p] += count;
+            }
+            slot_counts[model_idx] += 1;
+        }
+
+        // Model 0 (slots 0,1,2): sum of their placements
+        // Slot 0: [1,1,0,0], Slot 1: [1,1,0,0], Slot 2: [0,0,1,1]
+        // Sum: [2,2,1,1]
+        assert_eq!(merged_placements[0], vec![2, 2, 1, 1]);
+        assert_eq!(slot_counts[0], 3);
+
+        // Model 1 (slot 3): [0,0,1,1]
+        assert_eq!(merged_placements[1], vec![0, 0, 1, 1]);
+        assert_eq!(slot_counts[1], 1);
+    }
+
+    #[test]
+    fn test_eval_stats_reward_aggregation() {
+        // Test reward aggregation by model
+        let mut stats = EvalStats::new(4);
+
+        // Record game with rewards
+        stats.record_with_rewards(&GameOutcome(vec![1, 2, 3, 4]), &[10.0, 5.0, 2.0, 1.0], 10);
+        stats.record_with_rewards(&GameOutcome(vec![2, 1, 4, 3]), &[8.0, 6.0, 0.0, 3.0], 12);
+
+        // Verify rewards are recorded
+        assert_eq!(stats.game_rewards.len(), 2);
+        assert_eq!(stats.game_rewards[0], vec![10.0, 5.0, 2.0, 1.0]);
+        assert_eq!(stats.game_rewards[1], vec![8.0, 6.0, 0.0, 3.0]);
+
+        // slot_to_model: slots 0,1 -> model 0, slots 2,3 -> model 1
+        let slot_to_model = [0, 0, 1, 1];
+
+        // Simulate reward aggregation from print_reward_summary
+        let num_models = 2;
+        let mut model_reward_sums: Vec<f64> = vec![0.0; num_models];
+        let mut model_reward_counts: Vec<usize> = vec![0; num_models];
+
+        for (slot, &model_idx) in slot_to_model.iter().enumerate() {
+            for game_rewards in &stats.game_rewards {
+                if let Some(&reward) = game_rewards.get(slot) {
+                    model_reward_sums[model_idx] += reward;
+                    model_reward_counts[model_idx] += 1;
+                }
+            }
+        }
+
+        // Model 0 (slots 0,1): rewards (10+8) + (5+6) = 29, count = 4
+        assert_eq!(model_reward_sums[0], 29.0);
+        assert_eq!(model_reward_counts[0], 4);
+        let model_0_avg = model_reward_sums[0] / model_reward_counts[0] as f64;
+        assert!((model_0_avg - 7.25).abs() < 0.001);
+
+        // Model 1 (slots 2,3): rewards (2+0) + (1+3) = 6, count = 4
+        assert_eq!(model_reward_sums[1], 6.0);
+        assert_eq!(model_reward_counts[1], 4);
+        let model_1_avg = model_reward_sums[1] / model_reward_counts[1] as f64;
+        assert!((model_1_avg - 1.5).abs() < 0.001);
     }
 }

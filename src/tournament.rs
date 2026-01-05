@@ -6,7 +6,7 @@
 //! - Weng-Lin (`OpenSkill`) rating system with uncertainty tracking
 //! - Progress bars and intermediate standings
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -554,6 +554,16 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
                 path.display()
             );
         }
+    }
+
+    // Deduplicate by resolved path - keep first occurrence
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    let original_count = checkpoint_data.len();
+    checkpoint_data.retain(|(path, _)| seen_paths.insert(path.clone()));
+
+    if checkpoint_data.len() < original_count {
+        let removed = original_count - checkpoint_data.len();
+        println!("Warning: Removed {removed} duplicate checkpoint(s) (same resolved path)");
     }
 
     // Compute unique display names for all checkpoints
@@ -3404,5 +3414,75 @@ mod tests {
         // D: 4*0 = 0 raw points → 4th → 0.0 Swiss points
         assert!((contestants[0].swiss_points - 3.0).abs() < 0.001); // A = 1st
         assert!((contestants[3].swiss_points - 0.0).abs() < 0.001); // D = 4th
+    }
+
+    #[test]
+    fn test_checkpoint_deduplication() {
+        // Test that duplicate paths are removed from checkpoint_data
+        let mut checkpoint_data: Vec<(PathBuf, f64)> = vec![
+            (PathBuf::from("/runs/a/checkpoints/step_001"), 25.0),
+            (PathBuf::from("/runs/b/checkpoints/step_001"), 26.0),
+            (PathBuf::from("/runs/a/checkpoints/step_001"), 27.0), // duplicate of first
+            (PathBuf::from("/runs/c/checkpoints/step_001"), 28.0),
+            (PathBuf::from("/runs/b/checkpoints/step_001"), 29.0), // duplicate of second
+        ];
+
+        // Apply deduplication logic (same as in discover_contestants)
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        let original_count = checkpoint_data.len();
+        checkpoint_data.retain(|(path, _)| seen_paths.insert(path.clone()));
+
+        // Should remove 2 duplicates
+        assert_eq!(checkpoint_data.len(), 3);
+        assert_eq!(original_count - checkpoint_data.len(), 2);
+
+        // Verify remaining paths are unique
+        let paths: Vec<&PathBuf> = checkpoint_data.iter().map(|(p, _)| p).collect();
+        assert_eq!(
+            paths,
+            vec![
+                &PathBuf::from("/runs/a/checkpoints/step_001"),
+                &PathBuf::from("/runs/b/checkpoints/step_001"),
+                &PathBuf::from("/runs/c/checkpoints/step_001"),
+            ]
+        );
+
+        // Verify first occurrence's seed is kept
+        assert_eq!(checkpoint_data[0].1, 25.0); // first a
+        assert_eq!(checkpoint_data[1].1, 26.0); // first b
+        assert_eq!(checkpoint_data[2].1, 28.0); // c
+    }
+
+    #[test]
+    fn test_checkpoint_deduplication_no_duplicates() {
+        // Test that no paths are removed when there are no duplicates
+        let mut checkpoint_data: Vec<(PathBuf, f64)> = vec![
+            (PathBuf::from("/runs/a/step_001"), 25.0),
+            (PathBuf::from("/runs/b/step_001"), 26.0),
+            (PathBuf::from("/runs/c/step_001"), 27.0),
+        ];
+
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        let original_count = checkpoint_data.len();
+        checkpoint_data.retain(|(path, _)| seen_paths.insert(path.clone()));
+
+        assert_eq!(checkpoint_data.len(), original_count);
+        assert_eq!(checkpoint_data.len(), 3);
+    }
+
+    #[test]
+    fn test_checkpoint_deduplication_all_same() {
+        // Test that all duplicates except first are removed
+        let mut checkpoint_data: Vec<(PathBuf, f64)> = vec![
+            (PathBuf::from("/runs/a/step_001"), 25.0),
+            (PathBuf::from("/runs/a/step_001"), 26.0),
+            (PathBuf::from("/runs/a/step_001"), 27.0),
+        ];
+
+        let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+        checkpoint_data.retain(|(path, _)| seen_paths.insert(path.clone()));
+
+        assert_eq!(checkpoint_data.len(), 1);
+        assert_eq!(checkpoint_data[0].1, 25.0); // First occurrence kept
     }
 }
