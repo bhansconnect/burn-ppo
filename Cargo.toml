@@ -56,9 +56,9 @@ debug = 1              # Line tables for profiling
 # Peak performance builds (slow compilation, for benchmarks/distribution)
 [profile.release-lto]
 inherits = "release"
-lto = "fat"            # Full cross-crate optimization
+lto = "thin"           # Cross-crate optimization
 codegen-units = 1      # Maximum optimization opportunity
-incremental = false    # Incompatible with fat LTO
+incremental = false    # Incompatible with LTO
 strip = true           # Smaller binary
 panic = "abort"        # No unwinding overhead
 
