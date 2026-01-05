@@ -283,7 +283,11 @@ fn enumerate_checkpoints(checkpoints_dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(checkpoints)
 }
 
-/// Select N evenly spaced checkpoints including first and last
+/// Select N evenly distributed interior checkpoints.
+/// Uses positions at k/(n+1) for k in 1..=n:
+/// - n=1: middle (1/2)
+/// - n=2: 1/3rd and 2/3rd
+/// - n=3: 1/4th, 2/4th, 3/4th
 fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
     if n >= checkpoints.len() {
         return checkpoints.to_vec();
@@ -291,17 +295,14 @@ fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
     if n == 0 {
         return Vec::new();
     }
-    if n == 1 {
-        return vec![checkpoints.last().expect("non-empty").clone()];
-    }
 
+    let len = checkpoints.len();
     let mut selected = Vec::with_capacity(n);
-    let step = (checkpoints.len() - 1) as f64 / (n - 1) as f64;
 
-    for i in 0..n {
-        #[expect(clippy::cast_sign_loss, reason = "step is always positive")]
-        let idx = (i as f64 * step).round() as usize;
-        selected.push(checkpoints[idx.min(checkpoints.len() - 1)].clone());
+    for k in 1..=n {
+        // Position at k/(n+1) of the array
+        let idx = ((len * k) / (n + 1)).min(len - 1);
+        selected.push(checkpoints[idx].clone());
     }
 
     selected
@@ -349,10 +350,10 @@ fn get_best_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
     })
 }
 
-/// Select checkpoints with priority: best, latest, then evenly distributed
-/// - limit 1: best only
-/// - limit 2: best + latest
-/// - limit 3+: best + latest + (n-2) evenly distributed from remaining
+/// Select checkpoints with priority: best, latest, then evenly distributed.
+/// Deduplication of best/latest does not count against limit.
+/// - limit 1: best only (or latest as fallback)
+/// - limit 2+: best + latest (deduplicated) + evenly distributed from remaining
 fn select_checkpoints_with_priority(
     checkpoints_dir: &Path,
     checkpoints: &[PathBuf],
@@ -365,55 +366,39 @@ fn select_checkpoints_with_priority(
     let best = get_best_checkpoint(checkpoints_dir);
     let latest = checkpoints.last().cloned();
 
-    match limit {
-        1 => {
-            // Just best (or latest as final fallback)
-            best.or(latest).into_iter().collect()
-        }
-        2 => {
-            // Best + latest (deduplicated if same)
-            let mut result = Vec::new();
-            if let Some(b) = &best {
-                result.push(b.clone());
-            }
-            if let Some(l) = &latest {
-                if best.as_ref() != Some(l) {
-                    result.push(l.clone());
-                }
-            }
-            result
-        }
-        _ => {
-            // Best + latest + (n-2) evenly distributed from remaining
-            let mut result = Vec::new();
-            let mut excluded: HashSet<PathBuf> = HashSet::new();
+    if limit == 1 {
+        // Just best (or latest as final fallback)
+        return best.or(latest).into_iter().collect();
+    }
 
-            if let Some(b) = &best {
-                result.push(b.clone());
-                excluded.insert(b.clone());
-            }
-            if let Some(l) = &latest {
-                if !excluded.contains(l) {
-                    result.push(l.clone());
-                    excluded.insert(l.clone());
-                }
-            }
+    // Best + latest (deduplicated) + evenly distributed from remaining
+    let mut result = Vec::new();
+    let mut excluded: HashSet<PathBuf> = HashSet::new();
 
-            // Get remaining checkpoints (excluding best and latest)
-            let remaining: Vec<PathBuf> = checkpoints
-                .iter()
-                .filter(|c| !excluded.contains(*c))
-                .cloned()
-                .collect();
-
-            // Select (limit - result.len()) evenly from remaining
-            let extra_needed = limit.saturating_sub(result.len());
-            let extra = select_evenly_spaced(&remaining, extra_needed);
-            result.extend(extra);
-
-            result
+    if let Some(b) = &best {
+        result.push(b.clone());
+        excluded.insert(b.clone());
+    }
+    if let Some(l) = &latest {
+        if !excluded.contains(l) {
+            result.push(l.clone());
+            excluded.insert(l.clone());
         }
     }
+
+    // Get remaining checkpoints (excluding best and latest)
+    let remaining: Vec<PathBuf> = checkpoints
+        .iter()
+        .filter(|c| !excluded.contains(*c))
+        .cloned()
+        .collect();
+
+    // Select (limit - result.len()) evenly from remaining
+    let extra_needed = limit.saturating_sub(result.len());
+    let extra = select_evenly_spaced(&remaining, extra_needed);
+    result.extend(extra);
+
+    result
 }
 
 /// Compute display names for a list of paths.
@@ -2490,16 +2475,25 @@ mod tests {
             .map(|i| PathBuf::from(format!("step_{i}")))
             .collect();
 
-        // Select 3 from 10: should get 0, 4/5, 9
+        // Select 3 from 10: interior points at 1/4, 2/4, 3/4
+        // indices: 10*1/4=2, 10*2/4=5, 10*3/4=7
         let selected = select_evenly_spaced(&paths, 3);
         assert_eq!(selected.len(), 3);
-        assert_eq!(selected[0], paths[0]); // First
-        assert_eq!(selected[2], paths[9]); // Last
+        assert_eq!(selected[0], paths[2]); // 1/4
+        assert_eq!(selected[1], paths[5]); // 2/4 (middle)
+        assert_eq!(selected[2], paths[7]); // 3/4
 
-        // Select 1: should get last
+        // Select 1: should get middle (10*1/2=5)
         let selected = select_evenly_spaced(&paths, 1);
         assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0], paths[9]);
+        assert_eq!(selected[0], paths[5]);
+
+        // Select 2 from 10: interior points at 1/3, 2/3
+        // indices: 10*1/3=3, 10*2/3=6
+        let selected = select_evenly_spaced(&paths, 2);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0], paths[3]); // 1/3
+        assert_eq!(selected[1], paths[6]); // 2/3
 
         // Select more than available: get all
         let selected = select_evenly_spaced(&paths, 20);
@@ -3993,9 +3987,11 @@ mod tests {
         let checkpoints = enumerate_checkpoints(temp.path()).unwrap();
         let selected = select_checkpoints_with_priority(temp.path(), &checkpoints, 2);
 
-        // When best == latest, should only get 1 checkpoint (deduplicated)
-        assert_eq!(selected.len(), 1);
-        assert!(selected[0].ends_with("step_300"));
+        // When best == latest, deduplication doesn't count against limit
+        // Should get 2: best/latest (step_300) + 1 from remaining middle
+        assert_eq!(selected.len(), 2);
+        assert!(selected[0].ends_with("step_300")); // best/latest
+        assert!(selected[1].ends_with("step_200")); // middle of remaining [100, 200]
     }
 
     #[test]
