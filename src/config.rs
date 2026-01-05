@@ -287,6 +287,10 @@ pub struct TournamentArgs {
     /// Save results to JSON file
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
+
+    /// Generate and display a graph of ratings over training steps
+    #[arg(long)]
+    pub graph: bool,
 }
 
 /// Legacy alias for backward compatibility

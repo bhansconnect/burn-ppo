@@ -37,6 +37,9 @@ rayon = "1.10"
 # Skill rating (Weng-Lin/OpenSkill for tournaments)
 skillratings = "0.28"
 
+# Plotting (for tournament graphs)
+plotters = "0.3"
+
 # Profiling (Tracy integration, only our code - not dependencies)
 tracy-client = { version = "0.18", optional = true }
 itertools = "0.14.0"

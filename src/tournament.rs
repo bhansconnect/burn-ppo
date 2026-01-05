@@ -8,11 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use burn::tensor::backend::Backend;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use itertools::Itertools;
+use plotters::backend::BitMapBackend;
+use plotters::prelude::*;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -1120,6 +1123,227 @@ fn ordinal(n: usize) -> String {
     format!("{n}{suffix}")
 }
 
+/// Extract training step from contestant name
+fn extract_step(name: &str) -> Option<usize> {
+    let step_part = name.rsplit('/').next().unwrap_or(name);
+    step_part.strip_prefix("step_").and_then(|s| {
+        let trimmed = s.trim_start_matches('0');
+        if trimmed.is_empty() {
+            Some(0)
+        } else {
+            trimmed.parse().ok()
+        }
+    })
+}
+
+/// Extract run identifier from display name
+fn extract_run_id(name: &str) -> &str {
+    // "A/.../step_001" -> "A", "step_001" -> ""
+    if let Some(idx) = name.find("/.../") {
+        &name[..idx]
+    } else if name.starts_with("step_") {
+        ""
+    } else if let Some(idx) = name.rfind('/') {
+        &name[..idx]
+    } else {
+        ""
+    }
+}
+
+/// Format step number for axis labels (e.g., 10240 -> "10k")
+fn format_step(step: usize) -> String {
+    if step >= 1_000_000 {
+        format!("{}M", step / 1_000_000)
+    } else if step >= 1_000 {
+        format!("{}k", step / 1_000)
+    } else {
+        step.to_string()
+    }
+}
+
+/// Generate and display a rating graph for tournament contestants
+fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
+    // Helper for x-axis label formatting (must be defined before use)
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x-axis values are non-negative training steps"
+    )]
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "plotters API requires &f64 for label formatters"
+    )]
+    fn format_x_label(x: &f64) -> String {
+        format_step(x.max(0.0) as usize)
+    }
+
+    // 1. Separate checkpoints from random player
+    let (checkpoints, random): (Vec<_>, Vec<_>) = contestants
+        .iter()
+        .partition(|c| matches!(c.source, PlayerSource::Checkpoint(_)));
+
+    if checkpoints.is_empty() {
+        println!("No checkpoints to graph");
+        return Ok(());
+    }
+
+    // 2. Extract data: (step, rating, lower, upper, run_id)
+    let mut data: Vec<(usize, f64, f64, f64, String)> = checkpoints
+        .iter()
+        .filter_map(|c| {
+            let step = extract_step(&c.name)?;
+            let sigma = c.rating.uncertainty;
+            let lower = c.rating.rating - 2.0 * sigma;
+            let upper = c.rating.rating + 2.0 * sigma;
+            let run = extract_run_id(&c.name).to_string();
+            Some((step, c.rating.rating, lower, upper, run))
+        })
+        .collect();
+
+    if data.is_empty() {
+        println!("No checkpoints with parseable step numbers to graph");
+        return Ok(());
+    }
+
+    // 3. Sort by step
+    data.sort_by_key(|(step, ..)| *step);
+
+    // 4. Group by run
+    let mut runs: HashMap<String, Vec<(usize, f64, f64, f64)>> = HashMap::new();
+    for (step, rating, lower, upper, run) in data {
+        runs.entry(run)
+            .or_default()
+            .push((step, rating, lower, upper));
+    }
+
+    // 5. Calculate axis ranges
+    let all_points: Vec<_> = runs.values().flatten().collect();
+    let x_min = all_points.iter().map(|(s, ..)| *s).min().unwrap_or(0);
+    let x_max = all_points.iter().map(|(s, ..)| *s).max().unwrap_or(1);
+    let y_min = all_points
+        .iter()
+        .map(|(_, _, l, _)| *l)
+        .fold(f64::MAX, f64::min);
+    let y_max = all_points
+        .iter()
+        .map(|(_, _, _, u)| *u)
+        .fold(f64::MIN, f64::max);
+
+    // Include random baseline in y range
+    let random_rating = random.first().map(|r| r.rating.rating);
+    let y_min = random_rating.map_or(y_min, |r| y_min.min(r - 1.0));
+    let y_max = random_rating.map_or(y_max, |r| y_max.max(r + 1.0));
+
+    // Add padding to y range
+    let y_range = y_max - y_min;
+    let y_min = y_min - y_range * 0.05;
+    let y_max = y_max + y_range * 0.05;
+
+    // 6. Create temp file
+    let temp_path = std::env::temp_dir().join(format!(
+        "tournament_rating_{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ));
+
+    // 7. Create chart
+    let root = BitMapBackend::new(&temp_path, (1200, 800)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Rating by Training Step", ("sans-serif", 30))
+        .margin(20)
+        .x_label_area_size(50)
+        .y_label_area_size(60)
+        .build_cartesian_2d(x_min as f64..x_max as f64, y_min..y_max)?;
+
+    chart
+        .configure_mesh()
+        .x_label_formatter(&format_x_label)
+        .y_label_formatter(&|y| format!("{y:.1}"))
+        .x_desc("Training Step")
+        .y_desc("Rating")
+        .draw()?;
+
+    // 8. Define colors for runs
+    let colors = [BLUE, RED, GREEN, MAGENTA, CYAN];
+
+    for (i, (run_name, points)) in runs.iter().enumerate() {
+        let color = colors[i % colors.len()];
+
+        // Sort points by step for this run
+        let mut points = points.clone();
+        points.sort_by_key(|(s, ..)| *s);
+
+        // Draw confidence band (filled area)
+        let upper_bound: Vec<_> = points.iter().map(|(s, _, _, u)| (*s as f64, *u)).collect();
+        let lower_bound: Vec<_> = points.iter().map(|(s, _, l, _)| (*s as f64, *l)).collect();
+
+        // Create polygon for filled area
+        let mut polygon: Vec<(f64, f64)> = upper_bound.clone();
+        polygon.extend(lower_bound.iter().rev());
+
+        chart.draw_series(std::iter::once(Polygon::new(
+            polygon,
+            color.mix(0.2).filled(),
+        )))?;
+
+        // Draw rating line
+        let rating_line: Vec<_> = points.iter().map(|(s, r, _, _)| (*s as f64, *r)).collect();
+        let label = if run_name.is_empty() {
+            "rating"
+        } else {
+            run_name
+        };
+
+        chart
+            .draw_series(LineSeries::new(rating_line, color.stroke_width(2)))?
+            .label(label)
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+            });
+    }
+
+    // 9. Draw random baseline if present
+    if let Some(rr) = random_rating {
+        chart
+            .draw_series(LineSeries::new(
+                vec![(x_min as f64, rr), (x_max as f64, rr)],
+                BLACK.stroke_width(2),
+            ))?
+            .label("random")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.stroke_width(2)));
+    }
+
+    // 10. Draw legend
+    chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
+        .position(SeriesLabelPosition::UpperLeft)
+        .draw()?;
+
+    root.present()?;
+
+    // 11. Print path and open
+    println!("\nGraph saved to: {}", temp_path.display());
+
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(&temp_path).spawn();
+
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("xdg-open").arg(&temp_path).spawn();
+
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(&temp_path)
+        .spawn();
+
+    Ok(())
+}
+
 /// Build tournament results for JSON export
 fn build_results(
     contestants: &[Contestant],
@@ -1630,6 +1854,13 @@ fn run_tournament_env<B: Backend, E: Environment>(
     // Final summary
     print_rating_guide();
     print_final_summary(contestants, num_rounds, args.num_games);
+
+    // Graph output if requested
+    if args.graph {
+        if let Err(e) = generate_rating_graph(contestants) {
+            eprintln!("Failed to generate graph: {e}");
+        }
+    }
 
     // JSON output if requested
     if let Some(output_path) = &args.output {
@@ -2339,6 +2570,7 @@ mod tests {
             output: None,
             seed: Some(42),
             random: false,
+            graph: false,
         };
 
         let results = build_results(&contestants, &pods, 1, &args, "connect_four");
@@ -2375,6 +2607,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let results = build_results(&contestants, &[], 1, &args, "cartpole");
@@ -2405,6 +2638,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let results = build_results(&contestants, &[], 3, &args, "connect_four");
@@ -2434,6 +2668,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2465,6 +2700,7 @@ mod tests {
             output: None,
             seed: None,
             random: true, // Add random player
+            graph: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2497,6 +2733,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2528,6 +2765,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2552,6 +2790,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let result = discover_contestants(&args);
@@ -2581,6 +2820,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         // Empty dir isn't a valid checkpoint or checkpoints dir
@@ -2646,6 +2886,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2707,6 +2948,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2809,6 +3051,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let results = build_results(&contestants, &[], 1, &args, "test_env");
@@ -2919,6 +3162,7 @@ mod tests {
             output: None,
             seed: None,
             random: false,
+            graph: false,
         };
 
         let results = build_results(&contestants, &pods, 2, &args, "test");
