@@ -419,20 +419,26 @@ where
             }
         }
 
-        // Learning rate annealing (using total updates for proper continuation)
+        // Learning rate annealing (decay to final value, default 10% of initial)
         let lr = if config.lr_anneal {
             let actual_update = update_offset + update;
             let progress_frac = actual_update as f64 / total_updates as f64;
-            config.learning_rate * (1.0 - progress_frac)
+            let final_lr = config
+                .learning_rate_final
+                .unwrap_or(config.learning_rate * 0.1);
+            config.learning_rate + (final_lr - config.learning_rate) * progress_frac
         } else {
             config.learning_rate
         };
 
-        // Entropy coefficient annealing (decay to 10% of initial value)
+        // Entropy coefficient annealing (decay to final value, default 10% of initial)
         let ent_coef = if config.entropy_anneal {
             let actual_update = update_offset + update;
             let progress_frac = actual_update as f64 / total_updates as f64;
-            config.entropy_coef * progress_frac.mul_add(-0.9, 1.0) // Decay to 10% of initial
+            let final_coef = config
+                .entropy_coef_final
+                .unwrap_or(config.entropy_coef * 0.1);
+            config.entropy_coef + (final_coef - config.entropy_coef) * progress_frac
         } else {
             config.entropy_coef
         };

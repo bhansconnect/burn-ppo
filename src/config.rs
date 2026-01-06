@@ -120,6 +120,10 @@ pub struct TrainArgs {
     #[arg(long)]
     pub lr_anneal: Option<bool>,
 
+    /// Final learning rate when annealing (defaults to 10% of initial)
+    #[arg(long)]
+    pub learning_rate_final: Option<f64>,
+
     #[arg(long)]
     pub gamma: Option<f64>,
 
@@ -139,6 +143,10 @@ pub struct TrainArgs {
     /// Enable entropy coefficient annealing
     #[arg(long, action = clap::ArgAction::Set)]
     pub entropy_anneal: Option<bool>,
+
+    /// Final entropy coefficient when annealing (defaults to 10% of initial)
+    #[arg(long)]
+    pub entropy_coef_final: Option<f64>,
 
     #[arg(long)]
     pub value_coef: Option<f64>,
@@ -376,6 +384,9 @@ pub struct Config {
     pub learning_rate: f64,
     #[serde(default = "default_true")]
     pub lr_anneal: bool,
+    /// Final learning rate when annealing (None = 10% of initial)
+    #[serde(default)]
+    pub learning_rate_final: Option<f64>,
     #[serde(default = "default_gamma")]
     pub gamma: f64,
     #[serde(default = "default_gae_lambda")]
@@ -390,6 +401,9 @@ pub struct Config {
     /// When true, decays from `entropy_coef` to 10% of initial value
     #[serde(default)]
     pub entropy_anneal: bool,
+    /// Final entropy coefficient when annealing (None = 10% of initial)
+    #[serde(default)]
+    pub entropy_coef_final: Option<f64>,
     #[serde(default = "default_value_coef")]
     pub value_coef: f64,
     #[serde(default = "default_max_grad_norm")]
@@ -553,12 +567,14 @@ impl Default for Config {
             num_steps: default_num_steps(),
             learning_rate: default_learning_rate(),
             lr_anneal: default_true(),
+            learning_rate_final: None,
             gamma: default_gamma(),
             gae_lambda: default_gae_lambda(),
             clip_epsilon: default_clip_epsilon(),
             clip_value: default_true(),
             entropy_coef: default_entropy_coef(),
             entropy_anneal: false,
+            entropy_coef_final: None,
             value_coef: default_value_coef(),
             max_grad_norm: default_max_grad_norm(),
             target_kl: None,
@@ -648,6 +664,9 @@ impl Config {
         if let Some(v) = args.lr_anneal {
             self.lr_anneal = v;
         }
+        if let Some(v) = args.learning_rate_final {
+            self.learning_rate_final = Some(v);
+        }
         if let Some(v) = args.gamma {
             self.gamma = v;
         }
@@ -665,6 +684,9 @@ impl Config {
         }
         if let Some(v) = args.entropy_anneal {
             self.entropy_anneal = v;
+        }
+        if let Some(v) = args.entropy_coef_final {
+            self.entropy_coef_final = Some(v);
         }
         if let Some(v) = args.value_coef {
             self.value_coef = v;
@@ -787,6 +809,9 @@ impl Config {
         if args.lr_anneal.is_some() {
             ignored.push("--lr-anneal");
         }
+        if args.learning_rate_final.is_some() {
+            ignored.push("--learning-rate-final");
+        }
         if args.gamma.is_some() {
             ignored.push("--gamma");
         }
@@ -804,6 +829,9 @@ impl Config {
         }
         if args.entropy_anneal.is_some() {
             ignored.push("--entropy-anneal");
+        }
+        if args.entropy_coef_final.is_some() {
+            ignored.push("--entropy-coef-final");
         }
         if args.value_coef.is_some() {
             ignored.push("--value-coef");
