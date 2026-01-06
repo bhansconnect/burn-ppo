@@ -40,7 +40,3 @@ log_freq = 5_000
 
 # Experiment
 seed = 42
-
-challenger_eval = true
-challenger_games = 64
-challenger_threshold = 0.55

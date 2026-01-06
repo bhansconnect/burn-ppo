@@ -55,7 +55,7 @@ pub struct CheckpointMetadata {
     pub split_networks: bool,
     /// Environment name for dispatching at eval time
     pub env_name: String,
-    /// Training skill rating (Weng-Lin mu) for challenger evaluation
+    /// Training skill rating (Weng-Lin mu) for pool evaluation
     /// Rating accumulates across promotions
     #[serde(default = "default_rating")]
     pub training_rating: f64,
@@ -94,7 +94,7 @@ impl CheckpointManager {
     ///
     /// If `update_best` is true, updates the "best" symlink if this checkpoint
     /// has a higher `avg_return` than the previous best. Set to false when using
-    /// challenger evaluation to control best selection manually.
+    /// pool evaluation to control best selection manually.
     ///
     /// Returns the path to the saved checkpoint directory
     pub fn save<B: burn::tensor::backend::Backend>(
@@ -192,22 +192,6 @@ impl CheckpointManager {
         self.best_avg_return = value;
     }
 
-    /// Manually promote a checkpoint to best
-    ///
-    /// Used by challenger evaluation to update best based on head-to-head win rate
-    /// rather than average return.
-    pub fn promote_to_best(&mut self, checkpoint_dir: &Path) -> Result<()> {
-        self.update_symlink("best", checkpoint_dir)
-    }
-
-    /// Get the full path to the best checkpoint symlink
-    ///
-    /// Returns the path to the "best" symlink (not the resolved target).
-    /// Use this to check if a best checkpoint exists.
-    pub fn best_checkpoint_path(&self) -> PathBuf {
-        self.checkpoints_dir.join("best")
-    }
-
     /// Update a symlink atomically
     fn update_symlink(&self, name: &str, target: &Path) -> Result<()> {
         let link_path = self.checkpoints_dir.join(name);
@@ -242,18 +226,6 @@ pub fn load_metadata(checkpoint_path: &Path) -> Result<CheckpointMetadata> {
     let metadata_json =
         std::fs::read_to_string(&metadata_path).context("Failed to read checkpoint metadata")?;
     serde_json::from_str(&metadata_json).context("Failed to parse checkpoint metadata")
-}
-
-/// Update the training rating fields in a checkpoint's metadata
-///
-/// This modifies only the metadata.json file without touching model weights.
-pub fn update_training_rating(checkpoint_path: &Path, rating: f64, uncertainty: f64) -> Result<()> {
-    let mut metadata = load_metadata(checkpoint_path)?;
-    metadata.training_rating = rating;
-    metadata.training_uncertainty = uncertainty;
-    let metadata_path = checkpoint_path.join("metadata.json");
-    let metadata_json = serde_json::to_string_pretty(&metadata)?;
-    fs::write(&metadata_path, metadata_json).context("Failed to write checkpoint metadata")
 }
 
 /// Save optimizer state to a checkpoint directory

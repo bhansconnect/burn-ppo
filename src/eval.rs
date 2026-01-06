@@ -612,30 +612,6 @@ impl EvalStats {
     }
 }
 
-/// Result of challenger evaluation between current model and best checkpoint
-#[derive(Debug, Clone)]
-pub struct ChallengerResult {
-    /// Average Swiss points for current (challenger) model
-    /// Swiss points = `num_players` - `avg_position` (higher = better)
-    pub current_avg_points: f64,
-    /// Average Swiss points for best checkpoint model
-    pub best_avg_points: f64,
-    /// Draw rate (0.0 - 1.0) - all players tied for 1st
-    pub draw_rate: f64,
-    /// Current model's skill rating (Weng-Lin mu) after evaluation
-    pub current_rating: f64,
-    /// Current model's skill uncertainty (Weng-Lin sigma) after evaluation
-    pub current_uncertainty: f64,
-    /// Best model's skill rating (Weng-Lin mu) after evaluation
-    pub best_rating: f64,
-    /// Best model's skill uncertainty (Weng-Lin sigma) after evaluation
-    pub best_uncertainty: f64,
-    /// Whether current model should be promoted to best
-    pub should_promote: bool,
-    /// Time taken for evaluation in milliseconds
-    pub elapsed_ms: u64,
-}
-
 /// Get ordinal suffix (1st, 2nd, 3rd, 4th, ...)
 fn ordinal(n: usize) -> String {
     let suffix = match n % 10 {
@@ -677,60 +653,119 @@ pub fn load_model_from_checkpoint<B: Backend>(
     Ok((model, metadata, normalizer))
 }
 
-/// Run challenger evaluation: current model vs best checkpoint
+/// Run pool evaluation: current model vs sampled historical opponents
 ///
-/// Plays `num_games` games between the current model and the best checkpoint,
-/// with position swapping for fairness in 2-player games.
+/// Plays `num_games` games between the current model and opponents sampled from the pool.
+/// Each game has the learner at position 0 with (num_players-1) different opponents.
+/// Position permutations are handled by `run_stats_mode_env`.
 ///
-/// The `best_rating` and `best_uncertainty` parameters are the Weng-Lin rating
-/// of the best checkpoint (from its metadata). The current model starts with the
-/// same rating and updates based on match results. Rating accumulates across promotions.
-///
-/// Returns a `ChallengerResult` indicating whether the current model should be promoted.
-pub fn run_challenger_eval<B: Backend, E: Environment>(
+/// Returns a `PoolEvalResult` with rating updates and statistics.
+pub fn run_pool_eval<B: Backend, E: Environment>(
     current_model: &ActorCritic<B>,
     current_normalizer: Option<&ObsNormalizer>,
-    best_checkpoint_path: &Path,
-    best_rating: f64,
-    best_uncertainty: f64,
+    opponent_pool: &mut crate::opponent_pool::OpponentPool<B>,
     num_games: usize,
-    threshold: f64,
+    num_opponents_to_sample: usize,
     config: &Config,
     device: &B::Device,
     seed: u64,
-) -> Result<ChallengerResult> {
+    current_step: usize,
+    // Temperature parameters for pool evaluation
+    temp: Option<f32>, // None = use E::DEFAULT_TEMP
+    temp_final: f32,
+    temp_cutoff: Option<usize>,
+    temp_decay: bool,
+) -> Result<crate::opponent_pool::PoolEvalResult> {
+    use crate::opponent_pool::PoolEvalResult;
+
     profile_function!();
     let start = Instant::now();
     let num_players = E::NUM_PLAYERS;
 
-    // Load best checkpoint model and normalizer
-    let best_config = Config {
-        hidden_size: config.hidden_size,
-        num_hidden: config.num_hidden,
-        ..Config::default()
-    };
-    let (best_model, _) = CheckpointManager::load::<B>(best_checkpoint_path, &best_config, device)?;
-    let best_normalizer = load_normalizer(best_checkpoint_path)?;
+    // Check we have enough opponents in the pool
+    if opponent_pool.num_available() == 0 {
+        return Ok(PoolEvalResult {
+            current_avg_points: 0.0,
+            vs_best_margin: 0.0,
+            current_rating: 25.0,
+            current_uncertainty: 25.0 / 3.0,
+            draw_rate: 0.0,
+            games_played: 0,
+            num_opponents: 0,
+            elapsed_ms: 0,
+        });
+    }
 
-    // Setup models and checkpoint mapping
-    // models = [new, best], checkpoint_to_model = [0, 1, 1, 1, ...]
-    // This means: checkpoint 0 = new model, checkpoints 1..N-1 = best model
-    let models = vec![Some(current_model.clone()), Some(best_model)];
-    let normalizers = vec![current_normalizer.cloned(), best_normalizer];
-    let checkpoint_to_model: Vec<usize> = (0..num_players).map(|i| usize::from(i != 0)).collect();
-    let names: Vec<String> = (0..num_players)
-        .map(|i| if i == 0 { "new".into() } else { "best".into() })
+    // Sample opponents for evaluation (always includes highest-rated)
+    let sampled_indices = opponent_pool.sample_eval_opponents(num_opponents_to_sample);
+    let num_sampled = sampled_indices.len();
+
+    // Track which index is the "best" (highest-rated) for vs_best metrics
+    let best_idx = opponent_pool.highest_rated();
+
+    // Get opponent data (paths and ratings)
+    let opponent_data = opponent_pool.get_opponents_for_eval(&sampled_indices);
+
+    // Load opponent models
+    let mut opponent_models: Vec<ActorCritic<B>> = Vec::with_capacity(num_sampled);
+    let mut opponent_normalizers: Vec<Option<ObsNormalizer>> = Vec::with_capacity(num_sampled);
+
+    for (path, _rating) in &opponent_data {
+        let (model, _) = CheckpointManager::load::<B>(path, config, device)
+            .with_context(|| format!("Failed to load opponent from {}", path.display()))?;
+        let normalizer = load_normalizer(path)?;
+        opponent_models.push(model);
+        opponent_normalizers.push(normalizer);
+    }
+
+    // For each game, we need (num_players - 1) opponents
+    // We'll cycle through sampled opponents to fill slots
+    // Setup: current model is checkpoint 0, opponents are checkpoints 1..num_sampled+1
+    // But run_stats_mode_env expects checkpoint_to_model mapping
+
+    // Build models array: [current_model, opp0, opp1, ...]
+    let mut models: Vec<Option<ActorCritic<B>>> = vec![Some(current_model.clone())];
+    for opp_model in opponent_models {
+        models.push(Some(opp_model));
+    }
+
+    let mut normalizers: Vec<Option<ObsNormalizer>> = vec![current_normalizer.cloned()];
+    for opp_norm in opponent_normalizers {
+        normalizers.push(opp_norm);
+    }
+
+    // checkpoint_to_model: player 0 = current (model 0), players 1..N = opponents (cycle through)
+    // For a 4-player game with 3 opponents: [0, 1, 2, 3] or cycle if fewer
+    let checkpoint_to_model: Vec<usize> = (0..num_players)
+        .map(|i| {
+            if i == 0 {
+                0 // Current model
+            } else {
+                // Cycle through opponents: 1, 2, 3, 1, 2, 3, ...
+                ((i - 1) % num_sampled) + 1
+            }
+        })
         .collect();
 
-    // Create temperature schedule from config
-    let temp_schedule = TempSchedule::new(
-        config.challenger_temp,
-        config.challenger_temp_final.unwrap_or(0.0),
-        config.challenger_temp_cutoff,
-        config.challenger_temp_decay,
-    );
+    let names: Vec<String> = (0..num_players)
+        .map(|i| {
+            if i == 0 {
+                "current".to_string()
+            } else {
+                let opp_idx = (i - 1) % num_sampled;
+                opponent_data.get(opp_idx).map_or_else(
+                    || format!("opp{opp_idx}"),
+                    |(_, r)| r.checkpoint_name.clone(),
+                )
+            }
+        })
+        .collect();
 
-    // Run games - stats mode handles position permutations
+    // Create temperature schedule (use environment default if not specified)
+    let initial_temp = temp.unwrap_or(E::DEFAULT_TEMP);
+    let temp_schedule = TempSchedule::new(initial_temp, temp_final, temp_cutoff, temp_decay);
+
+    // Run games
     let num_envs = num_games.min(64);
     let mut rng = StdRng::seed_from_u64(seed);
     let stats = run_stats_mode_env::<B, E>(
@@ -746,16 +781,50 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         true, // silent
     );
 
-    // Compute average Swiss points per player from game outcomes
+    // Compute statistics
     let total_games = stats.game_outcomes.len();
     let mut current_total_points = 0.0;
-    let mut best_total_points = 0.0;
+    let mut vs_best_margin_total = 0.0;
     let mut draw_count = 0usize;
+
+    // Determine which player position has the best opponent
+    // Since sample_eval_opponents always puts best first, and player 1 uses model 1 (sampled[0]),
+    // player 1 is always the best opponent
+    let best_player_position: Option<usize> = best_idx.and_then(|bi| {
+        if sampled_indices.first() == Some(&bi) {
+            Some(1) // Player 1 uses model 1 = sampled[0] = best
+        } else {
+            None
+        }
+    });
+
+    // Track per-opponent results for rating updates
+    // opponent_results[opp_idx] = (games, points_for_current, points_for_opponent)
+    let mut opponent_results: Vec<(usize, f64, f64)> = vec![(0, 0.0, 0.0); num_sampled];
 
     for outcome in &stats.game_outcomes {
         let points = calculate_swiss_points(&outcome.0);
         current_total_points += points[0]; // Current model at position 0
-        best_total_points += points[1]; // Best model at position 1
+
+        // Track margin vs best opponent (current_points - best_points)
+        if let Some(best_pos) = best_player_position {
+            vs_best_margin_total += points[0] - points[best_pos];
+        }
+
+        // Track results per opponent (for rating updates)
+        // Iterate over all opponent player positions (1 to num_players-1)
+        for player in 1..num_players {
+            // Get which model this player position is using
+            let model_idx = checkpoint_to_model.get(player).copied().unwrap_or(1);
+            if model_idx > 0 && model_idx <= num_sampled {
+                let actual_opp = model_idx - 1;
+                if actual_opp < opponent_results.len() {
+                    opponent_results[actual_opp].0 += 1;
+                    opponent_results[actual_opp].1 += points[0]; // Current's points
+                    opponent_results[actual_opp].2 += points[player]; // Opponent's points
+                }
+            }
+        }
 
         // Draw = all tied for 1st
         if outcome.0.iter().all(|&p| p == 1) {
@@ -763,72 +832,105 @@ pub fn run_challenger_eval<B: Backend, E: Environment>(
         }
     }
 
-    let (current_avg_points, best_avg_points, draw_rate) = if total_games > 0 {
+    let (current_avg_points, vs_best_margin, draw_rate) = if total_games > 0 {
         (
             current_total_points / total_games as f64,
-            best_total_points / total_games as f64,
+            vs_best_margin_total / total_games as f64,
             draw_count as f64 / total_games as f64,
         )
     } else {
         (0.0, 0.0, 0.0)
     };
 
-    // Compute Weng-Lin ratings using weng_lin_multi_team (N-player compatible)
+    // Compute current network's rating using Weng-Lin
     let wl_config = WengLinConfig::new();
 
-    // For challenger eval, current starts with best's rating, best is anchored
-    let mut current = WengLinRating {
-        rating: best_rating,
-        uncertainty: best_uncertainty,
-    };
-    let best_rating_obj = WengLinRating {
-        rating: best_rating,
-        uncertainty: best_uncertainty,
-    };
+    // Start with learner's current rating from pool (persisted across evaluations)
+    let mut current = *opponent_pool.learner_rating();
 
-    // Shuffle games to avoid completion-order bias
+    // Create opponent ratings map for updates
+    let mut opp_ratings: Vec<WengLinRating> = opponent_data
+        .iter()
+        .map(|(_, r)| WengLinRating {
+            rating: r.rating_mu,
+            uncertainty: r.rating_sigma,
+        })
+        .collect();
+
+    // Shuffle outcomes to avoid completion-order bias
     let mut outcomes = stats.game_outcomes.clone();
-    let seed = outcomes.len() as u64;
-    let mut shuffle_rng = StdRng::seed_from_u64(seed);
-    outcomes.shuffle(&mut shuffle_rng);
+    outcomes.shuffle(&mut rng);
 
-    // Process each game using weng_lin_multi_team for N-player compatibility
+    // Process each game
     for outcome in &outcomes {
-        // Build rating groups: current at position 0, best at position 1
+        // Build rating groups for weng_lin_multi_team
         let current_arr = [current];
-        let best_arr = [best_rating_obj];
 
-        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = vec![
-            (&current_arr[..], MultiTeamOutcome::new(outcome.0[0])),
-            (&best_arr[..], MultiTeamOutcome::new(outcome.0[1])),
-        ];
+        // Build opponent rating arrays based on checkpoint_to_model mapping
+        let opp_arrs: Vec<[WengLinRating; 1]> = (1..num_players)
+            .map(|p| {
+                let model_idx = checkpoint_to_model[p];
+                if model_idx > 0 && model_idx <= num_sampled {
+                    [opp_ratings[model_idx - 1]]
+                } else {
+                    [current] // Fallback
+                }
+            })
+            .collect();
+
+        let mut rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> =
+            vec![(&current_arr[..], MultiTeamOutcome::new(outcome.0[0]))];
+
+        for (i, opp_arr) in opp_arrs.iter().enumerate() {
+            rating_groups.push((&opp_arr[..], MultiTeamOutcome::new(outcome.0[i + 1])));
+        }
 
         let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
-        // Only update current (best is anchored)
+
+        // Update current rating
         if !new_ratings[0].is_empty() {
             current = new_ratings[0][0];
         }
+
+        // Update opponent ratings
+        for (i, opp_new) in new_ratings.iter().enumerate().skip(1) {
+            if !opp_new.is_empty() {
+                let model_idx = checkpoint_to_model[i];
+                if model_idx > 0 && model_idx <= num_sampled {
+                    opp_ratings[model_idx - 1] = opp_new[0];
+                }
+            }
+        }
     }
+
+    // Build rating updates for the pool
+    let rating_updates: Vec<(usize, f64, f64, usize)> = sampled_indices
+        .iter()
+        .enumerate()
+        .map(|(i, &pool_idx)| {
+            (
+                pool_idx,
+                opp_ratings[i].rating,
+                opp_ratings[i].uncertainty,
+                total_games / num_sampled.max(1), // Approximate games per opponent
+            )
+        })
+        .collect();
+
+    // Update pool ratings (both learner and opponents)
+    opponent_pool.set_learner_rating(current);
+    opponent_pool.update_ratings_from_eval(&rating_updates, current_step);
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    // Promotion based on average points comparison with scaled margin
-    // threshold = 0.55 means "55%" in 2-player terms (5% margin above equal)
-    // Scale margin by point range so same confidence level applies to all player counts:
-    // - 2-player: margin = (0.55 - 0.5) * 1 = 0.05
-    // - 4-player: margin = (0.55 - 0.5) * 3 = 0.15
-    let margin = (threshold - 0.5) * (num_players - 1) as f64;
-    let should_promote = current_avg_points > best_avg_points + margin;
-
-    Ok(ChallengerResult {
+    Ok(PoolEvalResult {
         current_avg_points,
-        best_avg_points,
-        draw_rate,
+        vs_best_margin,
         current_rating: current.rating,
-        current_uncertainty: 25.0 / 3.0, // Reset sigma for new checkpoint
-        best_rating: best_rating_obj.rating,
-        best_uncertainty: best_rating_obj.uncertainty,
-        should_promote,
+        current_uncertainty: current.uncertainty,
+        draw_rate,
+        games_played: total_games,
+        num_opponents: num_sampled,
         elapsed_ms,
     })
 }
@@ -1614,7 +1716,7 @@ fn heap_permute(arr: &mut [usize], k: usize, result: &mut Vec<Vec<usize>>) {
 
 /// Stats mode implementation for a specific environment type
 ///
-/// When `silent` is true, suppresses output (used by challenger eval).
+/// When `silent` is true, suppresses output (used by pool eval).
 /// Returns `EvalStats` for further processing.
 ///
 /// Models can be `None` for random players - these will output uniform logits
@@ -2339,72 +2441,6 @@ mod tests {
     fn test_player_source_display_name_random() {
         let random = PlayerSource::Random;
         assert_eq!(random.display_name(), "Random");
-    }
-
-    #[test]
-    fn test_challenger_result_should_promote() {
-        // Current model outperforms best - should promote
-        // current_avg_points > best_avg_points
-        let result = ChallengerResult {
-            current_avg_points: 0.70, // Higher Swiss points = better
-            best_avg_points: 0.30,
-            draw_rate: 0.10,
-            current_rating: 5.0,
-            current_uncertainty: 6.0,
-            best_rating: -5.0,
-            best_uncertainty: 6.0,
-            should_promote: true,
-            elapsed_ms: 100,
-        };
-        assert!(result.should_promote);
-
-        // Current model underperforms best - should not promote
-        // current_avg_points < best_avg_points
-        let result2 = ChallengerResult {
-            current_avg_points: 0.30,
-            best_avg_points: 0.70,
-            draw_rate: 0.10,
-            current_rating: -5.0,
-            current_uncertainty: 6.0,
-            best_rating: 5.0,
-            best_uncertainty: 6.0,
-            should_promote: false,
-            elapsed_ms: 100,
-        };
-        assert!(!result2.should_promote);
-    }
-
-    #[test]
-    fn test_challenger_scaled_margin() {
-        // Test the scaled margin formula used for promotion decisions
-        // margin = (threshold - 0.5) * (num_players - 1)
-
-        let threshold = 0.55; // 55% threshold (5% margin in 2-player terms)
-
-        // 2-player: margin = (0.55 - 0.5) * 1 = 0.05
-        let num_players_2: i32 = 2;
-        let margin_2 = (threshold - 0.5) * f64::from(num_players_2 - 1);
-        assert!((margin_2 - 0.05).abs() < 1e-10);
-
-        // With best at 0.50, need > 0.55 to promote
-        let best_2 = 0.50;
-        assert!(0.56 > best_2 + margin_2); // Should promote
-        assert!(0.54 <= best_2 + margin_2); // Should not promote
-
-        // 4-player: margin = (0.55 - 0.5) * 3 = 0.15
-        let num_players_4: i32 = 4;
-        let margin_4 = (threshold - 0.5) * f64::from(num_players_4 - 1);
-        assert!((margin_4 - 0.15).abs() < 1e-10);
-
-        // With best at 1.50 (equal performance in 4-player), need > 1.65 to promote
-        let best_4 = 1.50;
-        assert!(1.70 > best_4 + margin_4); // Should promote
-        assert!(1.60 <= best_4 + margin_4); // Should not promote
-
-        // 3-player: margin = (0.55 - 0.5) * 2 = 0.10
-        let num_players_3: i32 = 3;
-        let margin_3 = (threshold - 0.5) * f64::from(num_players_3 - 1);
-        assert!((margin_3 - 0.10).abs() < 1e-10);
     }
 
     #[test]

@@ -40,8 +40,3 @@ log_freq = 10_000
 
 # Experiment
 seed = 42
-
-# Challenger evaluation - temp defaults to 1.0 for this env
-challenger_eval = true
-challenger_games = 128   # More games for 4-player variance
-challenger_threshold = 0.55

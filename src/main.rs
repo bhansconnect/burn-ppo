@@ -21,6 +21,7 @@ mod human;
 mod metrics;
 mod network;
 mod normalization;
+mod opponent_pool;
 mod ppo;
 mod profile;
 mod progress;
@@ -40,18 +41,20 @@ use clap::Parser;
 use rand::SeedableRng;
 
 use crate::checkpoint::{
-    load_metadata, load_normalizer, load_optimizer, load_rng_state, save_normalizer,
-    save_optimizer, save_rng_state, update_training_rating, CheckpointManager, CheckpointMetadata,
+    load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer,
+    save_rng_state, CheckpointManager, CheckpointMetadata,
 };
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_avg_points, Environment, GameOutcome, VecEnv};
 use crate::envs::{CartPole, ConnectFour, LiarsDice};
-use crate::eval::run_challenger_eval;
+use crate::eval::run_pool_eval;
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
+use crate::opponent_pool::{EnvState, OpponentPool};
 use crate::ppo::{
-    collect_rollouts, compute_gae, compute_gae_multiplayer, ppo_update, RolloutBuffer,
+    collect_rollouts, collect_rollouts_with_opponents, compute_gae, compute_gae_multiplayer,
+    ppo_update, RolloutBuffer,
 };
 use crate::progress::TrainingProgress;
 use crate::tournament::print_rating_guide;
@@ -64,17 +67,6 @@ fn extract_run_name_from_checkpoint_path(checkpoint_path: &std::path::Path) -> O
     // Navigate up from checkpoint: checkpoints/<name> -> checkpoints -> run_dir
     let run_dir = checkpoint_path.parent()?.parent()?;
     run_dir.file_name()?.to_str().map(String::from)
-}
-
-/// Get the step number from the best checkpoint symlink
-///
-/// Reads the symlink target and extracts the step number from the directory name.
-/// e.g., "`step_00010240`" -> 10240
-fn get_best_checkpoint_step(best_path: &std::path::Path) -> Option<usize> {
-    let target = std::fs::read_link(best_path).ok()?;
-    let name = target.file_name()?.to_str()?;
-    // Parse "step_XXXXXXXX" format
-    name.strip_prefix("step_").and_then(|s| s.parse().ok())
 }
 
 /// Count checkpoint directories in a run's checkpoints folder
@@ -308,8 +300,6 @@ where
     let mut checkpoint_manager = CheckpointManager::new(run_dir)?;
     checkpoint_manager.set_best_avg_return(best_return);
     let mut last_checkpoint_step = global_step;
-    let mut last_checkpoint_time = std::time::Instant::now();
-    let mut warned_challenger_eval_time = false;
 
     // Create initial checkpoint at step 0 for fresh training
     if matches!(mode, TrainingMode::Fresh) {
@@ -333,12 +323,6 @@ where
         };
 
         checkpoint_manager.save(&model, &metadata, true)?;
-
-        // Log initial challenger metrics for aim_watcher
-        logger.log_scalar("challenger/best_step", 0.0, 0)?;
-        logger.log_scalar("challenger/current_rating", 25.0, 0)?;
-        logger.log_scalar("challenger/best_rating", 25.0, 0)?;
-        logger.flush()?;
     }
 
     // Training state
@@ -380,6 +364,13 @@ where
     let mut gae_time_acc = std::time::Duration::ZERO;
     let mut update_time_acc = std::time::Duration::ZERO;
 
+    // Pool eval timing tracking (cumulative, not reset)
+    let mut total_pool_eval_time = std::time::Duration::ZERO;
+    let mut pool_eval_warning_shown = false;
+
+    // Last training metrics for checkpoint display
+    let mut last_metrics: Option<ppo::UpdateMetrics> = None;
+
     // Episode tracking for metrics (cleared on each log)
     let mut episodes_since_log: Vec<(f32, usize)> = Vec::new(); // (return, length)
 
@@ -396,6 +387,88 @@ where
     let mut recent_outcomes: VecDeque<GameOutcome> = VecDeque::with_capacity(100);
     // Per-player episode data for logging (cleared on each log)
     let mut episodes_since_log_mp: Vec<(Vec<f32>, Option<GameOutcome>)> = Vec::new();
+
+    // Opponent pool initialization (if enabled)
+    let mut opponent_pool: Option<OpponentPool<TB::InnerBackend>> =
+        if config.opponent_pool_enabled && num_players > 1 {
+            let checkpoints_dir = run_dir.join("checkpoints");
+
+            // Get initial learner rating from parent checkpoint if forked
+            let initial_learner_rating = config.forked_from.as_ref().and_then(|parent_path| {
+                checkpoint::load_metadata(std::path::Path::new(parent_path))
+                    .ok()
+                    .map(|meta| (meta.training_rating, meta.training_uncertainty))
+            });
+
+            match OpponentPool::new(
+                checkpoints_dir,
+                num_players_usize,
+                config.opponent_pool_sample_temperature,
+                config.clone(),
+                device.clone(),
+                config.seed,
+                initial_learner_rating,
+            ) {
+                Ok(pool) => {
+                    println!(
+                        "Opponent pool initialized with {} checkpoints",
+                        pool.num_available()
+                    );
+                    Some(pool)
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to initialize opponent pool: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    // Calculate number of opponent envs
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "opponent_pool_fraction is always positive"
+    )]
+    let num_opponent_envs = if opponent_pool.is_some() {
+        let raw = num_envs as f32 * config.opponent_pool_fraction;
+        if raw > 0.0 && raw < 1.0 {
+            eprintln!(
+                "Warning: opponent_pool_fraction ({:.1}%) of {} envs = {:.2} envs. \
+                 Rounding up to 1 env.",
+                config.opponent_pool_fraction * 100.0,
+                num_envs,
+                raw
+            );
+            1
+        } else {
+            raw as usize
+        }
+    } else {
+        0
+    };
+
+    // Initialize env states for opponent pool training
+    let mut env_states: Vec<EnvState> = if let Some(ref mut pool) = opponent_pool {
+        if pool.has_opponents() {
+            (0..num_opponent_envs)
+                .map(|_| {
+                    let opponents = pool.sample_all_slots();
+                    EnvState::new(num_players_usize, opponents, pool.rng_mut())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Track steps since last opponent rotation
+    let mut steps_since_rotation: usize = 0;
+
+    // Track steps since last pool evaluation
+    let mut last_pool_eval_step: usize = 0;
 
     // Training loop
     for update in 0..num_updates {
@@ -446,15 +519,76 @@ where
         // Collect rollouts using non-autodiff model for inference
         let rollout_start = std::time::Instant::now();
         let inference_model = model.valid();
-        let completed_episodes = collect_rollouts(
-            &inference_model,
-            &mut vec_env,
-            &mut buffer,
-            config.num_steps,
-            device,
-            &mut rng,
-            obs_normalizer.as_mut(),
-        );
+
+        // Use opponent pool collection if pool is active with opponents
+        let use_opponent_pool = opponent_pool
+            .as_ref()
+            .is_some_and(|p| p.has_opponents() && !env_states.is_empty());
+
+        let completed_episodes = if use_opponent_pool {
+            let pool = opponent_pool
+                .as_mut()
+                .expect("opponent_pool verified above");
+            let (episodes, opponent_completions) = collect_rollouts_with_opponents(
+                &inference_model,
+                pool,
+                &mut vec_env,
+                &mut buffer,
+                &mut env_states,
+                num_opponent_envs,
+                config.num_steps,
+                device,
+                &mut rng,
+                obs_normalizer.as_mut(),
+                global_step,
+            );
+
+            // Process opponent completions for rating updates
+            for completion in opponent_completions {
+                if !completion.placements.is_empty() {
+                    let env_state = &env_states[completion.env_idx];
+                    pool.update_ratings_after_game(
+                        &completion.placements,
+                        env_state.learner_position,
+                        env_state,
+                        global_step,
+                    );
+                }
+            }
+
+            // Handle rotation
+            steps_since_rotation += steps_per_update;
+            if steps_since_rotation >= config.opponent_pool_rotation_steps {
+                steps_since_rotation = 0;
+
+                // Refresh pool (scan for new checkpoints)
+                let _ = pool.scan_checkpoints();
+
+                // Queue new opponents for all env states (graceful rotation)
+                for state in &mut env_states {
+                    state.pending_opponents = Some(pool.sample_all_slots());
+                }
+
+                // Unload unused opponents
+                let in_use: Vec<usize> = env_states
+                    .iter()
+                    .flat_map(|s| s.assigned_opponents.iter().copied())
+                    .collect();
+                pool.unload_unused(&in_use);
+            }
+
+            episodes
+        } else {
+            collect_rollouts(
+                &inference_model,
+                &mut vec_env,
+                &mut buffer,
+                config.num_steps,
+                device,
+                &mut rng,
+                obs_normalizer.as_mut(),
+            )
+        };
         rollout_time_acc += rollout_start.elapsed();
 
         // Track episode returns for metrics and checkpointing
@@ -541,6 +675,7 @@ where
         );
         update_time_acc += update_start.elapsed();
         model = updated_model;
+        last_metrics = Some(metrics.clone());
 
         global_step += steps_per_update;
 
@@ -720,6 +855,126 @@ where
             logger.flush()?;
         }
 
+        // Pool evaluation (separate from checkpointing, at its own interval)
+        let should_run_pool_eval = config.opponent_pool_eval_enabled
+            && num_players > 1
+            && global_step - last_pool_eval_step >= config.pool_eval_interval();
+
+        if should_run_pool_eval {
+            if let Some(pool) = opponent_pool.as_mut() {
+                if pool.has_opponents() {
+                    // Run pool evaluation with inference backend (no autodiff)
+                    let eval_model = model.valid();
+                    match run_pool_eval::<TB::InnerBackend, E>(
+                        &eval_model,
+                        obs_normalizer.as_ref(),
+                        pool,
+                        config.opponent_pool_eval_games,
+                        config.opponent_pool_eval_opponents,
+                        config,
+                        device,
+                        config.seed.wrapping_add(global_step as u64),
+                        global_step,
+                        config.pool_eval_temp,
+                        config.pool_eval_temp_final,
+                        config.pool_eval_temp_cutoff,
+                        config.pool_eval_temp_decay,
+                    ) {
+                        Ok(result) => {
+                            // Log pool eval metrics
+                            logger.log_scalar(
+                                "pool_eval/current_rating",
+                                result.current_rating as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "pool_eval/current_uncertainty",
+                                result.current_uncertainty as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "pool_eval/avg_points",
+                                result.current_avg_points as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "pool_eval/vs_best_margin",
+                                result.vs_best_margin as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "pool_eval/draw_rate",
+                                result.draw_rate as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "pool_eval/games_played",
+                                result.games_played as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "pool_eval/num_opponents",
+                                result.num_opponents as f32,
+                                global_step,
+                            )?;
+                            logger.log_scalar(
+                                "pool_eval/eval_time_ms",
+                                result.elapsed_ms as f32,
+                                global_step,
+                            )?;
+
+                            // Accumulate pool eval time and log percentage
+                            total_pool_eval_time +=
+                                std::time::Duration::from_millis(result.elapsed_ms);
+                            let total_elapsed = training_start.elapsed().as_secs_f64();
+                            if total_elapsed > 0.0 {
+                                let pool_eval_pct =
+                                    total_pool_eval_time.as_secs_f64() / total_elapsed * 100.0;
+                                logger.log_scalar(
+                                    "pool_eval/time_pct",
+                                    pool_eval_pct as f32,
+                                    global_step,
+                                )?;
+
+                                // One-time warning if pool eval is >5% of total execution time
+                                if !pool_eval_warning_shown && pool_eval_pct > 5.0 {
+                                    eprintln!(
+                                        "Warning: Pool evaluation is taking {pool_eval_pct:.1}% of total \
+                                         execution time. Consider increasing \
+                                         opponent_pool_eval_interval or decreasing \
+                                         opponent_pool_eval_games."
+                                    );
+                                    pool_eval_warning_shown = true;
+                                }
+                            }
+
+                            logger.flush()?;
+
+                            // Print pool eval status line
+                            let status = format!(
+                                "[Pool Eval] Rating: {:.0} (\u{00b1}{:.0}) | vs Best: {:+.2} | Points: {:.2}",
+                                result.current_rating,
+                                result.current_uncertainty,
+                                result.vs_best_margin,
+                                result.current_avg_points
+                            );
+                            progress.println(&status);
+
+                            // Save updated pool ratings
+                            if let Err(e) = pool.save_ratings() {
+                                eprintln!("Warning: Failed to save pool ratings after eval: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Pool evaluation failed: {e}");
+                        }
+                    }
+                }
+            }
+
+            last_pool_eval_step = global_step;
+        }
+
         // Checkpointing
         if global_step - last_checkpoint_step >= config.checkpoint_freq {
             // Use episodes since last checkpoint for best selection
@@ -750,13 +1005,11 @@ where
                 activation: config.activation.clone(),
                 split_networks: config.split_networks,
                 env_name: E::NAME.to_string(),
-                training_rating: 25.0, // Updated after challenger eval via update_training_rating
+                training_rating: 25.0,
                 training_uncertainty: 25.0 / 3.0,
             };
 
-            // Disable auto-best when using challenger evaluation for multiplayer
-            let use_auto_best = !(config.challenger_eval && E::NUM_PLAYERS > 1);
-            let checkpoint_path = checkpoint_manager.save(&model, &metadata, use_auto_best)?;
+            let checkpoint_path = checkpoint_manager.save(&model, &metadata, true)?;
 
             // Save optimizer state alongside model
             if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
@@ -775,130 +1028,14 @@ where
                 eprintln!("Warning: Failed to save RNG state: {e}");
             }
 
-            // Challenger evaluation for multiplayer games
-            let challenger_avg_points: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1
-            {
-                let best_path = checkpoint_manager.best_checkpoint_path();
-                if best_path.exists() {
-                    // Load best checkpoint's training rating for accumulating skill
-                    let (best_rating, best_uncertainty) = load_metadata(&best_path)
-                        .map(|m| (m.training_rating, m.training_uncertainty))
-                        .unwrap_or((25.0, 25.0 / 3.0));
-
-                    // Run challenger evaluation with inference backend (no autodiff)
-                    let challenger_model = model.valid();
-                    match run_challenger_eval::<TB::InnerBackend, E>(
-                        &challenger_model,
-                        obs_normalizer.as_ref(),
-                        &best_path,
-                        best_rating,
-                        best_uncertainty,
-                        config.challenger_games,
-                        config.challenger_threshold,
-                        config,
-                        device,
-                        config.seed.wrapping_add(global_step as u64),
-                    ) {
-                        Ok(result) => {
-                            // Save this checkpoint's training rating
-                            if let Err(e) = update_training_rating(
-                                &checkpoint_path,
-                                result.current_rating,
-                                result.current_uncertainty,
-                            ) {
-                                eprintln!("Warning: Failed to save training rating: {e}");
-                            }
-                            // Log metrics
-                            logger.log_scalar(
-                                "challenger/eval_time_ms",
-                                result.elapsed_ms as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/current_avg_points",
-                                result.current_avg_points as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/best_avg_points",
-                                result.best_avg_points as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/draw_rate",
-                                result.draw_rate as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/current_rating",
-                                result.current_rating as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/current_uncertainty",
-                                result.current_uncertainty as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/best_rating",
-                                result.best_rating as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "challenger/best_uncertainty",
-                                result.best_uncertainty as f32,
-                                global_step,
-                            )?;
-
-                            // Check if eval took >5% of checkpoint interval
-                            let checkpoint_interval_ms =
-                                last_checkpoint_time.elapsed().as_millis() as u64;
-                            if checkpoint_interval_ms > 0 {
-                                let eval_pct = (result.elapsed_ms as f64
-                                    / checkpoint_interval_ms as f64)
-                                    * 100.0;
-                                if eval_pct > 5.0 && !warned_challenger_eval_time {
-                                    progress.println(&format!(
-                                        "Warning: Challenger evaluation took {eval_pct:.1}% of checkpoint interval (consider reducing challenger_games)"
-                                    ));
-                                    warned_challenger_eval_time = true;
-                                }
-                            }
-
-                            // Promote if win rate exceeds threshold
-                            if result.should_promote {
-                                if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path)
-                                {
-                                    eprintln!("Warning: Failed to promote checkpoint to best: {e}");
-                                }
-                            }
-
-                            // Log current best step (after potential promotion)
-                            if let Some(best_step) = get_best_checkpoint_step(&best_path) {
-                                logger.log_scalar(
-                                    "challenger/best_step",
-                                    best_step as f32,
-                                    global_step,
-                                )?;
-                            }
-
-                            Some(result.current_avg_points)
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Challenger evaluation failed: {e}");
-                            None
-                        }
-                    }
-                } else {
-                    // First checkpoint - becomes best automatically
-                    if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
-                        eprintln!("Warning: Failed to set initial best checkpoint: {e}");
-                    }
-                    None
+            // Add checkpoint to opponent pool
+            if let Some(ref mut pool) = opponent_pool {
+                pool.add_checkpoint(checkpoint_path.clone(), &metadata);
+                // Save pool ratings periodically
+                if let Err(e) = pool.save_ratings() {
+                    eprintln!("Warning: Failed to save pool ratings: {e}");
                 }
-            } else {
-                None
-            };
+            }
 
             // Log checkpoint save message
             let filename = checkpoint_path
@@ -906,13 +1043,14 @@ where
                 .expect("checkpoint has filename")
                 .to_string_lossy();
             let checkpoint_msg = if num_players > 1 {
-                // Multiplayer: show Swiss points instead of avg_return
+                // Multiplayer: show Swiss points and training metrics
                 let (avg_points, _draw_rate) =
                     compute_avg_points(&recent_outcomes, num_players_usize);
                 let p0_points = avg_points.first().copied().unwrap_or(0.0);
-                if let Some(challenger_pts) = challenger_avg_points {
+                if let Some(ref m) = last_metrics {
                     format!(
-                        "Saved checkpoint at step {global_step} (avg pts: {p0_points:.2}, vs best: {challenger_pts:.2} pts) -> {filename}"
+                        "Saved checkpoint at step {global_step} (pts: {p0_points:.2} | loss: {:.3} | ent: {:.2} | ev: {:.2}) -> {filename}",
+                        m.policy_loss, m.entropy, m.explained_variance
                     )
                 } else {
                     format!(
@@ -920,15 +1058,21 @@ where
                     )
                 }
             } else {
-                // Single-player: show avg_return
-                format!(
-                    "Saved checkpoint at step {global_step} (avg return: {avg_return:.1}) -> {filename}"
-                )
+                // Single-player: show avg_return and training metrics
+                if let Some(ref m) = last_metrics {
+                    format!(
+                        "Saved checkpoint at step {global_step} (ret: {avg_return:.1} | loss: {:.3} | ent: {:.2} | ev: {:.2}) -> {filename}",
+                        m.policy_loss, m.entropy, m.explained_variance
+                    )
+                } else {
+                    format!(
+                        "Saved checkpoint at step {global_step} (avg return: {avg_return:.1}) -> {filename}"
+                    )
+                }
             };
             progress.println(&checkpoint_msg);
 
             last_checkpoint_step = global_step;
-            last_checkpoint_time = std::time::Instant::now();
             episodes_since_checkpoint.clear();
         }
 
@@ -964,13 +1108,11 @@ where
             activation: config.activation.clone(),
             split_networks: config.split_networks,
             env_name: E::NAME.to_string(),
-            training_rating: 25.0, // Updated after challenger eval via update_training_rating
+            training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,
         };
 
-        // Disable auto-best when using challenger evaluation for multiplayer
-        let use_auto_best = !(config.challenger_eval && E::NUM_PLAYERS > 1);
-        let checkpoint_path = checkpoint_manager.save(&model, &metadata, use_auto_best)?;
+        let checkpoint_path = checkpoint_manager.save(&model, &metadata, true)?;
 
         // Save optimizer state alongside model
         if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
@@ -989,113 +1131,14 @@ where
             eprintln!("Warning: Failed to save RNG state: {e}");
         }
 
-        // Challenger evaluation for multiplayer games
-        let challenger_avg_points: Option<f64> = if config.challenger_eval && E::NUM_PLAYERS > 1 {
-            let best_path = checkpoint_manager.best_checkpoint_path();
-            if best_path.exists() {
-                // Load best checkpoint's training rating for accumulating skill
-                let (best_rating, best_uncertainty) = load_metadata(&best_path)
-                    .map(|m| (m.training_rating, m.training_uncertainty))
-                    .unwrap_or((25.0, 25.0 / 3.0));
-
-                // Run challenger evaluation with inference backend (no autodiff)
-                let challenger_model = model.valid();
-                match run_challenger_eval::<TB::InnerBackend, E>(
-                    &challenger_model,
-                    obs_normalizer.as_ref(),
-                    &best_path,
-                    best_rating,
-                    best_uncertainty,
-                    config.challenger_games,
-                    config.challenger_threshold,
-                    config,
-                    device,
-                    config.seed.wrapping_add(global_step as u64),
-                ) {
-                    Ok(result) => {
-                        // Save this checkpoint's training rating
-                        if let Err(e) = update_training_rating(
-                            &checkpoint_path,
-                            result.current_rating,
-                            result.current_uncertainty,
-                        ) {
-                            eprintln!("Warning: Failed to save training rating: {e}");
-                        }
-                        // Log metrics
-                        logger.log_scalar(
-                            "challenger/eval_time_ms",
-                            result.elapsed_ms as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/current_avg_points",
-                            result.current_avg_points as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/best_avg_points",
-                            result.best_avg_points as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/draw_rate",
-                            result.draw_rate as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/current_rating",
-                            result.current_rating as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/current_uncertainty",
-                            result.current_uncertainty as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/best_rating",
-                            result.best_rating as f32,
-                            global_step,
-                        )?;
-                        logger.log_scalar(
-                            "challenger/best_uncertainty",
-                            result.best_uncertainty as f32,
-                            global_step,
-                        )?;
-
-                        // Promote if avg points exceeds best
-                        if result.should_promote {
-                            if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
-                                eprintln!("Warning: Failed to promote checkpoint to best: {e}");
-                            }
-                        }
-
-                        // Log current best step (after potential promotion)
-                        if let Some(best_step) = get_best_checkpoint_step(&best_path) {
-                            logger.log_scalar(
-                                "challenger/best_step",
-                                best_step as f32,
-                                global_step,
-                            )?;
-                        }
-
-                        Some(result.current_avg_points)
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Challenger evaluation failed: {e}");
-                        None
-                    }
-                }
-            } else {
-                // First checkpoint - becomes best automatically
-                if let Err(e) = checkpoint_manager.promote_to_best(&checkpoint_path) {
-                    eprintln!("Warning: Failed to set initial best checkpoint: {e}");
-                }
-                None
+        // Add checkpoint to opponent pool
+        if let Some(ref mut pool) = opponent_pool {
+            pool.add_checkpoint(checkpoint_path.clone(), &metadata);
+            // Save pool ratings
+            if let Err(e) = pool.save_ratings() {
+                eprintln!("Warning: Failed to save pool ratings: {e}");
             }
-        } else {
-            None
-        };
+        }
 
         // Log final checkpoint save message
         let filename = checkpoint_path
@@ -1103,12 +1146,13 @@ where
             .expect("checkpoint has filename")
             .to_string_lossy();
         let checkpoint_msg = if num_players > 1 {
-            // Multiplayer: show Swiss points instead of avg_return
+            // Multiplayer: show Swiss points and training metrics
             let (avg_points, _draw_rate) = compute_avg_points(&recent_outcomes, num_players_usize);
             let p0_points = avg_points.first().copied().unwrap_or(0.0);
-            if let Some(challenger_pts) = challenger_avg_points {
+            if let Some(ref m) = last_metrics {
                 format!(
-                    "Saved final checkpoint at step {global_step} (avg pts: {p0_points:.2}, vs best: {challenger_pts:.2} pts) -> {filename}"
+                    "Saved final checkpoint at step {global_step} (pts: {p0_points:.2} | loss: {:.3} | ent: {:.2} | ev: {:.2}) -> {filename}",
+                    m.policy_loss, m.entropy, m.explained_variance
                 )
             } else {
                 format!(
@@ -1116,10 +1160,17 @@ where
                 )
             }
         } else {
-            // Single-player: show avg_return
-            format!(
-                "Saved final checkpoint at step {global_step} (avg return: {avg_return:.1}) -> {filename}"
-            )
+            // Single-player: show avg_return and training metrics
+            if let Some(ref m) = last_metrics {
+                format!(
+                    "Saved final checkpoint at step {global_step} (ret: {avg_return:.1} | loss: {:.3} | ent: {:.2} | ev: {:.2}) -> {filename}",
+                    m.policy_loss, m.entropy, m.explained_variance
+                )
+            } else {
+                format!(
+                    "Saved final checkpoint at step {global_step} (avg return: {avg_return:.1}) -> {filename}"
+                )
+            }
         };
         progress.println(&checkpoint_msg);
     }
@@ -1425,51 +1476,6 @@ mod tests {
     fn test_extract_run_name_from_checkpoint_path_single() {
         let path = Path::new("best");
         assert_eq!(extract_run_name_from_checkpoint_path(path), None);
-    }
-
-    #[test]
-    fn test_get_best_checkpoint_step_valid() {
-        let dir = tempdir().unwrap();
-        let best = dir.path().join("best");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("step_00010240", &best).unwrap();
-        #[cfg(unix)]
-        assert_eq!(get_best_checkpoint_step(&best), Some(10240));
-    }
-
-    #[test]
-    fn test_get_best_checkpoint_step_different_step() {
-        let dir = tempdir().unwrap();
-        let best = dir.path().join("best");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("step_00000512", &best).unwrap();
-        #[cfg(unix)]
-        assert_eq!(get_best_checkpoint_step(&best), Some(512));
-    }
-
-    #[test]
-    fn test_get_best_checkpoint_step_not_symlink() {
-        let dir = tempdir().unwrap();
-        let best = dir.path().join("best");
-        std::fs::create_dir(&best).unwrap();
-        assert_eq!(get_best_checkpoint_step(&best), None);
-    }
-
-    #[test]
-    fn test_get_best_checkpoint_step_invalid_format() {
-        let dir = tempdir().unwrap();
-        let best = dir.path().join("best");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("invalid_name", &best).unwrap();
-        #[cfg(unix)]
-        assert_eq!(get_best_checkpoint_step(&best), None);
-    }
-
-    #[test]
-    fn test_get_best_checkpoint_step_nonexistent() {
-        let dir = tempdir().unwrap();
-        let best = dir.path().join("nonexistent");
-        assert_eq!(get_best_checkpoint_step(&best), None);
     }
 
     #[test]

@@ -182,29 +182,54 @@ pub struct TrainArgs {
     #[arg(long)]
     pub log_freq: Option<usize>,
 
-    // --- Challenger Evaluation ---
-    /// Enable challenger-style evaluation for multiplayer games
+    // --- Opponent Pool Training ---
+    /// Enable opponent pool training for multiplayer games
     #[arg(long, action = clap::ArgAction::Set)]
-    pub challenger_eval: Option<bool>,
+    pub opponent_pool_enabled: Option<bool>,
 
+    /// Fraction of environments for opponent games (0.0-1.0)
     #[arg(long)]
-    pub challenger_games: Option<usize>,
+    pub opponent_pool_fraction: Option<f32>,
 
+    /// Steps between opponent rotation
     #[arg(long)]
-    pub challenger_threshold: Option<f64>,
+    pub opponent_pool_rotation_steps: Option<usize>,
 
+    /// Softmax temperature for opponent sampling
     #[arg(long)]
-    pub challenger_temp: Option<f32>,
+    pub opponent_pool_sample_temperature: Option<f32>,
 
-    #[arg(long)]
-    pub challenger_temp_final: Option<f32>,
-
-    #[arg(long)]
-    pub challenger_temp_cutoff: Option<usize>,
-
-    /// Enable temperature decay instead of hard cutoff
+    /// Enable periodic pool evaluation
     #[arg(long, action = clap::ArgAction::Set)]
-    pub challenger_temp_decay: Option<bool>,
+    pub opponent_pool_eval_enabled: Option<bool>,
+
+    /// Steps between pool evaluations
+    #[arg(long)]
+    pub opponent_pool_eval_interval: Option<usize>,
+
+    /// Number of games per pool evaluation
+    #[arg(long)]
+    pub opponent_pool_eval_games: Option<usize>,
+
+    /// Number of opponents to sample for evaluation
+    #[arg(long)]
+    pub opponent_pool_eval_opponents: Option<usize>,
+
+    /// Initial softmax temperature for pool evaluation (uses environment default if not specified)
+    #[arg(long)]
+    pub pool_eval_temp: Option<f32>,
+
+    /// Final temperature after cutoff moves for pool evaluation (default 0.0)
+    #[arg(long)]
+    pub pool_eval_temp_final: Option<f32>,
+
+    /// Move number to switch temperature for pool evaluation
+    #[arg(long)]
+    pub pool_eval_temp_cutoff: Option<usize>,
+
+    /// Gradually decay pool eval temperature over cutoff moves
+    #[arg(long)]
+    pub pool_eval_temp_decay: bool,
 }
 
 /// Arguments for evaluation
@@ -453,29 +478,44 @@ pub struct Config {
     #[serde(default = "default_log_freq")]
     pub log_freq: usize,
 
-    // Challenger evaluation (multiplayer best checkpoint selection)
-    /// Enable challenger-style evaluation for multiplayer games
-    /// When enabled, new checkpoints must beat the current best to become "best"
+    // Opponent Pool Training (OpenAI Five-style historical opponent training)
+    /// Enable opponent pool training for multiplayer games
+    /// When enabled, a fraction of training games are played against historical checkpoints
+    #[serde(default = "default_true")]
+    pub opponent_pool_enabled: bool,
+    /// Fraction of environments dedicated to opponent games (0.0-1.0)
+    #[serde(default = "default_opponent_pool_fraction")]
+    pub opponent_pool_fraction: f32,
+    /// Steps between opponent rotation triggers
+    #[serde(default = "default_opponent_pool_rotation_steps")]
+    pub opponent_pool_rotation_steps: usize,
+    /// Softmax temperature for opponent sampling (higher = more uniform)
+    #[serde(default = "default_opponent_pool_sample_temperature")]
+    pub opponent_pool_sample_temperature: f32,
+    /// Enable periodic pool evaluation
+    #[serde(default = "default_true")]
+    pub opponent_pool_eval_enabled: bool,
+    /// Steps between pool evaluations (None = use `checkpoint_freq`)
     #[serde(default)]
-    pub challenger_eval: bool,
-    /// Number of games for challenger evaluation
-    #[serde(default = "default_challenger_games")]
-    pub challenger_games: usize,
-    /// Win rate threshold to become new best (0.55 = 55%)
-    #[serde(default = "default_challenger_threshold")]
-    pub challenger_threshold: f64,
-    /// Temperature for challenger evaluation action sampling (default: 0.3)
-    #[serde(default = "default_challenger_temp")]
-    pub challenger_temp: f32,
-    /// Final temperature after cutoff (default: 0.0)
+    pub opponent_pool_eval_interval: Option<usize>,
+    /// Number of games per pool evaluation
+    #[serde(default = "default_opponent_pool_eval_games")]
+    pub opponent_pool_eval_games: usize,
+    /// Number of opponents to sample for each evaluation
+    #[serde(default = "default_opponent_pool_eval_opponents")]
+    pub opponent_pool_eval_opponents: usize,
+    /// Initial softmax temperature for pool evaluation (None = use environment default)
     #[serde(default)]
-    pub challenger_temp_final: Option<f32>,
-    /// Move number to switch/decay temperature (default: None = constant temp)
+    pub pool_eval_temp: Option<f32>,
+    /// Final temperature after cutoff moves (default 0.0, requires `pool_eval_temp_cutoff`)
     #[serde(default)]
-    pub challenger_temp_cutoff: Option<usize>,
-    /// Use linear decay instead of hard cutoff (default: false)
+    pub pool_eval_temp_final: f32,
+    /// Move number to switch from initial to final temperature (None = disabled)
     #[serde(default)]
-    pub challenger_temp_decay: bool,
+    pub pool_eval_temp_cutoff: Option<usize>,
+    /// Gradually decay temperature over cutoff moves (requires `pool_eval_temp_cutoff`)
+    #[serde(default)]
+    pub pool_eval_temp_decay: bool,
 
     // Experiment
     #[serde(default = "default_seed")]
@@ -547,14 +587,22 @@ const fn default_log_freq() -> usize {
 const fn default_seed() -> u64 {
     42
 }
-const fn default_challenger_games() -> usize {
+
+// Opponent pool defaults
+const fn default_opponent_pool_fraction() -> f32 {
+    0.25 // 25% of envs play against opponents
+}
+const fn default_opponent_pool_rotation_steps() -> usize {
+    2000
+}
+const fn default_opponent_pool_sample_temperature() -> f32 {
+    1.0
+}
+const fn default_opponent_pool_eval_games() -> usize {
     64
 }
-const fn default_challenger_threshold() -> f64 {
-    0.55
-}
-const fn default_challenger_temp() -> f32 {
-    0.3
+const fn default_opponent_pool_eval_opponents() -> usize {
+    5
 }
 
 impl Default for Config {
@@ -591,13 +639,18 @@ impl Default for Config {
             run_dir: default_run_dir(),
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
-            challenger_eval: false,
-            challenger_games: default_challenger_games(),
-            challenger_threshold: default_challenger_threshold(),
-            challenger_temp: default_challenger_temp(),
-            challenger_temp_final: None,
-            challenger_temp_cutoff: None,
-            challenger_temp_decay: false,
+            opponent_pool_enabled: true,
+            opponent_pool_fraction: default_opponent_pool_fraction(),
+            opponent_pool_rotation_steps: default_opponent_pool_rotation_steps(),
+            opponent_pool_sample_temperature: default_opponent_pool_sample_temperature(),
+            opponent_pool_eval_enabled: true,
+            opponent_pool_eval_interval: None, // Defaults to checkpoint_freq
+            opponent_pool_eval_games: default_opponent_pool_eval_games(),
+            opponent_pool_eval_opponents: default_opponent_pool_eval_opponents(),
+            pool_eval_temp: None, // Use environment default
+            pool_eval_temp_final: 0.0,
+            pool_eval_temp_cutoff: None, // Disabled by default
+            pool_eval_temp_decay: false,
             seed: default_seed(),
             run_name: None,
             forked_from: None,
@@ -606,6 +659,12 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Get pool eval interval (defaults to `checkpoint_freq` if not set)
+    pub fn pool_eval_interval(&self) -> usize {
+        self.opponent_pool_eval_interval
+            .unwrap_or(self.checkpoint_freq)
+    }
+
     /// Load config from TOML file, apply CLI overrides
     ///
     /// The `forked_from` parameter is set when forking from another run
@@ -746,27 +805,42 @@ impl Config {
             self.log_freq = v;
         }
 
-        // Challenger evaluation
-        if let Some(v) = args.challenger_eval {
-            self.challenger_eval = v;
+        // Opponent pool training
+        if let Some(v) = args.opponent_pool_enabled {
+            self.opponent_pool_enabled = v;
         }
-        if let Some(v) = args.challenger_games {
-            self.challenger_games = v;
+        if let Some(v) = args.opponent_pool_fraction {
+            self.opponent_pool_fraction = v;
         }
-        if let Some(v) = args.challenger_threshold {
-            self.challenger_threshold = v;
+        if let Some(v) = args.opponent_pool_rotation_steps {
+            self.opponent_pool_rotation_steps = v;
         }
-        if let Some(v) = args.challenger_temp {
-            self.challenger_temp = v;
+        if let Some(v) = args.opponent_pool_sample_temperature {
+            self.opponent_pool_sample_temperature = v;
         }
-        if let Some(v) = args.challenger_temp_final {
-            self.challenger_temp_final = Some(v);
+        if let Some(v) = args.opponent_pool_eval_enabled {
+            self.opponent_pool_eval_enabled = v;
         }
-        if let Some(v) = args.challenger_temp_cutoff {
-            self.challenger_temp_cutoff = Some(v);
+        if let Some(v) = args.opponent_pool_eval_interval {
+            self.opponent_pool_eval_interval = Some(v);
         }
-        if let Some(v) = args.challenger_temp_decay {
-            self.challenger_temp_decay = v;
+        if let Some(v) = args.opponent_pool_eval_games {
+            self.opponent_pool_eval_games = v;
+        }
+        if let Some(v) = args.opponent_pool_eval_opponents {
+            self.opponent_pool_eval_opponents = v;
+        }
+        if let Some(v) = args.pool_eval_temp {
+            self.pool_eval_temp = Some(v);
+        }
+        if let Some(v) = args.pool_eval_temp_final {
+            self.pool_eval_temp_final = v;
+        }
+        if let Some(v) = args.pool_eval_temp_cutoff {
+            self.pool_eval_temp_cutoff = Some(v);
+        }
+        if args.pool_eval_temp_decay {
+            self.pool_eval_temp_decay = true;
         }
 
         // Experiment
@@ -885,27 +959,30 @@ impl Config {
             ignored.push("--log-freq");
         }
 
-        // Challenger evaluation
-        if args.challenger_eval.is_some() {
-            ignored.push("--challenger-eval");
+        // Opponent pool training
+        if args.opponent_pool_enabled.is_some() {
+            ignored.push("--opponent-pool-enabled");
         }
-        if args.challenger_games.is_some() {
-            ignored.push("--challenger-games");
+        if args.opponent_pool_fraction.is_some() {
+            ignored.push("--opponent-pool-fraction");
         }
-        if args.challenger_threshold.is_some() {
-            ignored.push("--challenger-threshold");
+        if args.opponent_pool_rotation_steps.is_some() {
+            ignored.push("--opponent-pool-rotation-steps");
         }
-        if args.challenger_temp.is_some() {
-            ignored.push("--challenger-temp");
+        if args.opponent_pool_sample_temperature.is_some() {
+            ignored.push("--opponent-pool-sample-temperature");
         }
-        if args.challenger_temp_final.is_some() {
-            ignored.push("--challenger-temp-final");
+        if args.opponent_pool_eval_enabled.is_some() {
+            ignored.push("--opponent-pool-eval-enabled");
         }
-        if args.challenger_temp_cutoff.is_some() {
-            ignored.push("--challenger-temp-cutoff");
+        if args.opponent_pool_eval_interval.is_some() {
+            ignored.push("--opponent-pool-eval-interval");
         }
-        if args.challenger_temp_decay.is_some() {
-            ignored.push("--challenger-temp-decay");
+        if args.opponent_pool_eval_games.is_some() {
+            ignored.push("--opponent-pool-eval-games");
+        }
+        if args.opponent_pool_eval_opponents.is_some() {
+            ignored.push("--opponent-pool-eval-opponents");
         }
 
         // Experiment
@@ -994,6 +1071,25 @@ impl Config {
                 "Unknown activation '{}'. Supported: tanh, relu",
                 self.activation
             );
+        }
+
+        // Validate opponent pool config
+        if self.opponent_pool_enabled {
+            if self.opponent_pool_fraction < 0.0 || self.opponent_pool_fraction > 1.0 {
+                bail!("opponent_pool_fraction must be in [0.0, 1.0]");
+            }
+            if self.opponent_pool_rotation_steps == 0 {
+                bail!("opponent_pool_rotation_steps must be > 0");
+            }
+            if self.opponent_pool_sample_temperature <= 0.0 {
+                bail!("opponent_pool_sample_temperature must be > 0");
+            }
+            if self.opponent_pool_eval_games == 0 {
+                bail!("opponent_pool_eval_games must be > 0");
+            }
+            if self.opponent_pool_eval_opponents == 0 {
+                bail!("opponent_pool_eval_opponents must be > 0");
+            }
         }
 
         Ok(())
@@ -1224,5 +1320,14 @@ mod tests {
         };
         let name = generate_run_name(&config, Some("cartpole_003"));
         assert_eq!(name, "cartpole_003_child_001");
+    }
+
+    #[test]
+    fn test_pool_eval_temp_defaults() {
+        let config = Config::default();
+        assert!(config.pool_eval_temp.is_none()); // Use env default
+        assert!((config.pool_eval_temp_final - 0.0).abs() < f32::EPSILON);
+        assert!(config.pool_eval_temp_cutoff.is_none()); // Disabled
+        assert!(!config.pool_eval_temp_decay);
     }
 }

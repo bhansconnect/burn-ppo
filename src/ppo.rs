@@ -9,6 +9,8 @@
 // Tensor operations use expect/unwrap for internal invariants that cannot fail
 // when tensor shapes are correct (which is guaranteed by construction)
 
+use std::collections::HashMap;
+
 use burn::optim::GradientsParams;
 use burn::prelude::*;
 use burn::tensor::Int;
@@ -19,20 +21,25 @@ use crate::config::Config;
 use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
+use crate::opponent_pool::{EnvState, OpponentPool};
 use crate::profile::{gpu_sync, profile_function, profile_scope};
 use crate::utils::{
     entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical,
 };
 
 /// Flattened buffer data for minibatch processing:
-/// `(obs, actions, old_log_probs, advantages, returns, acting_players)`
+/// `(obs, actions, old_log_probs, advantages, returns, acting_players, old_values, valid_indices)`
+/// - `valid_indices` is `None` for self-play, `Some(indices)` for opponent pool training
+/// - When `valid_indices` is present, caller should use it to select only learner turn data
 type FlattenedBuffer<B> = (
-    Tensor<B, 2>,
-    Tensor<B, 1, Int>,
-    Tensor<B, 1>,
-    Tensor<B, 1>,
-    Tensor<B, 1>,
-    Tensor<B, 1, Int>,
+    Tensor<B, 2>,              // obs
+    Tensor<B, 1, Int>,         // actions
+    Tensor<B, 1>,              // old_log_probs
+    Tensor<B, 1>,              // advantages
+    Tensor<B, 1>,              // returns
+    Tensor<B, 1, Int>,         // acting_players
+    Tensor<B, 1>,              // old_values (flattened)
+    Option<Tensor<B, 1, Int>>, // valid_indices for opponent pool training
 );
 
 /// Stores trajectory data from environment rollouts
@@ -68,6 +75,9 @@ pub struct RolloutBuffer<B: Backend> {
     pub advantages: Option<Tensor<B, 2>>,
     /// Returns (values + advantages) [`num_steps`, `num_envs`]
     pub returns: Option<Tensor<B, 2>>,
+    /// Valid mask for opponent pool training [`num_steps`, `num_envs`]
+    /// 1.0 for learner turns (on-policy data), 0.0 for opponent turns (off-policy, masked out)
+    pub valid_mask: Option<Tensor<B, 2>>,
 }
 
 impl<B: Backend> RolloutBuffer<B> {
@@ -96,6 +106,7 @@ impl<B: Backend> RolloutBuffer<B> {
             num_players,
             advantages: None,
             returns: None,
+            valid_mask: None,
         }
     }
 
@@ -105,11 +116,16 @@ impl<B: Backend> RolloutBuffer<B> {
     }
 
     /// Flatten buffer for minibatch processing
-    /// Returns (obs, actions, `old_log_probs`, advantages, returns, `acting_players`)
+    /// Returns (obs, actions, `old_log_probs`, advantages, returns, `acting_players`, `old_values`, `valid_indices`)
     /// Each with shape [`num_steps` * `num_envs`, ...]
+    ///
+    /// If `valid_mask` is set (opponent pool training), returns `valid_indices` containing
+    /// indices of learner turns only. Caller should use these to select valid data before
+    /// any computation to ensure opponent turn data is completely excluded.
     ///
     /// # Panics
     /// Panics if `compute_gae` was not called first (advantages/returns not set)
+    #[expect(clippy::cast_possible_wrap, reason = "batch indices fit in i64")]
     pub fn flatten(&self) -> FlattenedBuffer<B> {
         let [num_steps, num_envs, obs_dim] = self.observations.dims();
         let batch_size = num_steps * num_envs;
@@ -130,8 +146,35 @@ impl<B: Backend> RolloutBuffer<B> {
             .clone()
             .flatten(0, 1);
         let acting_players = self.acting_players.clone().flatten(0, 1);
+        let old_values = self.values.clone().flatten(0, 1);
 
-        (obs, actions, log_probs, advantages, returns, acting_players)
+        // Compute valid indices if mask present (opponent pool training)
+        // These indices identify learner turns - caller uses them to select only valid data
+        let valid_indices = if let Some(ref mask) = self.valid_mask {
+            let mask_flat: Tensor<B, 1> = mask.clone().flatten(0, 1);
+            let mask_data: Vec<f32> = mask_flat.into_data().to_vec().expect("mask data");
+            let indices: Vec<i64> = mask_data
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v > 0.5)
+                .map(|(i, _)| i as i64)
+                .collect();
+            let device = self.observations.device();
+            Some(Tensor::<B, 1, Int>::from_ints(indices.as_slice(), &device))
+        } else {
+            None
+        };
+
+        (
+            obs,
+            actions,
+            log_probs,
+            advantages,
+            returns,
+            acting_players,
+            old_values,
+            valid_indices,
+        )
     }
 }
 
@@ -320,6 +363,369 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     }
 
     all_completed
+}
+
+/// Information about a completed episode in opponent pool training
+#[derive(Debug)]
+#[expect(dead_code, reason = "fields reserved for pool evaluation metrics")]
+pub struct OpponentEpisodeCompletion {
+    /// Environment index
+    pub env_idx: usize,
+    /// Placements for all players (1 = first, 2 = second, etc.)
+    pub placements: Vec<usize>,
+    /// Pool indices of opponents in this game
+    pub opponent_pool_indices: Vec<usize>,
+    /// Whether this env was playing against opponents (vs self-play)
+    pub is_opponent_game: bool,
+}
+
+/// Collect rollouts with opponent pool training
+///
+/// A fraction of envs play against historical opponents, the rest do self-play.
+/// For opponent games, only the learner's experiences are stored (on-policy requirement).
+///
+/// Returns `(episode_stats, opponent_completions)` where `opponent_completions`
+/// contains info for rating updates.
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::too_many_arguments,
+    clippy::explicit_iter_loop,
+    reason = "action indices and player counts are small positive values"
+)]
+pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
+    model: &ActorCritic<B>,
+    opponent_pool: &mut OpponentPool<B>,
+    vec_env: &mut VecEnv<E>,
+    buffer: &mut RolloutBuffer<B>,
+    env_states: &mut [EnvState],
+    num_opponent_envs: usize,
+    num_steps: usize,
+    device: &B::Device,
+    rng: &mut impl Rng,
+    mut normalizer: Option<&mut ObsNormalizer>,
+    _current_step: usize,
+) -> (Vec<EpisodeStats>, Vec<OpponentEpisodeCompletion>) {
+    profile_function!();
+    let num_envs = vec_env.num_envs();
+    let obs_dim = E::OBSERVATION_DIM;
+    let num_players = E::NUM_PLAYERS;
+    let mut all_completed = Vec::new();
+    let mut opponent_completions = Vec::new();
+
+    // Track which indices in each buffer position contain learner data
+    // For self-play envs: all turns are learner data
+    // For opponent envs: only learner's turns are stored
+    let mut valid_indices: Vec<bool> = Vec::with_capacity(num_steps * num_envs);
+
+    // Pre-allocate CPU vectors for batch collection
+    let mut all_obs: Vec<f32> = Vec::with_capacity(num_steps * num_envs * obs_dim);
+    let mut all_actions: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_acting_rewards: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_dones: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_acting_values: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+    let mut all_log_probs: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
+
+    // Multi-player data
+    let mut all_values_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
+    let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
+    let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
+
+    // Collect raw observations for normalizer stats update
+    let collect_raw_obs = normalizer.is_some();
+    let mut raw_obs_for_stats: Vec<f32> = if collect_raw_obs {
+        Vec::with_capacity(num_steps * num_envs * obs_dim)
+    } else {
+        Vec::new()
+    };
+
+    for _step in 0..num_steps {
+        profile_scope!("rollout_step_opponents");
+
+        // Get current players BEFORE the step
+        let current_players = vec_env.get_current_players();
+
+        // Get current observations (keep raw for opponent normalization)
+        let obs_flat_raw = vec_env.get_observations();
+
+        // Store raw observations for normalizer stats update
+        if collect_raw_obs {
+            raw_obs_for_stats.extend_from_slice(&obs_flat_raw);
+        }
+
+        // Partition envs by which model should act
+        let mut learner_env_indices: Vec<usize> = Vec::new();
+        let mut opponent_batches: HashMap<usize, Vec<usize>> = HashMap::new();
+
+        for (env_idx, &current_player) in current_players.iter().enumerate() {
+            if env_idx >= num_opponent_envs {
+                // Self-play env: learner always acts
+                learner_env_indices.push(env_idx);
+            } else {
+                // Opponent env: check if it's learner's turn
+                let env_state = &env_states[env_idx];
+                if current_player == env_state.learner_position {
+                    learner_env_indices.push(env_idx);
+                } else {
+                    // Opponent's turn - look up which opponent model
+                    let pool_idx = env_state.position_to_opponent[current_player]
+                        .expect("position_to_opponent should have opponent index");
+                    opponent_batches.entry(pool_idx).or_default().push(env_idx);
+                }
+            }
+        }
+
+        // Prepare actions for all envs (will be filled in by model forward passes)
+        let mut all_env_actions: Vec<usize> = vec![0; num_envs];
+        let mut all_env_values: Vec<Vec<f32>> = vec![vec![0.0; num_players]; num_envs];
+        let mut all_env_log_probs: Vec<f32> = vec![0.0; num_envs];
+
+        // Forward pass for learner model
+        if !learner_env_indices.is_empty() {
+            profile_scope!("learner_forward");
+
+            // Gather observations for learner envs
+            let mut learner_obs: Vec<f32> = learner_env_indices
+                .iter()
+                .flat_map(|&env_idx| {
+                    let start = env_idx * obs_dim;
+                    obs_flat_raw[start..start + obs_dim].iter().copied()
+                })
+                .collect();
+
+            // Apply learner's normalizer
+            if let Some(ref norm) = normalizer {
+                norm.normalize_batch(&mut learner_obs, obs_dim);
+            }
+
+            let batch_size = learner_env_indices.len();
+            let obs_tensor: Tensor<B, 2> =
+                Tensor::<B, 1>::from_floats(learner_obs.as_slice(), device)
+                    .reshape([batch_size, obs_dim]);
+            let (logits, values) = model.forward(obs_tensor);
+
+            let actions = sample_categorical(logits.clone(), rng, device);
+            let log_probs = log_prob_categorical(logits, actions.clone());
+
+            // Sync to CPU
+            let actions_data: Vec<i64> = actions
+                .float()
+                .into_data()
+                .to_vec::<f32>()
+                .expect("actions to vec")
+                .into_iter()
+                .map(|x| x as i64)
+                .collect();
+            let values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+            let log_probs_data: Vec<f32> =
+                log_probs.into_data().to_vec().expect("log_probs to vec");
+
+            // Scatter results back to env arrays
+            for (batch_idx, &env_idx) in learner_env_indices.iter().enumerate() {
+                all_env_actions[env_idx] = actions_data[batch_idx] as usize;
+                all_env_log_probs[env_idx] = log_probs_data[batch_idx];
+
+                // Extract all player values for this env
+                let value_start = batch_idx * num_players;
+                all_env_values[env_idx] =
+                    values_data[value_start..value_start + num_players].to_vec();
+            }
+        }
+
+        // Forward pass for each opponent model
+        for (pool_idx, env_indices) in opponent_batches.iter() {
+            if env_indices.is_empty() {
+                continue;
+            }
+
+            profile_scope!("opponent_forward");
+
+            // Gather observations for opponent envs (from raw)
+            let mut opp_obs: Vec<f32> = env_indices
+                .iter()
+                .flat_map(|&env_idx| {
+                    let start = env_idx * obs_dim;
+                    obs_flat_raw[start..start + obs_dim].iter().copied()
+                })
+                .collect();
+
+            // Load opponent model and normalizer together (single borrow)
+            let (opp_model, opp_norm) = opponent_pool
+                .get_model_and_normalizer(*pool_idx)
+                .expect("opponent model should load");
+
+            // Apply opponent's normalizer if present
+            if let Some(norm) = opp_norm {
+                norm.normalize_batch(&mut opp_obs, obs_dim);
+            }
+
+            let batch_size = env_indices.len();
+            let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(opp_obs.as_slice(), device)
+                .reshape([batch_size, obs_dim]);
+            let (logits, _values) = opp_model.forward(obs_tensor);
+
+            // Sample actions (opponents don't need log probs or values for training)
+            let actions = sample_categorical(logits, rng, device);
+
+            let actions_data: Vec<i64> = actions
+                .float()
+                .into_data()
+                .to_vec::<f32>()
+                .expect("actions to vec")
+                .into_iter()
+                .map(|x| x as i64)
+                .collect();
+
+            // Scatter actions to env arrays
+            for (batch_idx, &env_idx) in env_indices.iter().enumerate() {
+                all_env_actions[env_idx] = actions_data[batch_idx] as usize;
+            }
+        }
+
+        // Step environment
+        let (player_rewards, dones, completed) = {
+            profile_scope!("env_step_cpu");
+            let (_next_obs, player_rewards, dones, completed) = vec_env.step(&all_env_actions);
+            (player_rewards, dones, completed)
+        };
+
+        // Process completed episodes
+        for stats in &completed {
+            let env_idx = stats.env_index;
+            let is_opponent_game = env_idx < num_opponent_envs;
+
+            // Get placements from GameOutcome if available
+            let placements = stats.outcome.as_ref().map(|o| o.0.clone());
+
+            if is_opponent_game {
+                if let Some(ref places) = placements {
+                    // Track opponent completion for rating update
+                    let env_state = &env_states[env_idx];
+                    let opponent_indices: Vec<usize> = env_state
+                        .position_to_opponent
+                        .iter()
+                        .filter_map(|&opt| opt)
+                        .collect();
+
+                    opponent_completions.push(OpponentEpisodeCompletion {
+                        env_idx,
+                        placements: places.clone(),
+                        opponent_pool_indices: opponent_indices,
+                        is_opponent_game: true,
+                    });
+                }
+
+                // Shuffle positions for next episode (same opponents until rotation)
+                env_states[env_idx].shuffle_positions(num_players, rng);
+
+                // Apply pending rotation if any
+                env_states[env_idx].apply_pending_rotation();
+            }
+        }
+        all_completed.extend(completed);
+
+        // Store data - for opponent envs, only store if it's learner's turn
+        for (env_idx, &current_player) in current_players.iter().enumerate() {
+            let is_opponent_env = env_idx < num_opponent_envs;
+            let is_learner_turn = if is_opponent_env {
+                current_player == env_states[env_idx].learner_position
+            } else {
+                true // Self-play: all turns are learner
+            };
+
+            valid_indices.push(is_learner_turn);
+
+            // Always store data in buffer slots (will be masked later)
+            // Store normalized observations for learner envs
+            let obs_start = env_idx * obs_dim;
+            let mut env_obs = obs_flat_raw[obs_start..obs_start + obs_dim].to_vec();
+            // Normalize with learner's normalizer for buffer storage
+            if let Some(ref norm) = normalizer {
+                norm.normalize_batch(&mut env_obs, obs_dim);
+            }
+            all_obs.extend_from_slice(&env_obs);
+
+            all_actions.push(all_env_actions[env_idx] as i64);
+            all_log_probs.push(all_env_log_probs[env_idx]);
+
+            // Get acting player's reward and value
+            let acting_reward = player_rewards
+                .get(env_idx)
+                .and_then(|r| r.get(current_player))
+                .copied()
+                .unwrap_or(0.0);
+            all_acting_rewards.push(acting_reward);
+
+            let acting_value = all_env_values
+                .get(env_idx)
+                .and_then(|v| v.get(current_player))
+                .copied()
+                .unwrap_or(0.0);
+            all_acting_values.push(acting_value);
+
+            all_dones.push(if dones.get(env_idx).copied().unwrap_or(false) {
+                1.0
+            } else {
+                0.0
+            });
+
+            // Multi-player data
+            all_values_flat.extend_from_slice(&all_env_values[env_idx]);
+            let rewards_flat: Vec<f32> = (0..num_players)
+                .map(|p| {
+                    player_rewards
+                        .get(env_idx)
+                        .and_then(|r| r.get(p))
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            all_rewards_flat.extend_from_slice(&rewards_flat);
+            all_acting_players.push(current_player as i64);
+        }
+    }
+
+    // Batch transfer to GPU
+    {
+        profile_scope!("batch_gpu_transfer");
+        buffer.observations = Tensor::<B, 1>::from_floats(all_obs.as_slice(), device)
+            .reshape([num_steps, num_envs, obs_dim]);
+        buffer.actions = Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.rewards = Tensor::<B, 1>::from_floats(all_acting_rewards.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.dones = Tensor::<B, 1>::from_floats(all_dones.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.values = Tensor::<B, 1>::from_floats(all_acting_values.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+        buffer.log_probs = Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device)
+            .reshape([num_steps, num_envs]);
+
+        buffer.all_values = Tensor::<B, 1>::from_floats(all_values_flat.as_slice(), device)
+            .reshape([num_steps, num_envs, num_players]);
+        buffer.all_rewards = Tensor::<B, 1>::from_floats(all_rewards_flat.as_slice(), device)
+            .reshape([num_steps, num_envs, num_players]);
+        buffer.acting_players =
+            Tensor::<B, 1, Int>::from_ints(all_acting_players.as_slice(), device)
+                .reshape([num_steps, num_envs]);
+
+        // Create valid mask from valid_indices (1.0 for learner turns, 0.0 for opponent turns)
+        let valid_mask_data: Vec<f32> = valid_indices
+            .iter()
+            .map(|&valid| if valid { 1.0 } else { 0.0 })
+            .collect();
+        buffer.valid_mask = Some(
+            Tensor::<B, 1>::from_floats(valid_mask_data.as_slice(), device)
+                .reshape([num_steps, num_envs]),
+        );
+    }
+
+    // Update normalizer stats
+    if let Some(norm) = normalizer.as_mut() {
+        norm.update_batch(&raw_obs_for_stats, obs_dim);
+    }
+
+    (all_completed, opponent_completions)
 }
 
 /// Compute Generalized Advantage Estimation
@@ -620,10 +1026,42 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         advantages_inner,
         returns_inner,
         acting_players_inner,
+        old_values_inner,
+        valid_indices,
     ) = buffer.flatten();
 
-    // Keep old_values on InnerBackend for value clipping
-    let old_values_inner = buffer.values.clone();
+    // If opponent pool training, filter to only learner turn data
+    // This completely excludes opponent turn data from all computation
+    let (
+        obs_inner,
+        actions_inner,
+        old_log_probs_inner,
+        advantages_inner,
+        returns_inner,
+        acting_players_inner,
+        old_values_inner,
+    ) = if let Some(indices) = valid_indices {
+        (
+            obs_inner.select(0, indices.clone()),
+            actions_inner.select(0, indices.clone()),
+            old_log_probs_inner.select(0, indices.clone()),
+            advantages_inner.select(0, indices.clone()),
+            returns_inner.select(0, indices.clone()),
+            acting_players_inner.select(0, indices.clone()),
+            old_values_inner.select(0, indices),
+        )
+    } else {
+        (
+            obs_inner,
+            actions_inner,
+            old_log_probs_inner,
+            advantages_inner,
+            returns_inner,
+            acting_players_inner,
+            old_values_inner,
+        )
+    };
+
     let batch_size = obs_inner.dims()[0];
     let minibatch_size = batch_size / config.num_minibatches;
 
@@ -662,6 +1100,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 Tensor::from_ints(mb_indices.as_slice(), &device);
 
             // Select minibatch data on InnerBackend (no autodiff graph created)
+            // Data is already filtered to learner turns only (if opponent pool training)
             let mb_obs_inner = obs_inner.clone().select(0, mb_indices_inner.clone());
             let mb_actions_inner = actions_inner.clone().select(0, mb_indices_inner.clone());
             let mb_old_log_probs_inner = old_log_probs_inner
@@ -669,7 +1108,10 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 .select(0, mb_indices_inner.clone());
             let mb_advantages_inner = advantages_inner.clone().select(0, mb_indices_inner.clone());
             let mb_returns_inner = returns_inner.clone().select(0, mb_indices_inner.clone());
-            let mb_acting_players_inner = acting_players_inner.clone().select(0, mb_indices_inner);
+            let mb_acting_players_inner = acting_players_inner
+                .clone()
+                .select(0, mb_indices_inner.clone());
+            let mb_old_values_inner = old_values_inner.clone().select(0, mb_indices_inner);
 
             // Convert to autodiff for THIS minibatch only (fresh independent graph)
             // Each minibatch's graph is independent and can be fully freed at loop end
@@ -679,6 +1121,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_advantages_raw: Tensor<B, 1> = Tensor::from_inner(mb_advantages_inner);
             let mb_returns: Tensor<B, 1> = Tensor::from_inner(mb_returns_inner);
             let mb_acting_players: Tensor<B, 1, Int> = Tensor::from_inner(mb_acting_players_inner);
+            let mb_old_values: Tensor<B, 1> = Tensor::from_inner(mb_old_values_inner);
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
@@ -731,24 +1174,10 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 let policy_loss_mean = policy_loss.mean();
 
                 // Value loss (optionally clipped)
+                // Data is already filtered to learner turns only
                 let value_loss = if config.clip_value {
-                    // Select old values on InnerBackend, then convert to autodiff
-                    let mb_old_values_indices: Tensor<B::InnerBackend, 1, Int> = Tensor::from_ints(
-                        indices[mb_start..mb_end]
-                            .iter()
-                            .map(|&i| i as i64)
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                        &device,
-                    );
-                    let mb_old_values_inner = old_values_inner
-                        .clone()
-                        .flatten(0, 1)
-                        .select(0, mb_old_values_indices);
-                    let mb_old_values: Tensor<B, 1> = Tensor::from_inner(mb_old_values_inner);
-
                     let values_clipped = mb_old_values.clone()
-                        + (values.clone() - mb_old_values.clone())
+                        + (values.clone() - mb_old_values)
                             .clamp(-config.clip_epsilon, config.clip_epsilon);
                     let value_loss_1 = (values.clone() - mb_returns.clone()).powf_scalar(2.0);
                     let value_loss_2 = (values_clipped - mb_returns.clone()).powf_scalar(2.0);
@@ -993,7 +1422,16 @@ mod tests {
         buffer.advantages = Some(Tensor::ones([4, 2], &device));
         buffer.returns = Some(Tensor::ones([4, 2], &device));
 
-        let (obs, actions, log_probs, advantages, returns, acting_players) = buffer.flatten();
+        let (
+            obs,
+            actions,
+            log_probs,
+            advantages,
+            returns,
+            acting_players,
+            old_values,
+            valid_indices,
+        ) = buffer.flatten();
 
         assert_eq!(obs.dims(), [8, 3]);
         assert_eq!(actions.dims(), [8]);
@@ -1001,6 +1439,11 @@ mod tests {
         assert_eq!(advantages.dims(), [8]);
         assert_eq!(returns.dims(), [8]);
         assert_eq!(acting_players.dims(), [8]);
+        assert_eq!(old_values.dims(), [8]);
+        assert!(
+            valid_indices.is_none(),
+            "valid_indices should be None without valid_mask"
+        );
     }
 
     #[test]
@@ -1058,5 +1501,115 @@ mod tests {
         let ev = compute_explained_variance(&values, &returns);
         // Should be positive but less than 1
         assert!(ev > 0.0 && ev < 1.0, "Expected 0 < ev < 1, got {ev}");
+    }
+
+    #[test]
+    fn test_valid_mask_produces_correct_indices() {
+        // Test that valid_mask correctly filters to only learner turn indices
+        let device = Default::default();
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
+
+        // Set up required fields
+        buffer.advantages = Some(Tensor::ones([4, 2], &device));
+        buffer.returns = Some(Tensor::ones([4, 2], &device));
+
+        // Set valid_mask: alternating learner (1.0) and opponent (0.0) turns
+        // Shape [4, 2] flattens to [8] indices: 0,1,2,3,4,5,6,7
+        // Mask: [[1,0], [0,1], [1,0], [0,1]] -> flattened: [1,0,0,1,1,0,0,1]
+        // Valid indices should be: 0, 3, 4, 7
+        buffer.valid_mask = Some(Tensor::from_floats(
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+            &device,
+        ));
+
+        let (_, _, _, _, _, _, _, valid_indices) = buffer.flatten();
+
+        assert!(
+            valid_indices.is_some(),
+            "valid_indices should be Some with valid_mask"
+        );
+        let indices = valid_indices.unwrap();
+        assert_eq!(indices.dims(), [4], "Should have 4 valid indices");
+
+        let indices_data: Vec<i64> = indices.into_data().to_vec().expect("indices data");
+        assert_eq!(
+            indices_data,
+            vec![0, 3, 4, 7],
+            "Valid indices should match mask pattern"
+        );
+    }
+
+    #[test]
+    fn test_valid_mask_all_learner_turns() {
+        // When all turns are learner turns, valid_indices should include all
+        let device = Default::default();
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
+
+        buffer.advantages = Some(Tensor::ones([4, 2], &device));
+        buffer.returns = Some(Tensor::ones([4, 2], &device));
+
+        // All 1.0 = all learner turns
+        buffer.valid_mask = Some(Tensor::ones([4, 2], &device));
+
+        let (_, _, _, _, _, _, _, valid_indices) = buffer.flatten();
+
+        let indices = valid_indices.expect("should have valid_indices");
+        assert_eq!(indices.dims(), [8], "All 8 positions should be valid");
+
+        let indices_data: Vec<i64> = indices.into_data().to_vec().expect("indices data");
+        assert_eq!(indices_data, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_valid_mask_no_learner_turns() {
+        // Edge case: no learner turns (shouldn't happen in practice, but test robustness)
+        let device = Default::default();
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
+
+        buffer.advantages = Some(Tensor::ones([4, 2], &device));
+        buffer.returns = Some(Tensor::ones([4, 2], &device));
+
+        // All 0.0 = all opponent turns
+        buffer.valid_mask = Some(Tensor::zeros([4, 2], &device));
+
+        let (_, _, _, _, _, _, _, valid_indices) = buffer.flatten();
+
+        let indices = valid_indices.expect("should have valid_indices");
+        assert_eq!(indices.dims(), [0], "No positions should be valid");
+    }
+
+    #[test]
+    fn test_select_filters_data_correctly() {
+        // Test that selecting with valid_indices correctly filters tensor data
+        let device = Default::default();
+
+        // Create observation data where we can verify filtering
+        // Obs shape: [8, 3] - 8 timesteps, 3 features
+        let obs: Tensor<TestBackend, 2> = Tensor::from_floats(
+            [
+                [0.0, 1.0, 2.0],
+                [3.0, 4.0, 5.0],
+                [6.0, 7.0, 8.0],
+                [9.0, 10.0, 11.0],
+                [12.0, 13.0, 14.0],
+                [15.0, 16.0, 17.0],
+                [18.0, 19.0, 20.0],
+                [21.0, 22.0, 23.0],
+            ],
+            &device,
+        );
+
+        // Select indices 0, 3, 4, 7 (simulating learner turns)
+        let indices: Tensor<TestBackend, 1, Int> = Tensor::from_ints([0, 3, 4, 7], &device);
+        let filtered = obs.select(0, indices);
+
+        assert_eq!(filtered.dims(), [4, 3], "Should have 4 selected rows");
+
+        let filtered_data: Vec<f32> = filtered.into_data().to_vec().expect("filtered data");
+        // Row 0: [0, 1, 2], Row 3: [9, 10, 11], Row 4: [12, 13, 14], Row 7: [21, 22, 23]
+        assert_eq!(
+            filtered_data,
+            vec![0.0, 1.0, 2.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0]
+        );
     }
 }
