@@ -231,9 +231,9 @@ pub struct TrainArgs {
     #[arg(long)]
     pub pool_eval_temp_decay: bool,
 
-    /// Normalized margin threshold for updating "best" checkpoint from pool eval.
-    /// For 2-player: 0.10 = 55% win rate, 0.20 = 60% win rate.
-    /// None = use training rating or skip for multiplayer.
+    /// Win rate threshold for updating "best" checkpoint from pool eval.
+    /// 0.5 = match best, 0.55 = 55% win rate (recommended), 1.0 = always win.
+    /// Valid range: 0.5 to 1.0. None = use training rating for multiplayer.
     #[arg(long)]
     pub pool_eval_best_margin: Option<f32>,
 }
@@ -522,10 +522,9 @@ pub struct Config {
     /// Gradually decay temperature over cutoff moves (requires `pool_eval_temp_cutoff`)
     #[serde(default)]
     pub pool_eval_temp_decay: bool,
-    /// Normalized margin threshold for updating "best" checkpoint from pool eval.
-    /// When set, "best" is updated when normalized margin exceeds this threshold.
-    /// For 2-player: 0.10 = 55% win rate, 0.20 = 60% win rate.
-    /// None = use training rating for multiplayer with pool eval, skip otherwise.
+    /// Win rate threshold for updating "best" checkpoint from pool eval.
+    /// 0.5 = match best, 0.55 = 55% win rate (recommended), 1.0 = always win.
+    /// Valid range: 0.5 to 1.0. None = use training rating for multiplayer.
     #[serde(default)]
     pub pool_eval_best_margin: Option<f32>,
 
@@ -611,10 +610,10 @@ const fn default_opponent_pool_sample_temperature() -> f32 {
     1.0
 }
 const fn default_opponent_pool_eval_games() -> usize {
-    64
+    128
 }
 const fn default_opponent_pool_eval_opponents() -> usize {
-    5
+    10
 }
 
 impl Default for Config {
@@ -1105,6 +1104,15 @@ impl Config {
             }
             if self.opponent_pool_eval_opponents == 0 {
                 bail!("opponent_pool_eval_opponents must be > 0");
+            }
+        }
+
+        // Validate pool_eval_best_margin (win rate, so valid range is [0.5, 1.0])
+        if let Some(win_rate) = self.pool_eval_best_margin {
+            if !(0.5..=1.0).contains(&win_rate) {
+                bail!(
+                    "pool_eval_best_margin must be between 0.5 and 1.0 (0.5 = match best, 0.55 = 55% win rate, 1.0 = always win)"
+                );
             }
         }
 

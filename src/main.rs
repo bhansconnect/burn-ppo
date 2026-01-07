@@ -980,12 +980,14 @@ where
                             }
 
                             // Update "best" checkpoint based on vs_best_margin if threshold is set
-                            if let Some(margin_threshold) = config.pool_eval_best_margin {
-                                // Convert normalized threshold to raw Swiss points
-                                // Normalized margin M -> raw margin = M * max_swiss_points
-                                // For N players, max Swiss = N - 1
+                            if let Some(win_rate_threshold) = config.pool_eval_best_margin {
+                                // Convert win rate to raw Swiss point margin
+                                // User specifies win rate (0.5 = 50%, 0.55 = 55%, 1.0 = 100%)
+                                // Margin = 2 * win_rate - 1 (e.g., 0.55 -> 0.10)
+                                // For N players, scale by max Swiss points (N - 1)
                                 let max_swiss = f64::from(num_players - 1);
-                                let raw_threshold = f64::from(margin_threshold) * max_swiss;
+                                let raw_threshold =
+                                    (2.0 * f64::from(win_rate_threshold) - 1.0) * max_swiss;
 
                                 if result.vs_best_margin >= raw_threshold {
                                     // Resolve "latest" symlink to get actual checkpoint name
