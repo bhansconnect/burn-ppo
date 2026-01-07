@@ -1090,6 +1090,14 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         for mb_start in (0..batch_size).step_by(minibatch_size) {
             profile_scope!("ppo_minibatch");
             let mb_end = (mb_start + minibatch_size).min(batch_size);
+            let mb_size = mb_end - mb_start;
+
+            // Skip minibatches that are too small for stable normalization
+            // variance requires at least 2 samples to avoid NaN (sample var divides by n-1)
+            if mb_size < 2 {
+                continue;
+            }
+
             let mb_indices: Vec<i64> = indices[mb_start..mb_end]
                 .iter()
                 .map(|&i| i as i64)
@@ -1283,6 +1291,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         .into_data()
         .to_vec()
         .expect("returns to vec");
+
     let explained_variance = compute_explained_variance(&values_data, &returns_data);
 
     // Average metrics
