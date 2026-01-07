@@ -563,10 +563,10 @@ impl<B: Backend> OpponentPool<B> {
         let num_players = placements.len();
 
         // Build teams array in position order
-        // We'll use a reference rating for the learner (not updated)
+        // Use learner's current rating from pool evaluations to prevent opponent deflation
         let learner_rating = WengLinRating {
-            rating: 25.0, // Reference rating
-            uncertainty: DEFAULT_UNCERTAINTY,
+            rating: self.learner_rating.rating,
+            uncertainty: self.learner_rating.uncertainty,
         };
 
         // Collect ratings for all positions

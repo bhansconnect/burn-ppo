@@ -1005,7 +1005,9 @@ where
                 activation: config.activation.clone(),
                 split_networks: config.split_networks,
                 env_name: E::NAME.to_string(),
-                training_rating: 25.0,
+                training_rating: opponent_pool
+                    .as_ref()
+                    .map_or(25.0, |p| p.learner_rating().rating),
                 training_uncertainty: 25.0 / 3.0,
             };
 
@@ -1108,7 +1110,9 @@ where
             activation: config.activation.clone(),
             split_networks: config.split_networks,
             env_name: E::NAME.to_string(),
-            training_rating: 25.0,
+            training_rating: opponent_pool
+                .as_ref()
+                .map_or(25.0, |p| p.learner_rating().rating),
             training_uncertainty: 25.0 / 3.0,
         };
 
