@@ -24,7 +24,8 @@ use crate::normalization::ObsNormalizer;
 use crate::opponent_pool::{EnvState, OpponentPool};
 use crate::profile::{gpu_sync, profile_function, profile_scope};
 use crate::utils::{
-    entropy_categorical, log_prob_categorical, normalize_advantages, sample_categorical,
+    apply_action_mask, entropy_categorical, log_prob_categorical, normalize_advantages,
+    sample_categorical,
 };
 
 /// Flattened buffer data for minibatch processing:
@@ -246,6 +247,9 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             norm.normalize_batch(&mut obs_flat, obs_dim);
         }
 
+        // Get action masks for all environments
+        let action_masks = vec_env.get_action_masks();
+
         // Model inference: forward pass, sample actions, compute log probs, sync to CPU
         // All GPU ops batched together - timing includes actual compute (sync at end)
         let (actions_data, acting_values_data, log_probs_data, values_all_data) = {
@@ -256,8 +260,10 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             let (logits, values) = model.forward(obs_tensor);
             // values is [num_envs, num_players]
 
-            let actions = sample_categorical(logits.clone(), rng, device);
-            let log_probs = log_prob_categorical(logits, actions.clone());
+            // Apply action mask to prevent sampling invalid actions
+            let masked_logits = apply_action_mask(logits, action_masks);
+            let actions = sample_categorical(masked_logits.clone(), rng, device);
+            let log_probs = log_prob_categorical(masked_logits, actions.clone());
 
             // Sync to CPU - this is where actual GPU compute happens
             let actions_data: Vec<i64> = actions
@@ -475,6 +481,10 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             }
         }
 
+        // Get action masks for all environments
+        let all_action_masks = vec_env.get_action_masks();
+        let action_count = all_action_masks.as_ref().map_or(0, |m| m.len() / num_envs);
+
         // Prepare actions for all envs (will be filled in by model forward passes)
         let mut all_env_actions: Vec<usize> = vec![0; num_envs];
         let mut all_env_values: Vec<Vec<f32>> = vec![vec![0.0; num_players]; num_envs];
@@ -493,6 +503,17 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 })
                 .collect();
 
+            // Extract action masks for learner envs
+            let learner_masks: Option<Vec<bool>> = all_action_masks.as_ref().map(|all_masks| {
+                learner_env_indices
+                    .iter()
+                    .flat_map(|&env_idx| {
+                        let start = env_idx * action_count;
+                        all_masks[start..start + action_count].iter().copied()
+                    })
+                    .collect()
+            });
+
             // Apply learner's normalizer
             if let Some(ref norm) = normalizer {
                 norm.normalize_batch(&mut learner_obs, obs_dim);
@@ -504,8 +525,10 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                     .reshape([batch_size, obs_dim]);
             let (logits, values) = model.forward(obs_tensor);
 
-            let actions = sample_categorical(logits.clone(), rng, device);
-            let log_probs = log_prob_categorical(logits, actions.clone());
+            // Apply action mask to prevent sampling invalid actions
+            let masked_logits = apply_action_mask(logits, learner_masks);
+            let actions = sample_categorical(masked_logits.clone(), rng, device);
+            let log_probs = log_prob_categorical(masked_logits, actions.clone());
 
             // Sync to CPU
             let actions_data: Vec<i64> = actions
@@ -549,6 +572,17 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 })
                 .collect();
 
+            // Extract action masks for opponent envs
+            let opp_masks: Option<Vec<bool>> = all_action_masks.as_ref().map(|all_masks| {
+                env_indices
+                    .iter()
+                    .flat_map(|&env_idx| {
+                        let start = env_idx * action_count;
+                        all_masks[start..start + action_count].iter().copied()
+                    })
+                    .collect()
+            });
+
             // Load opponent model and normalizer together (single borrow)
             let (opp_model, opp_norm) = opponent_pool
                 .get_model_and_normalizer(*pool_idx)
@@ -564,8 +598,9 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 .reshape([batch_size, obs_dim]);
             let (logits, _values) = opp_model.forward(obs_tensor);
 
-            // Sample actions (opponents don't need log probs or values for training)
-            let actions = sample_categorical(logits, rng, device);
+            // Apply action mask and sample (opponents don't need log probs or values for training)
+            let masked_logits = apply_action_mask(logits, opp_masks);
+            let actions = sample_categorical(masked_logits, rng, device);
 
             let actions_data: Vec<i64> = actions
                 .float()

@@ -504,13 +504,15 @@ where
             config.learning_rate
         };
 
-        // Entropy coefficient annealing (decay to final value, default 10% of initial)
+        // Entropy coefficient annealing (decay to final value, default 50% of initial)
+        // Note: Official PPO uses constant entropy (ICLR blog). 50% is a safer default
+        // than the previous 10% which caused premature convergence in board games.
         let ent_coef = if config.entropy_anneal {
             let actual_update = update_offset + update;
             let progress_frac = actual_update as f64 / total_updates as f64;
             let final_coef = config
                 .entropy_coef_final
-                .unwrap_or(config.entropy_coef * 0.1);
+                .unwrap_or(config.entropy_coef * 0.5);
             config.entropy_coef + (final_coef - config.entropy_coef) * progress_frac
         } else {
             config.entropy_coef

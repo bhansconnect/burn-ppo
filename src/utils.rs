@@ -81,6 +81,34 @@ pub fn normalize_advantages<B: Backend>(advantages: Tensor<B, 1>) -> Tensor<B, 1
     (advantages - mean) / (std + 1e-8)
 }
 
+/// Apply action mask to logits by setting invalid actions to large negative value
+///
+/// mask: flattened [batch * `num_actions`] where true = valid action
+/// logits: [batch, `num_actions`]
+/// Returns logits with invalid actions set to -1e9 (effectively zero probability after softmax)
+pub fn apply_action_mask<B: Backend>(
+    logits: Tensor<B, 2>,
+    mask: Option<Vec<bool>>,
+) -> Tensor<B, 2> {
+    let Some(mask) = mask else {
+        return logits;
+    };
+
+    let [batch, num_actions] = logits.dims();
+    let device = logits.device();
+
+    // Convert bool mask to f32: true -> 0.0, false -> -1e9
+    let mask_values: Vec<f32> = mask
+        .iter()
+        .map(|&valid| if valid { 0.0 } else { -1e9 })
+        .collect();
+
+    let mask_tensor =
+        Tensor::<B, 1>::from_floats(mask_values.as_slice(), &device).reshape([batch, num_actions]);
+
+    logits + mask_tensor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +185,58 @@ mod tests {
         // Check std is approximately 1
         let std: f32 = normalized.var(0).sqrt().into_scalar();
         assert!((std - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_apply_action_mask_none() {
+        let device = Default::default();
+        let logits: Tensor<TestBackend, 2> = Tensor::from_floats([[1.0, 2.0, 3.0]], &device);
+
+        let masked = apply_action_mask(logits.clone(), None);
+
+        // Should return original logits unchanged
+        let original: Vec<f32> = logits.into_data().to_vec().unwrap();
+        let result: Vec<f32> = masked.into_data().to_vec().unwrap();
+        assert_eq!(original, result);
+    }
+
+    #[test]
+    fn test_apply_action_mask_some() {
+        let device = Default::default();
+        let logits: Tensor<TestBackend, 2> = Tensor::from_floats([[1.0, 2.0, 3.0, 4.0]], &device);
+
+        // Mask out actions 1 and 3
+        let mask = vec![true, false, true, false];
+        let masked = apply_action_mask(logits, Some(mask));
+
+        let result: Vec<f32> = masked.into_data().to_vec().unwrap();
+        assert_eq!(result[0], 1.0); // Valid, unchanged
+        assert!(result[1] < -1e8); // Invalid, very negative
+        assert_eq!(result[2], 3.0); // Valid, unchanged
+        assert!(result[3] < -1e8); // Invalid, very negative
+    }
+
+    #[test]
+    fn test_apply_action_mask_sampling() {
+        // Test that masked actions are never sampled
+        let device = Default::default();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+
+        // All actions equal, but mask out action 0
+        let logits: Tensor<TestBackend, 2> = Tensor::zeros([10, 4], &device);
+        let mask: Vec<bool> = (0..40)
+            .map(|i| i % 4 != 0) // Mask out action 0 for all batches
+            .collect();
+
+        let masked_logits = apply_action_mask(logits, Some(mask));
+        let actions = sample_categorical(masked_logits, &mut rng, &device);
+
+        // actions is already Tensor<B, 1, Int>, so no need for .int()
+        let actions_vec: Vec<i64> = actions.into_data().to_vec().unwrap();
+
+        // Action 0 should never be sampled
+        for action in actions_vec {
+            assert_ne!(action, 0, "Masked action 0 was sampled!");
+        }
     }
 }
