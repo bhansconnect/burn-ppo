@@ -1063,7 +1063,6 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     };
 
     let batch_size = obs_inner.dims()[0];
-    let minibatch_size = batch_size / config.num_minibatches;
 
     // Accumulators for metrics
     let mut total_policy_loss = 0.0;
@@ -1086,17 +1085,20 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         let mut indices: Vec<usize> = (0..batch_size).collect();
         indices.shuffle(rng);
 
-        // Minibatch loop
-        for mb_start in (0..batch_size).step_by(minibatch_size) {
-            profile_scope!("ppo_minibatch");
-            let mb_end = (mb_start + minibatch_size).min(batch_size);
-            let mb_size = mb_end - mb_start;
+        // Minibatch loop - distribute samples evenly across minibatches
+        // Example: 893 samples / 4 minibatches = 224, 223, 223, 223
+        let base_mb_size = batch_size / config.num_minibatches;
+        let remainder = batch_size % config.num_minibatches;
 
-            // Skip minibatches that are too small for stable normalization
-            // variance requires at least 2 samples to avoid NaN (sample var divides by n-1)
-            if mb_size < 2 {
-                continue;
+        let mut mb_start = 0;
+        for mb_idx in 0..config.num_minibatches {
+            profile_scope!("ppo_minibatch");
+            // First `remainder` batches get one extra sample
+            let mb_size = base_mb_size + usize::from(mb_idx < remainder);
+            if mb_size == 0 {
+                continue; // Skip if no samples (only if batch_size < num_minibatches)
             }
+            let mb_end = mb_start + mb_size;
 
             let mb_indices: Vec<i64> = indices[mb_start..mb_end]
                 .iter()
@@ -1273,6 +1275,8 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                     }
                 }
             }
+
+            mb_start = mb_end;
         }
     }
 
@@ -1620,5 +1624,100 @@ mod tests {
             filtered_data,
             vec![0.0, 1.0, 2.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 21.0, 22.0, 23.0]
         );
+    }
+
+    /// Helper to compute minibatch boundaries using the same logic as `ppo_update`
+    fn compute_minibatch_sizes(batch_size: usize, num_minibatches: usize) -> Vec<usize> {
+        let base_mb_size = batch_size / num_minibatches;
+        let remainder = batch_size % num_minibatches;
+
+        let mut sizes = Vec::new();
+        for mb_idx in 0..num_minibatches {
+            let mb_size = base_mb_size + usize::from(mb_idx < remainder);
+            if mb_size > 0 {
+                sizes.push(mb_size);
+            }
+        }
+        sizes
+    }
+
+    #[test]
+    fn test_minibatch_distribution_evenly_divisible() {
+        // 100 samples / 4 minibatches = 25 each
+        let sizes = compute_minibatch_sizes(100, 4);
+        assert_eq!(sizes, vec![25, 25, 25, 25]);
+        assert_eq!(sizes.iter().sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn test_minibatch_distribution_with_remainder() {
+        // 893 samples / 4 minibatches = 223 base + 1 remainder
+        // First 1 batch gets 224, remaining 3 get 223
+        let sizes = compute_minibatch_sizes(893, 4);
+        assert_eq!(sizes, vec![224, 223, 223, 223]);
+        assert_eq!(sizes.iter().sum::<usize>(), 893);
+    }
+
+    #[test]
+    fn test_minibatch_distribution_larger_remainder() {
+        // 14 samples / 4 minibatches = 3 base + 2 remainder
+        // First 2 batches get 4, remaining 2 get 3
+        let sizes = compute_minibatch_sizes(14, 4);
+        assert_eq!(sizes, vec![4, 4, 3, 3]);
+        assert_eq!(sizes.iter().sum::<usize>(), 14);
+    }
+
+    #[test]
+    fn test_minibatch_distribution_small_batch() {
+        // 3 samples / 4 minibatches - only 3 batches have samples
+        let sizes = compute_minibatch_sizes(3, 4);
+        assert_eq!(sizes, vec![1, 1, 1]);
+        assert_eq!(sizes.iter().sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn test_minibatch_distribution_single_sample() {
+        // 1 sample / 4 minibatches - only 1 batch has the sample
+        let sizes = compute_minibatch_sizes(1, 4);
+        assert_eq!(sizes, vec![1]);
+        assert_eq!(sizes.iter().sum::<usize>(), 1);
+    }
+
+    #[test]
+    fn test_minibatch_distribution_empty() {
+        // 0 samples - no batches
+        let sizes = compute_minibatch_sizes(0, 4);
+        assert!(sizes.is_empty());
+    }
+
+    #[test]
+    fn test_minibatch_boundaries_correct() {
+        // Verify that mb_start/mb_end boundaries don't overlap or skip samples
+        let batch_size = 893;
+        let num_minibatches = 4;
+        let base_mb_size = batch_size / num_minibatches;
+        let remainder = batch_size % num_minibatches;
+
+        let mut mb_start = 0;
+        let mut covered = vec![false; batch_size];
+
+        for mb_idx in 0..num_minibatches {
+            let mb_size = base_mb_size + usize::from(mb_idx < remainder);
+            if mb_size == 0 {
+                continue;
+            }
+            let mb_end = mb_start + mb_size;
+
+            // Mark these indices as covered
+            for c in &mut covered[mb_start..mb_end] {
+                assert!(!*c, "Index covered twice");
+                *c = true;
+            }
+
+            mb_start = mb_end;
+        }
+
+        // All indices should be covered exactly once
+        assert!(covered.iter().all(|&c| c), "Not all indices covered");
     }
 }
