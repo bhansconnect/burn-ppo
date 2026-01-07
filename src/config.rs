@@ -230,6 +230,12 @@ pub struct TrainArgs {
     /// Gradually decay pool eval temperature over cutoff moves
     #[arg(long)]
     pub pool_eval_temp_decay: bool,
+
+    /// Normalized margin threshold for updating "best" checkpoint from pool eval.
+    /// For 2-player: 0.10 = 55% win rate, 0.20 = 60% win rate.
+    /// None = use training rating or skip for multiplayer.
+    #[arg(long)]
+    pub pool_eval_best_margin: Option<f32>,
 }
 
 /// Arguments for evaluation
@@ -516,6 +522,12 @@ pub struct Config {
     /// Gradually decay temperature over cutoff moves (requires `pool_eval_temp_cutoff`)
     #[serde(default)]
     pub pool_eval_temp_decay: bool,
+    /// Normalized margin threshold for updating "best" checkpoint from pool eval.
+    /// When set, "best" is updated when normalized margin exceeds this threshold.
+    /// For 2-player: 0.10 = 55% win rate, 0.20 = 60% win rate.
+    /// None = use training rating for multiplayer with pool eval, skip otherwise.
+    #[serde(default)]
+    pub pool_eval_best_margin: Option<f32>,
 
     // Experiment
     #[serde(default = "default_seed")]
@@ -651,6 +663,7 @@ impl Default for Config {
             pool_eval_temp_final: 0.0,
             pool_eval_temp_cutoff: None, // Disabled by default
             pool_eval_temp_decay: false,
+            pool_eval_best_margin: None, // Use avg_return for single-player, skip for multiplayer
             seed: default_seed(),
             run_name: None,
             forked_from: None,
@@ -841,6 +854,9 @@ impl Config {
         }
         if args.pool_eval_temp_decay {
             self.pool_eval_temp_decay = true;
+        }
+        if let Some(v) = args.pool_eval_best_margin {
+            self.pool_eval_best_margin = Some(v);
         }
 
         // Experiment

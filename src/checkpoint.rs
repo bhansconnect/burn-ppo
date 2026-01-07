@@ -192,6 +192,20 @@ impl CheckpointManager {
         self.best_avg_return = value;
     }
 
+    /// Manually update the "best" symlink to point to a specific checkpoint.
+    ///
+    /// Used by pool evaluation to update best based on `vs_best_margin` rather than `avg_return`.
+    pub fn set_best_checkpoint(&self, checkpoint_name: &str) -> Result<()> {
+        let checkpoint_dir = self.checkpoints_dir.join(checkpoint_name);
+        if !checkpoint_dir.exists() {
+            anyhow::bail!(
+                "Checkpoint directory does not exist: {}",
+                checkpoint_dir.display()
+            );
+        }
+        self.update_symlink("best", &checkpoint_dir)
+    }
+
     /// Update a symlink atomically
     fn update_symlink(&self, name: &str, target: &Path) -> Result<()> {
         let link_path = self.checkpoints_dir.join(name);

@@ -470,6 +470,18 @@ where
     // Track steps since last pool evaluation
     let mut last_pool_eval_step: usize = 0;
 
+    // Track best training rating for pool-eval-based best selection
+    // (used when pool_eval is enabled but pool_eval_best_margin is not set)
+    let mut best_training_rating: f64 = opponent_pool
+        .as_ref()
+        .map_or(25.0, |p| p.learner_rating().rating);
+
+    // Determine how "best" checkpoint should be selected
+    // - Single-player: use avg_return (auto_update_best = true)
+    // - Multiplayer + pool_eval disabled: skip best tracking (auto_update_best = false)
+    // - Multiplayer + pool_eval enabled: manual update (auto_update_best = false)
+    let use_avg_return_for_best = num_players == 1;
+
     // Training loop
     for update in 0..num_updates {
         profile::profile_scope!("training_update");
@@ -966,6 +978,42 @@ where
                             if let Err(e) = pool.save_ratings() {
                                 eprintln!("Warning: Failed to save pool ratings after eval: {e}");
                             }
+
+                            // Update "best" checkpoint based on vs_best_margin if threshold is set
+                            if let Some(margin_threshold) = config.pool_eval_best_margin {
+                                // Convert normalized threshold to raw Swiss points
+                                // Normalized margin M -> raw margin = M * max_swiss_points
+                                // For N players, max Swiss = N - 1
+                                let max_swiss = f64::from(num_players - 1);
+                                let raw_threshold = f64::from(margin_threshold) * max_swiss;
+
+                                if result.vs_best_margin >= raw_threshold {
+                                    // Resolve "latest" symlink to get actual checkpoint name
+                                    let latest_path = run_dir.join("checkpoints/latest");
+                                    let checkpoint_name = if latest_path.is_symlink() {
+                                        std::fs::read_link(&latest_path).ok().and_then(|p| {
+                                            p.file_name().map(|n| n.to_string_lossy().into_owned())
+                                        })
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(name) = checkpoint_name {
+                                        if let Err(e) =
+                                            checkpoint_manager.set_best_checkpoint(&name)
+                                        {
+                                            eprintln!(
+                                                "Warning: Failed to update best checkpoint: {e}"
+                                            );
+                                        } else {
+                                            progress.println(&format!(
+                                                "[Pool Eval] Updated 'best' -> {name} (margin {:.2} >= {:.2})",
+                                                result.vs_best_margin, raw_threshold
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!("Warning: Pool evaluation failed: {e}");
@@ -1013,7 +1061,12 @@ where
                 training_uncertainty: 25.0 / 3.0,
             };
 
-            let checkpoint_path = checkpoint_manager.save(&model, &metadata, true)?;
+            // Determine whether to auto-update "best" symlink
+            // - Single-player: use avg_return
+            // - Multiplayer: manual control via pool eval (or skip if pool_eval disabled)
+            let auto_update_best = use_avg_return_for_best;
+
+            let checkpoint_path = checkpoint_manager.save(&model, &metadata, auto_update_best)?;
 
             // Save optimizer state alongside model
             if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
@@ -1038,6 +1091,22 @@ where
                 // Save pool ratings periodically
                 if let Err(e) = pool.save_ratings() {
                     eprintln!("Warning: Failed to save pool ratings: {e}");
+                }
+            }
+
+            // For multiplayer with pool_eval but no margin threshold: update best based on training_rating
+            if num_players > 1
+                && config.opponent_pool_eval_enabled
+                && config.pool_eval_best_margin.is_none()
+                && metadata.training_rating > best_training_rating
+            {
+                best_training_rating = metadata.training_rating;
+                let checkpoint_name = checkpoint_path
+                    .file_name()
+                    .expect("checkpoint has filename")
+                    .to_string_lossy();
+                if let Err(e) = checkpoint_manager.set_best_checkpoint(&checkpoint_name) {
+                    eprintln!("Warning: Failed to update best checkpoint: {e}");
                 }
             }
 
@@ -1118,7 +1187,10 @@ where
             training_uncertainty: 25.0 / 3.0,
         };
 
-        let checkpoint_path = checkpoint_manager.save(&model, &metadata, true)?;
+        // Determine whether to auto-update "best" symlink (same logic as regular checkpoints)
+        let auto_update_best = use_avg_return_for_best;
+
+        let checkpoint_path = checkpoint_manager.save(&model, &metadata, auto_update_best)?;
 
         // Save optimizer state alongside model
         if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
@@ -1143,6 +1215,22 @@ where
             // Save pool ratings
             if let Err(e) = pool.save_ratings() {
                 eprintln!("Warning: Failed to save pool ratings: {e}");
+            }
+        }
+
+        // For multiplayer with pool_eval but no margin threshold: update best based on training_rating
+        if num_players > 1
+            && config.opponent_pool_eval_enabled
+            && config.pool_eval_best_margin.is_none()
+            && metadata.training_rating > best_training_rating
+        {
+            // best_training_rating = metadata.training_rating; // Not needed, training ending
+            let checkpoint_name = checkpoint_path
+                .file_name()
+                .expect("checkpoint has filename")
+                .to_string_lossy();
+            if let Err(e) = checkpoint_manager.set_best_checkpoint(&checkpoint_name) {
+                eprintln!("Warning: Failed to update best checkpoint: {e}");
             }
         }
 
