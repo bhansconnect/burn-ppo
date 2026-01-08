@@ -34,9 +34,15 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// Number of players (1 for single-agent, 2+ for multi-player)
     const NUM_PLAYERS: usize = 1;
 
-    /// Default temperature for eval/tournament sampling.
+    /// Default starting temperature for evaluation/tournament play.
+    /// Higher values = more exploration/randomness.
     /// Stochastic games (e.g., bluffing games) should override to 1.0.
-    const DEFAULT_TEMP: f32 = 0.3;
+    const EVAL_TEMP: f32 = 0.3;
+
+    /// Optional temperature cutoff for evaluation: (`move_number`, `final_temp`).
+    /// After `move_number` moves, temperature drops to `final_temp`.
+    /// None = use constant temperature throughout.
+    const EVAL_TEMP_CUTOFF: Option<(usize, f32)> = None;
 
     /// Create a new environment with the given seed.
     /// For deterministic games, the seed may be ignored.

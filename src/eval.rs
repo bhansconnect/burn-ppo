@@ -99,11 +99,75 @@ impl TempSchedule {
         }
     }
 
-    /// Create a `TempSchedule` from CLI arguments with a default temperature
+    /// Create a `TempSchedule` from CLI arguments with environment defaults
+    ///
+    /// Uses `E::EVAL_TEMP` and `E::EVAL_TEMP_CUTOFF` as defaults, allowing CLI to override.
     ///
     /// # Errors
     /// Returns an error if --temp-final or --temp-decay is used without --temp-cutoff
+    pub fn from_args_with_env_defaults<E: Environment>(args: &EvalArgs) -> Result<Self> {
+        // If --no-temp-cutoff is set, disable cutoff entirely
+        if args.no_temp_cutoff {
+            return Ok(Self::new(
+                args.temp.unwrap_or(E::EVAL_TEMP),
+                0.0,
+                None,
+                false,
+            ));
+        }
+
+        // Get environment default cutoff
+        let env_cutoff = E::EVAL_TEMP_CUTOFF;
+
+        // Determine effective cutoff: CLI override > env default
+        let effective_cutoff = if args.temp_cutoff.is_some() {
+            args.temp_cutoff
+        } else {
+            env_cutoff.map(|(c, _)| c)
+        };
+
+        // Validate: temp_final and temp_decay require some cutoff
+        if effective_cutoff.is_none() {
+            if args.temp_final.is_some() {
+                anyhow::bail!("--temp-final requires --temp-cutoff to be set (or env default)");
+            }
+            if args.temp_decay {
+                anyhow::bail!("--temp-decay requires --temp-cutoff to be set (or env default)");
+            }
+        }
+
+        // Determine final temp: CLI override > env default > 0.0
+        let effective_final = args
+            .temp_final
+            .unwrap_or_else(|| env_cutoff.map_or(0.0, |(_, f)| f));
+
+        Ok(Self::new(
+            args.temp.unwrap_or(E::EVAL_TEMP),
+            effective_final,
+            effective_cutoff,
+            args.temp_decay,
+        ))
+    }
+
+    /// Create a `TempSchedule` from CLI arguments with a simple default temperature
+    ///
+    /// This is a simpler version that doesn't use environment defaults for cutoff.
+    /// Used for testing.
+    ///
+    /// # Errors
+    /// Returns an error if --temp-final or --temp-decay is used without --temp-cutoff
+    #[cfg(test)]
     pub fn from_args_with_default(args: &EvalArgs, default_temp: f32) -> Result<Self> {
+        // If --no-temp-cutoff is set, disable cutoff entirely
+        if args.no_temp_cutoff {
+            return Ok(Self::new(
+                args.temp.unwrap_or(default_temp),
+                0.0,
+                None,
+                false,
+            ));
+        }
+
         // Validate: temp_final and temp_decay require temp_cutoff
         if args.temp_cutoff.is_none() {
             if args.temp_final.is_some() {
@@ -120,6 +184,25 @@ impl TempSchedule {
             args.temp_cutoff,
             args.temp_decay,
         ))
+    }
+
+    /// Describe the temperature schedule for display
+    pub fn describe(&self) -> String {
+        match self.cutoff {
+            None => format!("temp={:.2} (constant)", self.initial),
+            Some(cutoff) if self.decay => {
+                format!(
+                    "temp={:.2}→{:.2} (decay over {} moves)",
+                    self.initial, self.final_temp, cutoff
+                )
+            }
+            Some(cutoff) => {
+                format!(
+                    "temp={:.2}→{:.2} (cutoff at move {})",
+                    self.initial, self.final_temp, cutoff
+                )
+            }
+        }
     }
 
     /// Get temperature for a given move number
@@ -703,7 +786,7 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
     seed: u64,
     current_step: usize,
     // Temperature parameters for pool evaluation
-    temp: Option<f32>, // None = use E::DEFAULT_TEMP
+    temp: Option<f32>, // None = use E::EVAL_TEMP
     temp_final: f32,
     temp_cutoff: Option<usize>,
     temp_decay: bool,
@@ -794,8 +877,16 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
         .collect();
 
     // Create temperature schedule (use environment default if not specified)
-    let initial_temp = temp.unwrap_or(E::DEFAULT_TEMP);
-    let temp_schedule = TempSchedule::new(initial_temp, temp_final, temp_cutoff, temp_decay);
+    let initial_temp = temp.unwrap_or(E::EVAL_TEMP);
+    // For pool eval, also apply env default cutoff if not overridden
+    let effective_cutoff = temp_cutoff.or_else(|| E::EVAL_TEMP_CUTOFF.map(|(c, _)| c));
+    let effective_final = if temp_cutoff.is_some() {
+        temp_final
+    } else {
+        E::EVAL_TEMP_CUTOFF.map_or(temp_final, |(_, f)| f)
+    };
+    let temp_schedule =
+        TempSchedule::new(initial_temp, effective_final, effective_cutoff, temp_decay);
 
     // Run games
     let num_envs = num_games.min(64);
@@ -1218,7 +1309,8 @@ fn run_interactive_evaluation<B: Backend>(
     // Dispatch based on environment name
     dispatch_env!(env_name, {
         // Create temp schedule with environment-specific default
-        let temp_schedule = TempSchedule::from_args_with_default(args, E::DEFAULT_TEMP)?;
+        let temp_schedule = TempSchedule::from_args_with_env_defaults::<E>(args)?;
+        println!("Temperature: {}", temp_schedule.describe());
 
         // Verify player count matches
         let expected_players = E::NUM_PLAYERS;
@@ -1266,7 +1358,8 @@ fn run_watch_mode<B: Backend>(
     // Dispatch based on env_name stored in checkpoint metadata
     crate::dispatch_env!(metadata.env_name, {
         // Create temp schedule with environment-specific default
-        let temp_schedule = TempSchedule::from_args_with_default(args, E::DEFAULT_TEMP)?;
+        let temp_schedule = TempSchedule::from_args_with_env_defaults::<E>(args)?;
+        println!("Temperature: {}", temp_schedule.describe());
 
         run_watch_mode_env::<B, E>(
             models,
@@ -1704,7 +1797,8 @@ fn run_stats_mode<B: Backend>(
     // Stats are printed inside run_stats_mode_env when not silent
     crate::dispatch_env!(metadata.env_name, {
         // Create temp schedule with environment-specific default
-        let temp_schedule = TempSchedule::from_args_with_default(args, E::DEFAULT_TEMP)?;
+        let temp_schedule = TempSchedule::from_args_with_env_defaults::<E>(args)?;
+        println!("Temperature: {}", temp_schedule.describe());
 
         run_stats_mode_env::<B, E>(
             models,
@@ -2090,6 +2184,7 @@ mod tests {
             temp: Some(0.5),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             temp_decay: false,
         };
         let schedule = TempSchedule::from_args_with_default(&args, 0.3).unwrap();
@@ -2127,6 +2222,7 @@ mod tests {
             temp: Some(0.5),
             temp_final: Some(0.1), // final without cutoff = error
             temp_cutoff: None,
+            no_temp_cutoff: false,
             temp_decay: false,
         };
         let result = TempSchedule::from_args_with_default(&args, 0.3);
@@ -2157,6 +2253,7 @@ mod tests {
             temp: Some(0.5),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             temp_decay: true, // decay without cutoff = error
         };
         let result = TempSchedule::from_args_with_default(&args, 0.3);

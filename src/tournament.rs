@@ -1757,15 +1757,28 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
     let format_name = if use_swiss { "Swiss" } else { "Round-Robin" };
     println!("Format: {format_name} ({num_rounds} rounds)");
-    println!();
 
-    // Temperature schedule - use environment default if not specified
-    let temp_schedule = TempSchedule::new(
-        args.temp.unwrap_or(E::DEFAULT_TEMP),
-        args.temp_final.unwrap_or(0.0),
-        args.temp_cutoff,
-        false,
-    );
+    // Temperature schedule - use environment defaults unless overridden
+    let temp_schedule = if args.no_temp_cutoff {
+        // Explicitly disable cutoff
+        TempSchedule::new(args.temp.unwrap_or(E::EVAL_TEMP), 0.0, None, false)
+    } else {
+        // Use CLI override or environment default for cutoff
+        let effective_cutoff = args
+            .temp_cutoff
+            .or_else(|| E::EVAL_TEMP_CUTOFF.map(|(c, _)| c));
+        let effective_final = args
+            .temp_final
+            .unwrap_or_else(|| E::EVAL_TEMP_CUTOFF.map_or(0.0, |(_, f)| f));
+        TempSchedule::new(
+            args.temp.unwrap_or(E::EVAL_TEMP),
+            effective_final,
+            effective_cutoff,
+            false,
+        )
+    };
+    println!("Temperature: {}", temp_schedule.describe());
+    println!();
 
     // RNG
     let seed = args.seed.unwrap_or_else(rand::random);
@@ -2662,6 +2675,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: Some(1),
             output: None,
@@ -2699,6 +2713,7 @@ mod tests {
             temp: Some(0.5),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: None,
             output: None,
@@ -2730,6 +2745,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: Some(3),
             output: None,
@@ -2760,6 +2776,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: None,
             output: None,
@@ -2792,6 +2809,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: None,
             output: None,
@@ -2825,6 +2843,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None, // No limit
             rounds: None,
             output: None,
@@ -2857,6 +2876,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: Some(3), // Limit to 3
             rounds: None,
             output: None,
@@ -2882,6 +2902,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: None,
             output: None,
@@ -2912,6 +2933,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: None,
             output: None,
@@ -3014,6 +3036,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: Some(4), // 4 total = 2 per folder (best + latest from each)
             rounds: None,
             output: None,
@@ -3077,6 +3100,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: Some(2), // 2 total = 1 per folder, should pick best-rated
             rounds: None,
             output: None,
@@ -3180,6 +3204,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: None,
             output: None,
@@ -3291,6 +3316,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: Some(2),
             output: None,
@@ -4054,6 +4080,7 @@ mod tests {
             temp: Some(1.0),
             temp_final: None,
             temp_cutoff: None,
+            no_temp_cutoff: false,
             limit: None,
             rounds: None,
             output: None,

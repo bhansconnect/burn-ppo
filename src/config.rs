@@ -306,6 +306,10 @@ pub struct EvalArgs {
     #[arg(long)]
     pub temp_cutoff: Option<usize>,
 
+    /// Disable temperature cutoff (overrides environment default)
+    #[arg(long)]
+    pub no_temp_cutoff: bool,
+
     /// Gradually decay temperature over cutoff moves (requires --temp-cutoff)
     #[arg(long)]
     pub temp_decay: bool,
@@ -356,6 +360,10 @@ pub struct TournamentArgs {
     /// Move number to switch from initial to final temperature
     #[arg(long)]
     pub temp_cutoff: Option<usize>,
+
+    /// Disable temperature cutoff (overrides environment default)
+    #[arg(long)]
+    pub no_temp_cutoff: bool,
 
     /// Random seed for reproducibility
     #[arg(long)]

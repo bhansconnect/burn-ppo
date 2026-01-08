@@ -348,7 +348,7 @@ impl Environment for LiarsDice {
     const ACTION_COUNT: usize = ACTION_COUNT;
     const NAME: &'static str = "liars_dice";
     const NUM_PLAYERS: usize = NUM_PLAYERS;
-    const DEFAULT_TEMP: f32 = 1.0; // Stochastic play essential for bluffing
+    const EVAL_TEMP: f32 = 1.0; // Stochastic play essential for bluffing
 
     fn new(seed: u64) -> Self {
         let mut env = Self {

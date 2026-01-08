@@ -212,6 +212,10 @@ impl Environment for ConnectFour {
     const ACTION_COUNT: usize = COLS; // 7
     const NAME: &'static str = "connect_four";
     const NUM_PLAYERS: usize = 2;
+    /// Moderate randomness in openings for game variety
+    const EVAL_TEMP: f32 = 0.4;
+    /// After 10 moves, play deterministically for precise tactical play
+    const EVAL_TEMP_CUTOFF: Option<(usize, f32)> = Some((10, 0.0));
 
     /// Create new game (seed ignored - game is deterministic)
     fn new(_seed: u64) -> Self {
