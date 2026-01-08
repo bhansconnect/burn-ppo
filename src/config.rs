@@ -343,7 +343,7 @@ pub struct TournamentArgs {
     /// Maximum checkpoints to select from each run directory
     /// Selects evenly spaced checkpoints including first and last
     #[arg(long)]
-    pub limit: Option<usize>,
+    pub limit_per_run: Option<usize>,
 
     /// Include a random agent as baseline
     #[arg(long)]

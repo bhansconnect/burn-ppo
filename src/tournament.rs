@@ -570,29 +570,6 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
         })
         .collect();
 
-    // Count run directories for limit splitting
-    let num_run_dirs = resolved_sources
-        .iter()
-        .filter(|p| is_run_checkpoints_dir(p))
-        .count();
-
-    // Calculate per-folder limits if limit is set and there are multiple run dirs
-    let per_folder_limits: Vec<usize> = if let Some(total_limit) = args.limit {
-        if num_run_dirs > 0 {
-            let base = total_limit / num_run_dirs;
-            let remainder = total_limit % num_run_dirs;
-            // Distribute remainder to earlier folders
-            (0..num_run_dirs)
-                .map(|i| base + usize::from(i < remainder))
-                .collect()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
-    let mut run_dir_idx = 0;
-
     // First pass: collect all checkpoint paths with their initial seeds
     let mut checkpoint_data: Vec<(PathBuf, f64)> = Vec::new();
 
@@ -614,11 +591,7 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
                 bail!("No checkpoints found in {}", path.display());
             }
 
-            // Get per-folder limit (if any)
-            let folder_limit = per_folder_limits.get(run_dir_idx).copied();
-            run_dir_idx += 1;
-
-            let selected = match folder_limit {
+            let selected = match args.limit_per_run {
                 Some(limit) => select_checkpoints_with_priority(&path, &checkpoints, limit),
                 None => checkpoints,
             };
@@ -2676,7 +2649,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: Some(1),
             output: None,
             seed: Some(42),
@@ -2714,7 +2687,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: None,
             output: None,
             seed: None,
@@ -2746,7 +2719,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: Some(3),
             output: None,
             seed: None,
@@ -2777,7 +2750,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: None,
             output: None,
             seed: None,
@@ -2810,7 +2783,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: None,
             output: None,
             seed: None,
@@ -2844,7 +2817,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None, // No limit
+            limit_per_run: None, // No limit
             rounds: None,
             output: None,
             seed: None,
@@ -2877,7 +2850,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: Some(3), // Limit to 3
+            limit_per_run: Some(3), // Limit to 3 per run
             rounds: None,
             output: None,
             seed: None,
@@ -2903,7 +2876,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: None,
             output: None,
             seed: None,
@@ -2934,7 +2907,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: None,
             output: None,
             seed: None,
@@ -3037,7 +3010,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: Some(4), // 4 total = 2 per folder (best + latest from each)
+            limit_per_run: Some(2), // 2 per folder (best + latest from each)
             rounds: None,
             output: None,
             seed: None,
@@ -3101,7 +3074,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: Some(2), // 2 total = 1 per folder, should pick best-rated
+            limit_per_run: Some(1), // 1 per folder, should pick best-rated
             rounds: None,
             output: None,
             seed: None,
@@ -3205,7 +3178,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: None,
             output: None,
             seed: None,
@@ -3317,7 +3290,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: Some(2),
             output: None,
             seed: None,
@@ -4081,7 +4054,7 @@ mod tests {
             temp_final: None,
             temp_cutoff: None,
             no_temp_cutoff: false,
-            limit: None,
+            limit_per_run: None,
             rounds: None,
             output: None,
             seed: None,
