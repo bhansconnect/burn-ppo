@@ -504,14 +504,11 @@ where
             }
         }
 
-        // Learning rate annealing (decay to final value, default 10% of initial)
+        // Learning rate annealing (decay to final value, default 0)
         let lr = if config.lr_anneal {
             let actual_update = update_offset + update;
             let progress_frac = actual_update as f64 / total_updates as f64;
-            let final_lr = config
-                .learning_rate_final
-                .unwrap_or(config.learning_rate * 0.1);
-            config.learning_rate + (final_lr - config.learning_rate) * progress_frac
+            config.learning_rate + (config.lr_final - config.learning_rate) * progress_frac
         } else {
             config.learning_rate
         };

@@ -120,9 +120,9 @@ pub struct TrainArgs {
     #[arg(long)]
     pub lr_anneal: Option<bool>,
 
-    /// Final learning rate when annealing (defaults to 10% of initial)
+    /// Final learning rate when annealing (default: 0)
     #[arg(long)]
-    pub learning_rate_final: Option<f64>,
+    pub lr_final: Option<f64>,
 
     #[arg(long)]
     pub gamma: Option<f64>,
@@ -423,9 +423,9 @@ pub struct Config {
     pub learning_rate: f64,
     #[serde(default = "default_true")]
     pub lr_anneal: bool,
-    /// Final learning rate when annealing (None = 10% of initial)
+    /// Final learning rate when annealing (default: 0)
     #[serde(default)]
-    pub learning_rate_final: Option<f64>,
+    pub lr_final: f64,
     #[serde(default = "default_gamma")]
     pub gamma: f64,
     #[serde(default = "default_gae_lambda")]
@@ -634,7 +634,7 @@ impl Default for Config {
             num_steps: default_num_steps(),
             learning_rate: default_learning_rate(),
             lr_anneal: default_true(),
-            learning_rate_final: None,
+            lr_final: 0.0,
             gamma: default_gamma(),
             gae_lambda: default_gae_lambda(),
             clip_epsilon: default_clip_epsilon(),
@@ -743,8 +743,8 @@ impl Config {
         if let Some(v) = args.lr_anneal {
             self.lr_anneal = v;
         }
-        if let Some(v) = args.learning_rate_final {
-            self.learning_rate_final = Some(v);
+        if let Some(v) = args.lr_final {
+            self.lr_final = v;
         }
         if let Some(v) = args.gamma {
             self.gamma = v;
@@ -906,8 +906,8 @@ impl Config {
         if args.lr_anneal.is_some() {
             ignored.push("--lr-anneal");
         }
-        if args.learning_rate_final.is_some() {
-            ignored.push("--learning-rate-final");
+        if args.lr_final.is_some() {
+            ignored.push("--lr-final");
         }
         if args.gamma.is_some() {
             ignored.push("--gamma");
