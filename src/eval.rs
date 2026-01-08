@@ -442,6 +442,29 @@ impl EvalStats {
             )
         };
 
+        // Compute draw counts per model (games where all players tied for 1st)
+        let mut draw_counts: Vec<usize> = vec![0; merged_names.len()];
+        for outcome in &self.game_outcomes {
+            let is_draw = outcome.0.iter().all(|&p| p == 1);
+            if is_draw {
+                if let Some(mapping) = slot_to_model {
+                    // Count draw for each model that participated
+                    for (slot, &model_idx) in mapping.iter().enumerate() {
+                        if slot < outcome.0.len() && model_idx < draw_counts.len() {
+                            draw_counts[model_idx] += 1;
+                        }
+                    }
+                } else {
+                    // No merging - each slot is its own model
+                    for (slot, _) in outcome.0.iter().enumerate() {
+                        if slot < draw_counts.len() {
+                            draw_counts[slot] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // Show placement distribution and Swiss points per checkpoint (or merged model)
         for (i, name) in merged_names.iter().enumerate() {
             if name.is_empty() {
@@ -454,14 +477,23 @@ impl EvalStats {
                 continue;
             }
 
-            let placement_pcts: Vec<String> = merged_placements[i]
-                .iter()
-                .enumerate()
-                .map(|(p, &count)| {
+            // Build placement percentages, separating draws from solo 1st
+            let mut placement_pcts: Vec<String> = Vec::new();
+            for (p, &count) in merged_placements[i].iter().enumerate() {
+                if p == 0 {
+                    // 1st place: subtract draws to get solo wins
+                    let solo_wins = count.saturating_sub(draw_counts[i]);
+                    let solo_pct = 100.0 * solo_wins as f64 / total_observations as f64;
+                    placement_pcts.push(format!("{solo_pct:.0}% 1st"));
+                } else {
                     let pct = 100.0 * count as f64 / total_observations as f64;
-                    format!("{:.0}% {}", pct, ordinal(p + 1))
-                })
-                .collect();
+                    placement_pcts.push(format!("{:.0}% {}", pct, ordinal(p + 1)));
+                }
+            }
+
+            // Add draw percentage at the end
+            let draw_pct = 100.0 * draw_counts[i] as f64 / total_observations as f64;
+            placement_pcts.push(format!("{draw_pct:.0}% Draw"));
 
             // Compute Swiss points: num_players - avg_placement (higher = better)
             let avg_placement: f64 = merged_placements[i]
