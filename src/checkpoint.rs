@@ -53,6 +53,28 @@ pub struct CheckpointMetadata {
     /// Whether split actor/critic networks were used
     #[serde(default)]
     pub split_networks: bool,
+    /// Network architecture type: "mlp" (default) or "cnn"
+    #[serde(default = "default_network_type")]
+    pub network_type: String,
+    /// Number of convolutional layers (CNN only)
+    #[serde(default = "default_num_conv_layers")]
+    pub num_conv_layers: usize,
+    /// Channels per conv layer (CNN only)
+    #[serde(default = "default_conv_channels")]
+    pub conv_channels: Vec<usize>,
+    /// Kernel size for conv layers (CNN only)
+    #[serde(default = "default_kernel_size")]
+    pub kernel_size: usize,
+    /// FC hidden layer size after conv (CNN only)
+    #[serde(default = "default_cnn_fc_hidden_size")]
+    pub cnn_fc_hidden_size: usize,
+    /// Number of FC layers after conv (CNN only)
+    #[serde(default = "default_cnn_num_fc_layers")]
+    pub cnn_num_fc_layers: usize,
+    /// Spatial observation shape (H, W, C) for CNN networks
+    /// None for MLP networks
+    #[serde(default)]
+    pub obs_shape: Option<(usize, usize, usize)>,
     /// Environment name for dispatching at eval time
     pub env_name: String,
     /// Training skill rating (Weng-Lin mu) for pool evaluation
@@ -70,6 +92,30 @@ fn default_rating() -> f64 {
 
 fn default_uncertainty() -> f64 {
     25.0 / 3.0 // ~8.333, standard Weng-Lin sigma
+}
+
+fn default_network_type() -> String {
+    "mlp".to_string()
+}
+
+fn default_num_conv_layers() -> usize {
+    2
+}
+
+fn default_conv_channels() -> Vec<usize> {
+    vec![64, 64]
+}
+
+fn default_kernel_size() -> usize {
+    3
+}
+
+fn default_cnn_fc_hidden_size() -> usize {
+    128
+}
+
+fn default_cnn_num_fc_layers() -> usize {
+    1
 }
 
 /// Manages checkpointing for a training run
@@ -160,13 +206,23 @@ impl CheckpointManager {
         // Create config with architecture from checkpoint metadata
         // (not current config, which may have different split_networks/hidden_size/etc.)
         let mut load_config = config.clone();
+        load_config.network_type.clone_from(&metadata.network_type);
         load_config.hidden_size = metadata.hidden_size;
         load_config.num_hidden = metadata.num_hidden;
         load_config.activation.clone_from(&metadata.activation);
         load_config.split_networks = metadata.split_networks;
+        // CNN-specific params
+        load_config.num_conv_layers = metadata.num_conv_layers;
+        load_config
+            .conv_channels
+            .clone_from(&metadata.conv_channels);
+        load_config.kernel_size = metadata.kernel_size;
+        load_config.cnn_fc_hidden_size = metadata.cnn_fc_hidden_size;
+        load_config.cnn_num_fc_layers = metadata.cnn_num_fc_layers;
 
         let default_model: ActorCritic<B> = ActorCritic::new(
             metadata.obs_dim,
+            metadata.obs_shape,
             metadata.action_count,
             metadata.num_players,
             &load_config,
@@ -375,7 +431,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, None, 2, 1, &config, &device);
         let metadata = CheckpointMetadata {
             step: 1000,
             avg_return: 150.0,
@@ -390,6 +446,13 @@ mod tests {
             num_hidden: 2,
             activation: "tanh".to_string(),
             split_networks: false,
+            network_type: "mlp".to_string(),
+            num_conv_layers: 2,
+            conv_channels: vec![64, 64],
+            kernel_size: 3,
+            cnn_fc_hidden_size: 128,
+            cnn_num_fc_layers: 1,
+            obs_shape: None,
             env_name: "cartpole".to_string(),
             training_rating: 0.0,
             training_uncertainty: 25.0 / 3.0,
@@ -421,7 +484,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, None, 2, 1, &config, &device);
 
         // Save first checkpoint with low return
         manager
@@ -441,6 +504,13 @@ mod tests {
                     num_hidden: 2,
                     activation: "tanh".to_string(),
                     split_networks: false,
+                    network_type: "mlp".to_string(),
+                    num_conv_layers: 2,
+                    conv_channels: vec![64, 64],
+                    kernel_size: 3,
+                    cnn_fc_hidden_size: 128,
+                    cnn_num_fc_layers: 1,
+                    obs_shape: None,
                     env_name: "cartpole".to_string(),
                     training_rating: 0.0,
                     training_uncertainty: 25.0 / 3.0,
@@ -467,6 +537,13 @@ mod tests {
                     num_hidden: 2,
                     activation: "tanh".to_string(),
                     split_networks: false,
+                    network_type: "mlp".to_string(),
+                    num_conv_layers: 2,
+                    conv_channels: vec![64, 64],
+                    kernel_size: 3,
+                    cnn_fc_hidden_size: 128,
+                    cnn_num_fc_layers: 1,
+                    obs_shape: None,
                     env_name: "cartpole".to_string(),
                     training_rating: 0.0,
                     training_uncertainty: 25.0 / 3.0,
@@ -493,6 +570,13 @@ mod tests {
                     num_hidden: 2,
                     activation: "tanh".to_string(),
                     split_networks: false,
+                    network_type: "mlp".to_string(),
+                    num_conv_layers: 2,
+                    conv_channels: vec![64, 64],
+                    kernel_size: 3,
+                    cnn_fc_hidden_size: 128,
+                    cnn_num_fc_layers: 1,
+                    obs_shape: None,
                     env_name: "cartpole".to_string(),
                     training_rating: 0.0,
                     training_uncertainty: 25.0 / 3.0,
@@ -574,6 +658,13 @@ mod tests {
             num_hidden: 3,
             activation: "relu".to_string(),
             split_networks: true,
+            network_type: "cnn".to_string(),
+            num_conv_layers: 3,
+            conv_channels: vec![32, 64, 64],
+            kernel_size: 4,
+            cnn_fc_hidden_size: 128,
+            cnn_num_fc_layers: 1,
+            obs_shape: Some((6, 7, 2)),
             env_name: "connect_four".to_string(),
             training_rating: 150.5,
             training_uncertainty: 5.0,
@@ -697,7 +788,8 @@ mod tests {
             ..Config::default()
         };
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &split_config, &device);
+        let model: ActorCritic<TestBackend> =
+            ActorCritic::new(4, None, 2, 1, &split_config, &device);
 
         let metadata = CheckpointMetadata {
             step: 1000,
@@ -713,6 +805,13 @@ mod tests {
             num_hidden: 2,
             activation: "tanh".to_string(),
             split_networks: true, // Saved as split
+            network_type: "mlp".to_string(),
+            num_conv_layers: 2,
+            conv_channels: vec![64, 64],
+            kernel_size: 3,
+            cnn_fc_hidden_size: 128,
+            cnn_num_fc_layers: 1,
+            obs_shape: None,
             env_name: "test".to_string(),
             training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,
@@ -751,7 +850,8 @@ mod tests {
         // Create config with shared backbone (default)
         let shared_config = Config::default();
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &shared_config, &device);
+        let model: ActorCritic<TestBackend> =
+            ActorCritic::new(4, None, 2, 1, &shared_config, &device);
 
         let metadata = CheckpointMetadata {
             step: 1000,
@@ -767,6 +867,13 @@ mod tests {
             num_hidden: 2,
             activation: "tanh".to_string(),
             split_networks: false, // Saved as shared
+            network_type: "mlp".to_string(),
+            num_conv_layers: 2,
+            conv_channels: vec![64, 64],
+            kernel_size: 3,
+            cnn_fc_hidden_size: 128,
+            cnn_num_fc_layers: 1,
+            obs_shape: None,
             env_name: "test".to_string(),
             training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,
@@ -811,7 +918,7 @@ mod tests {
             ..Config::default()
         };
         let split_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, 2, 1, &split_config, &device);
+            ActorCritic::new(4, None, 2, 1, &split_config, &device);
 
         let split_metadata = CheckpointMetadata {
             step: 1000,
@@ -827,6 +934,13 @@ mod tests {
             num_hidden: 2,
             activation: "tanh".to_string(),
             split_networks: true,
+            network_type: "mlp".to_string(),
+            num_conv_layers: 2,
+            conv_channels: vec![64, 64],
+            kernel_size: 3,
+            cnn_fc_hidden_size: 128,
+            cnn_num_fc_layers: 1,
+            obs_shape: None,
             env_name: "test".to_string(),
             training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,
@@ -836,7 +950,7 @@ mod tests {
         // Create and save shared network model
         let shared_config = Config::default();
         let shared_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, 2, 1, &shared_config, &device);
+            ActorCritic::new(4, None, 2, 1, &shared_config, &device);
 
         let shared_metadata = CheckpointMetadata {
             step: 2000,
@@ -852,6 +966,13 @@ mod tests {
             num_hidden: 2,
             activation: "tanh".to_string(),
             split_networks: false,
+            network_type: "mlp".to_string(),
+            num_conv_layers: 2,
+            conv_channels: vec![64, 64],
+            kernel_size: 3,
+            cnn_fc_hidden_size: 128,
+            cnn_num_fc_layers: 1,
+            obs_shape: None,
             env_name: "test".to_string(),
             training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,

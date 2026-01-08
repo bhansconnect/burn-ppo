@@ -175,13 +175,15 @@ where
     let mut vec_env = VecEnv::new(num_envs, env_factory);
 
     let obs_dim = E::OBSERVATION_DIM;
+    let obs_shape = E::OBSERVATION_SHAPE;
     let action_count = E::ACTION_COUNT;
     let num_players = E::NUM_PLAYERS as u8;
     println!(
-        "Created {} {} environments (obs_dim={}, actions={}, players={})",
+        "Created {} {} environments (obs_dim={}, obs_shape={:?}, actions={}, players={})",
         num_envs,
         E::NAME,
         obs_dim,
+        obs_shape,
         action_count,
         num_players
     );
@@ -211,10 +213,16 @@ where
     // Initialize model and optimizer based on mode
     let (mut model, mut optimizer, mut global_step, mut recent_returns, best_return) = match mode {
         TrainingMode::Fresh => {
-            let model: ActorCritic<TB> =
-                ActorCritic::new(obs_dim, action_count, num_players as usize, config, device);
+            let model: ActorCritic<TB> = ActorCritic::new(
+                obs_dim,
+                obs_shape,
+                action_count,
+                num_players as usize,
+                config,
+                device,
+            );
             let optimizer = optimizer_config.init();
-            println!("Created ActorCritic network");
+            println!("Created {} ActorCritic network", config.network_type);
             (model, optimizer, 0, Vec::new(), f32::NEG_INFINITY)
         }
         TrainingMode::Resume { checkpoint_dir, .. } | TrainingMode::Fork { checkpoint_dir } => {
@@ -326,6 +334,13 @@ where
             num_hidden: config.num_hidden,
             activation: config.activation.clone(),
             split_networks: config.split_networks,
+            network_type: config.network_type.clone(),
+            num_conv_layers: config.num_conv_layers,
+            conv_channels: config.conv_channels.clone(),
+            kernel_size: config.kernel_size,
+            cnn_fc_hidden_size: config.cnn_fc_hidden_size,
+            cnn_num_fc_layers: config.cnn_num_fc_layers,
+            obs_shape,
             env_name: E::NAME.to_string(),
             training_rating: 25.0,
             training_uncertainty: 25.0 / 3.0,
@@ -1119,6 +1134,13 @@ where
                 num_hidden: config.num_hidden,
                 activation: config.activation.clone(),
                 split_networks: config.split_networks,
+                network_type: config.network_type.clone(),
+                num_conv_layers: config.num_conv_layers,
+                conv_channels: config.conv_channels.clone(),
+                kernel_size: config.kernel_size,
+                cnn_fc_hidden_size: config.cnn_fc_hidden_size,
+                cnn_num_fc_layers: config.cnn_num_fc_layers,
+                obs_shape,
                 env_name: E::NAME.to_string(),
                 training_rating: opponent_pool
                     .as_ref()
@@ -1245,6 +1267,13 @@ where
             num_hidden: config.num_hidden,
             activation: config.activation.clone(),
             split_networks: config.split_networks,
+            network_type: config.network_type.clone(),
+            num_conv_layers: config.num_conv_layers,
+            conv_channels: config.conv_channels.clone(),
+            kernel_size: config.kernel_size,
+            cnn_fc_hidden_size: config.cnn_fc_hidden_size,
+            cnn_num_fc_layers: config.cnn_num_fc_layers,
+            obs_shape,
             env_name: E::NAME.to_string(),
             training_rating: opponent_pool
                 .as_ref()

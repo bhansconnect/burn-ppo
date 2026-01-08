@@ -34,6 +34,19 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// Number of players (1 for single-agent, 2+ for multi-player)
     const NUM_PLAYERS: usize = 1;
 
+    /// Spatial observation shape for CNN networks: (height, width, channels)
+    /// If None, CNN cannot be used (only MLP).
+    ///
+    /// **Layout convention**: The observation vector is structured as:
+    ///   `[spatial_data..., extra_features...]`
+    /// where:
+    ///   - `spatial_data` has size H * W * C (can be reshaped to [H, W, C])
+    ///   - `extra_features` has size `OBSERVATION_DIM` - (H * W * C)
+    ///
+    /// For CNN: `spatial_data` goes through conv layers, `extra_features`
+    /// are concatenated after flattening the conv output.
+    const OBSERVATION_SHAPE: Option<(usize, usize, usize)> = None;
+
     /// Default starting temperature for evaluation/tournament play.
     /// Higher values = more exploration/randomness.
     /// Stochastic games (e.g., bluffing games) should override to 1.0.

@@ -212,6 +212,9 @@ impl Environment for ConnectFour {
     const ACTION_COUNT: usize = COLS; // 7
     const NAME: &'static str = "connect_four";
     const NUM_PLAYERS: usize = 2;
+    /// 6 rows × 7 cols × 2 channels (one plane per player)
+    /// Note: Turn indicator (2 values) is at the END as extra features
+    const OBSERVATION_SHAPE: Option<(usize, usize, usize)> = Some((ROWS, COLS, 2));
     /// Moderate randomness in openings for game variety
     const EVAL_TEMP: f32 = 0.4;
     /// After 10 moves, play deterministically for precise tactical play

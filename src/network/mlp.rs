@@ -13,7 +13,7 @@ use crate::profile::{profile_function, profile_scope};
 /// Per ICLR blog "37 Implementation Details of PPO":
 /// - Weights: Orthogonal initialization with specified gain
 /// - Biases: Zeros
-fn create_linear_orthogonal<B: Backend>(
+pub fn create_linear_orthogonal<B: Backend>(
     d_input: usize,
     d_output: usize,
     gain: f64,
@@ -37,12 +37,12 @@ fn create_linear_orthogonal<B: Backend>(
     }
 }
 
-/// Actor-Critic network with optional split architecture
+/// MLP Actor-Critic network with optional split architecture
 ///
 /// When `split_networks` is false (default): shared backbone with separate heads
 /// When `split_networks` is true: separate actor and critic networks
 #[derive(Module, Debug)]
-pub struct ActorCritic<B: Backend> {
+pub struct MlpActorCritic<B: Backend> {
     /// Actor hidden layers (or shared backbone when `split_networks` is false)
     pub layers: Vec<nn::Linear<B>>,
     /// Critic hidden layers (only populated when `split_networks` is true)
@@ -62,8 +62,8 @@ pub struct ActorCritic<B: Backend> {
     split_networks: bool,
 }
 
-impl<B: Backend> ActorCritic<B> {
-    /// Create a new `ActorCritic` network
+impl<B: Backend> MlpActorCritic<B> {
+    /// Create a new `MlpActorCritic` network
     ///
     /// Uses orthogonal initialization with specific gains (per ICLR blog):
     /// - Hidden layers: sqrt(2) for `ReLU`, 1.0 for tanh
@@ -232,7 +232,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
         // Single-player: num_players = 1
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
+        let model: MlpActorCritic<TestBackend> = MlpActorCritic::new(4, 2, 1, &config, &device);
 
         let batch_size = 8;
         let obs = Tensor::zeros([batch_size, 4], &device);
@@ -247,7 +247,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
         // Two-player game
-        let model: ActorCritic<TestBackend> = ActorCritic::new(86, 7, 2, &config, &device);
+        let model: MlpActorCritic<TestBackend> = MlpActorCritic::new(86, 7, 2, &config, &device);
 
         let batch_size = 8;
         let obs = Tensor::zeros([batch_size, 86], &device);
@@ -261,7 +261,7 @@ mod tests {
     fn test_action_probs_sum_to_one() {
         let device = Default::default();
         let config = Config::default();
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
+        let model: MlpActorCritic<TestBackend> = MlpActorCritic::new(4, 2, 1, &config, &device);
 
         let obs = Tensor::zeros([1, 4], &device);
         let (logits, _) = model.forward(obs);
@@ -276,10 +276,10 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model1: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
+        let model1: MlpActorCritic<TestBackend> = MlpActorCritic::new(4, 2, 1, &config, &device);
         assert_eq!(model1.num_players(), 1);
 
-        let model2: ActorCritic<TestBackend> = ActorCritic::new(86, 7, 2, &config, &device);
+        let model2: MlpActorCritic<TestBackend> = MlpActorCritic::new(86, 7, 2, &config, &device);
         assert_eq!(model2.num_players(), 2);
     }
 
@@ -291,7 +291,7 @@ mod tests {
             ..Config::default()
         };
         // Single-player with split networks
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
+        let model: MlpActorCritic<TestBackend> = MlpActorCritic::new(4, 2, 1, &config, &device);
 
         // Verify critic_layers is populated
         assert_eq!(model.critic_layers.len(), config.num_hidden);
@@ -313,7 +313,7 @@ mod tests {
             ..Config::default()
         };
         // Two-player game with split networks
-        let model: ActorCritic<TestBackend> = ActorCritic::new(86, 7, 2, &config, &device);
+        let model: MlpActorCritic<TestBackend> = MlpActorCritic::new(86, 7, 2, &config, &device);
 
         let batch_size = 8;
         let obs = Tensor::zeros([batch_size, 86], &device);
@@ -329,8 +329,8 @@ mod tests {
 
         // Shared backbone (default)
         let shared_config = Config::default();
-        let shared_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, 2, 1, &shared_config, &device);
+        let shared_model: MlpActorCritic<TestBackend> =
+            MlpActorCritic::new(4, 2, 1, &shared_config, &device);
         assert!(shared_model.critic_layers.is_empty());
         assert!(!shared_model.split_networks);
 
@@ -339,8 +339,8 @@ mod tests {
             split_networks: true,
             ..Config::default()
         };
-        let split_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, 2, 1, &split_config, &device);
+        let split_model: MlpActorCritic<TestBackend> =
+            MlpActorCritic::new(4, 2, 1, &split_config, &device);
         assert!(!split_model.critic_layers.is_empty());
         assert!(split_model.split_networks);
         assert_eq!(split_model.critic_layers.len(), split_config.num_hidden);
@@ -354,7 +354,7 @@ mod tests {
             ..Config::default()
         };
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, 2, 1, &config, &device);
+        let model: MlpActorCritic<TestBackend> = MlpActorCritic::new(4, 2, 1, &config, &device);
 
         // Use non-zero input to verify actor and critic produce different outputs
         // (since they have independently initialized weights)

@@ -104,6 +104,10 @@ pub struct TrainArgs {
     pub activation: Option<String>,
 
     // --- Network ---
+    /// Network architecture type: "mlp" or "cnn"
+    #[arg(long)]
+    pub network_type: Option<String>,
+
     /// Use separate actor and critic networks instead of shared backbone
     #[arg(long, action = clap::ArgAction::Set, help = "Use separate actor/critic networks (default: false)")]
     pub split_networks: Option<bool>,
@@ -113,6 +117,23 @@ pub struct TrainArgs {
 
     #[arg(long, help = "Number of hidden layers (default: 2)")]
     pub num_hidden: Option<usize>,
+
+    // --- CNN Network Parameters ---
+    /// Number of convolutional layers
+    #[arg(long)]
+    pub num_conv_layers: Option<usize>,
+
+    /// Kernel size for all conv layers
+    #[arg(long)]
+    pub kernel_size: Option<usize>,
+
+    /// FC hidden layer size after conv
+    #[arg(long)]
+    pub cnn_fc_hidden_size: Option<usize>,
+
+    /// Number of FC layers after conv
+    #[arg(long)]
+    pub cnn_num_fc_layers: Option<usize>,
 
     // --- PPO Hyperparameters ---
     #[arg(long, help = "Steps per rollout (default: 128)")]
@@ -536,6 +557,9 @@ pub struct Config {
     pub max_training_time: Option<String>,
 
     // Network
+    /// Network architecture type: "mlp" (default) or "cnn"
+    #[serde(default = "default_network_type")]
+    pub network_type: String,
     #[serde(default = "default_hidden_size")]
     pub hidden_size: usize,
     #[serde(default = "default_num_hidden")]
@@ -545,6 +569,23 @@ pub struct Config {
     /// Use separate actor and critic networks instead of shared backbone
     #[serde(default)]
     pub split_networks: bool,
+
+    // CNN-specific parameters (ignored when network_type = "mlp")
+    /// Number of convolutional layers (default: 2)
+    #[serde(default = "default_num_conv_layers")]
+    pub num_conv_layers: usize,
+    /// Channels per conv layer (default: [64, 64])
+    #[serde(default = "default_conv_channels")]
+    pub conv_channels: Vec<usize>,
+    /// Kernel size for all conv layers (default: 3)
+    #[serde(default = "default_kernel_size")]
+    pub kernel_size: usize,
+    /// FC hidden layer size after conv (default: 128)
+    #[serde(default = "default_cnn_fc_hidden_size")]
+    pub cnn_fc_hidden_size: usize,
+    /// Number of FC layers after conv (default: 1)
+    #[serde(default = "default_cnn_num_fc_layers")]
+    pub cnn_num_fc_layers: usize,
 
     // Checkpointing
     #[serde(default = "default_run_dir")]
@@ -688,6 +729,24 @@ const fn default_num_hidden() -> usize {
 fn default_activation() -> String {
     "tanh".to_string()
 }
+fn default_network_type() -> String {
+    "mlp".to_string()
+}
+const fn default_num_conv_layers() -> usize {
+    2
+}
+fn default_conv_channels() -> Vec<usize> {
+    vec![64, 64]
+}
+const fn default_kernel_size() -> usize {
+    3
+}
+const fn default_cnn_fc_hidden_size() -> usize {
+    128
+}
+const fn default_cnn_num_fc_layers() -> usize {
+    1
+}
 fn default_run_dir() -> PathBuf {
     PathBuf::from("runs")
 }
@@ -753,10 +812,16 @@ impl Default for Config {
             num_minibatches: default_num_minibatches(),
             adam_epsilon: default_adam_epsilon(),
             max_training_time: None,
+            network_type: default_network_type(),
             hidden_size: default_hidden_size(),
             num_hidden: default_num_hidden(),
             activation: default_activation(),
             split_networks: false,
+            num_conv_layers: default_num_conv_layers(),
+            conv_channels: default_conv_channels(),
+            kernel_size: default_kernel_size(),
+            cnn_fc_hidden_size: default_cnn_fc_hidden_size(),
+            cnn_num_fc_layers: default_cnn_num_fc_layers(),
             run_dir: default_run_dir(),
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
@@ -928,6 +993,9 @@ impl Config {
         }
 
         // Network
+        if let Some(network_type) = &args.network_type {
+            self.network_type.clone_from(network_type);
+        }
         if let Some(v) = args.hidden_size {
             self.hidden_size = v;
         }
@@ -939,6 +1007,19 @@ impl Config {
         }
         if let Some(v) = args.split_networks {
             self.split_networks = v;
+        }
+        // CNN parameters
+        if let Some(v) = args.num_conv_layers {
+            self.num_conv_layers = v;
+        }
+        if let Some(v) = args.kernel_size {
+            self.kernel_size = v;
+        }
+        if let Some(v) = args.cnn_fc_hidden_size {
+            self.cnn_fc_hidden_size = v;
+        }
+        if let Some(v) = args.cnn_num_fc_layers {
+            self.cnn_num_fc_layers = v;
         }
 
         // Checkpointing/Logging
@@ -1268,6 +1349,25 @@ impl Config {
                 "Unknown activation '{}'. Supported: tanh, relu",
                 self.activation
             );
+        }
+
+        // Validate network type
+        if !["mlp", "cnn"].contains(&self.network_type.as_str()) {
+            bail!(
+                "Unknown network_type '{}'. Supported: mlp, cnn",
+                self.network_type
+            );
+        }
+
+        // Validate CNN parameters
+        if self.num_conv_layers == 0 {
+            bail!("num_conv_layers must be > 0");
+        }
+        if self.kernel_size == 0 {
+            bail!("kernel_size must be > 0");
+        }
+        if self.conv_channels.is_empty() {
+            bail!("conv_channels must not be empty");
         }
 
         // Validate opponent pool config

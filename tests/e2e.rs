@@ -730,6 +730,291 @@ run_dir = "{}"
 }
 
 // ============================================================================
+// CNN Network Tests
+// ============================================================================
+
+#[test]
+fn test_cnn_training_connect_four() {
+    let dir = tempdir().unwrap();
+
+    // Create config for connect four with CNN
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 2
+num_steps = 8
+total_timesteps = 32
+num_epochs = 1
+num_minibatches = 1
+network_type = "cnn"
+num_conv_layers = 1
+conv_channels = [8]
+kernel_size = 3
+cnn_fc_hidden_size = 16
+cnn_num_fc_layers = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 16
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("cnn_config.toml");
+    fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "CNN training failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify checkpoint created
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let checkpoints = run_dir.join("checkpoints");
+    assert!(checkpoints.exists(), "Checkpoints directory should exist");
+}
+
+#[test]
+fn test_cnn_checkpoint_resume() {
+    let dir = tempdir().unwrap();
+
+    // Phase 1: Train CNN model
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 2
+num_steps = 8
+total_timesteps = 32
+num_epochs = 1
+num_minibatches = 1
+network_type = "cnn"
+num_conv_layers = 1
+conv_channels = [8]
+kernel_size = 3
+cnn_fc_hidden_size = 16
+cnn_num_fc_layers = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 16
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("cnn_config.toml");
+    fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "Initial CNN training failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Phase 2: Resume training from checkpoint
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let run_dir_str = run_dir.to_str().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--resume", run_dir_str, "--total-timesteps", "128"])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "CNN checkpoint resume failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_cnn_checkpoint_metadata() {
+    let dir = tempdir().unwrap();
+
+    // Train CNN model
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 2
+num_steps = 8
+total_timesteps = 32
+num_epochs = 1
+num_minibatches = 1
+network_type = "cnn"
+num_conv_layers = 1
+conv_channels = [8]
+kernel_size = 3
+cnn_fc_hidden_size = 16
+cnn_num_fc_layers = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 16
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("cnn_config.toml");
+    fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(output.status.success(), "CNN training failed");
+
+    // Verify metadata contains CNN fields
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let latest_checkpoint = run_dir.join("checkpoints/latest");
+    let metadata_path = latest_checkpoint.join("metadata.json");
+
+    assert!(metadata_path.exists(), "metadata.json should exist");
+
+    let metadata_content = fs::read_to_string(&metadata_path).unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&metadata_content).unwrap();
+
+    // Verify CNN-specific fields
+    assert_eq!(
+        metadata["network_type"].as_str(),
+        Some("cnn"),
+        "network_type should be 'cnn'"
+    );
+    assert_eq!(
+        metadata["num_conv_layers"].as_u64(),
+        Some(1),
+        "num_conv_layers should be 1"
+    );
+    assert_eq!(
+        metadata["kernel_size"].as_u64(),
+        Some(3),
+        "kernel_size should be 3"
+    );
+    assert_eq!(
+        metadata["cnn_fc_hidden_size"].as_u64(),
+        Some(16),
+        "cnn_fc_hidden_size should be 16"
+    );
+
+    // Verify obs_shape for connect four
+    let obs_shape = metadata["obs_shape"]
+        .as_array()
+        .expect("obs_shape should be array");
+    assert_eq!(obs_shape.len(), 3, "obs_shape should have 3 elements");
+    assert_eq!(obs_shape[0].as_u64(), Some(6), "height should be 6");
+    assert_eq!(obs_shape[1].as_u64(), Some(7), "width should be 7");
+    assert_eq!(obs_shape[2].as_u64(), Some(2), "channels should be 2");
+}
+
+#[test]
+fn test_cnn_eval() {
+    let dir = tempdir().unwrap();
+
+    // Train CNN model
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 2
+num_steps = 8
+total_timesteps = 32
+num_epochs = 1
+num_minibatches = 1
+network_type = "cnn"
+num_conv_layers = 1
+conv_channels = [8]
+kernel_size = 3
+cnn_fc_hidden_size = 16
+cnn_num_fc_layers = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 16
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("cnn_config.toml");
+    fs::write(&config_path, &config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(output.status.success(), "CNN training failed");
+
+    // Run eval on the trained model
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let checkpoint_path = run_dir.join("checkpoints/latest");
+    let checkpoint_str = checkpoint_path.to_str().unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args([
+            "eval",
+            "--checkpoint",
+            checkpoint_str,
+            "--num-games",
+            "2",
+            "--num-envs",
+            "2",
+        ])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "CNN eval failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ============================================================================
 // Pool Evaluation Temperature Tests
 // ============================================================================
 
