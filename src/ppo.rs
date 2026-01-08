@@ -79,6 +79,11 @@ pub struct RolloutBuffer<B: Backend> {
     /// Valid mask for opponent pool training [`num_steps`, `num_envs`]
     /// 1.0 for learner turns (on-policy data), 0.0 for opponent turns (off-policy, masked out)
     pub valid_mask: Option<Tensor<B, 2>>,
+    /// Action masks for each step [`num_steps`, `num_envs`, `num_actions`]
+    /// true = valid action, false = invalid action
+    /// Used during PPO update to ensure `log_probs` and entropy are computed
+    /// on the same masked distribution as during rollout collection.
+    pub action_masks: Option<Tensor<B, 3>>,
 }
 
 impl<B: Backend> RolloutBuffer<B> {
@@ -108,6 +113,7 @@ impl<B: Backend> RolloutBuffer<B> {
             advantages: None,
             returns: None,
             valid_mask: None,
+            action_masks: None,
         }
     }
 
@@ -218,6 +224,10 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
 
+    // Action masks (collected if environment provides them)
+    let mut all_action_masks: Option<Vec<f32>> = None;
+    let mut num_actions: usize = 0;
+
     // Collect raw observations for normalizer stats update at end of rollout
     // This implements "lagged" normalization: normalize with existing stats,
     // then update stats for the NEXT rollout
@@ -249,6 +259,20 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 
         // Get action masks for all environments
         let action_masks = vec_env.get_action_masks();
+
+        // Collect action masks if environment provides them
+        if let Some(ref masks) = action_masks {
+            if all_action_masks.is_none() {
+                // First step: initialize collection with capacity
+                num_actions = masks.len() / num_envs;
+                all_action_masks = Some(Vec::with_capacity(num_steps * num_envs * num_actions));
+            }
+            // Convert bool to f32 and extend
+            all_action_masks
+                .as_mut()
+                .expect("all_action_masks initialized above")
+                .extend(masks.iter().map(|&v| if v { 1.0 } else { 0.0 }));
+        }
 
         // Model inference: forward pass, sample actions, compute log probs, sync to CPU
         // All GPU ops batched together - timing includes actual compute (sync at end)
@@ -360,6 +384,15 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         buffer.acting_players =
             Tensor::<B, 1, Int>::from_ints(all_acting_players.as_slice(), device)
                 .reshape([num_steps, num_envs]);
+
+        // Store action masks if collected
+        buffer.action_masks = all_action_masks.map(|masks| {
+            Tensor::<B, 1>::from_floats(masks.as_slice(), device).reshape([
+                num_steps,
+                num_envs,
+                num_actions,
+            ])
+        });
     }
 
     // Update normalizer stats at end of rollout with all RAW observations
@@ -437,6 +470,10 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
 
+    // Action masks (collected if environment provides them)
+    let mut collected_action_masks: Option<Vec<f32>> = None;
+    let mut stored_action_count: usize = 0;
+
     // Collect raw observations for normalizer stats update
     let collect_raw_obs = normalizer.is_some();
     let mut raw_obs_for_stats: Vec<f32> = if collect_raw_obs {
@@ -484,6 +521,21 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
         // Get action masks for all environments
         let all_action_masks = vec_env.get_action_masks();
         let action_count = all_action_masks.as_ref().map_or(0, |m| m.len() / num_envs);
+
+        // Collect action masks if environment provides them
+        if let Some(ref masks) = all_action_masks {
+            if collected_action_masks.is_none() {
+                // First step: initialize collection with capacity
+                stored_action_count = action_count;
+                collected_action_masks =
+                    Some(Vec::with_capacity(num_steps * num_envs * action_count));
+            }
+            // Convert bool to f32 and extend
+            collected_action_masks
+                .as_mut()
+                .expect("collected_action_masks initialized above")
+                .extend(masks.iter().map(|&v| if v { 1.0 } else { 0.0 }));
+        }
 
         // Prepare actions for all envs (will be filled in by model forward passes)
         let mut all_env_actions: Vec<usize> = vec![0; num_envs];
@@ -753,6 +805,15 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             Tensor::<B, 1>::from_floats(valid_mask_data.as_slice(), device)
                 .reshape([num_steps, num_envs]),
         );
+
+        // Store action masks if collected
+        buffer.action_masks = collected_action_masks.map(|masks| {
+            Tensor::<B, 1>::from_floats(masks.as_slice(), device).reshape([
+                num_steps,
+                num_envs,
+                stored_action_count,
+            ])
+        });
     }
 
     // Update normalizer stats
@@ -1097,6 +1158,32 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         )
     };
 
+    // Flatten and filter action masks (if present)
+    // Shape: [num_steps * num_envs, num_actions] -> after filtering -> [batch_size, num_actions]
+    let action_masks_inner: Option<Tensor<B::InnerBackend, 2>> =
+        buffer.action_masks.as_ref().map(|masks| {
+            let [num_steps, num_envs, num_actions] = masks.dims();
+            let flattened = masks.clone().reshape([num_steps * num_envs, num_actions]);
+
+            // Filter with valid_indices if opponent pool training
+            if let Some(ref mask) = buffer.valid_mask {
+                let mask_flat: Tensor<B::InnerBackend, 1> = mask.clone().flatten(0, 1);
+                let mask_data: Vec<f32> = mask_flat.into_data().to_vec().expect("mask data");
+                let indices: Vec<i64> = mask_data
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &v)| v > 0.5)
+                    .map(|(i, _)| i as i64)
+                    .collect();
+                let device = masks.device();
+                let indices_tensor =
+                    Tensor::<B::InnerBackend, 1, Int>::from_ints(indices.as_slice(), &device);
+                flattened.select(0, indices_tensor)
+            } else {
+                flattened
+            }
+        });
+
     let batch_size = obs_inner.dims()[0];
 
     // Accumulators for metrics
@@ -1156,7 +1243,12 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_acting_players_inner = acting_players_inner
                 .clone()
                 .select(0, mb_indices_inner.clone());
-            let mb_old_values_inner = old_values_inner.clone().select(0, mb_indices_inner);
+            let mb_old_values_inner = old_values_inner.clone().select(0, mb_indices_inner.clone());
+
+            // Select minibatch action masks (if present)
+            let mb_action_masks_inner: Option<Tensor<B::InnerBackend, 2>> = action_masks_inner
+                .as_ref()
+                .map(|masks| masks.clone().select(0, mb_indices_inner));
 
             // Convert to autodiff for THIS minibatch only (fresh independent graph)
             // Each minibatch's graph is independent and can be fully freed at loop end
@@ -1200,8 +1292,21 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let (grads, metrics) = {
                 profile_scope!("loss_and_backward");
 
-                let new_log_probs = log_prob_categorical(logits.clone(), mb_actions);
-                let entropy = entropy_categorical(logits);
+                // Apply action mask to logits (if present) to match rollout distribution
+                // Mask is stored as f32: 1.0 = valid, 0.0 = invalid
+                // Convert to: valid -> 0.0, invalid -> -1e9 (then add to logits)
+                let masked_logits = if let Some(ref mask_inner) = mb_action_masks_inner {
+                    let mask: Tensor<B, 2> = Tensor::from_inner(mask_inner.clone());
+                    // Convert: 1.0 -> 0.0, 0.0 -> -1e9
+                    // Formula: (mask - 1.0) * 1e9 gives: 1.0 -> 0.0, 0.0 -> -1e9
+                    let mask_additive = (mask - 1.0) * 1e9;
+                    logits + mask_additive
+                } else {
+                    logits
+                };
+
+                let new_log_probs = log_prob_categorical(masked_logits.clone(), mb_actions);
+                let entropy = entropy_categorical(masked_logits);
 
                 // Policy loss (clipped surrogate objective)
                 let log_ratio = new_log_probs.clone() - mb_old_log_probs;
