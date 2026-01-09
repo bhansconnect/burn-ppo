@@ -6,6 +6,7 @@ use crate::env::{Environment, GameOutcome};
 use crate::profile::profile_function;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use std::collections::VecDeque;
 
 // Game constants
 const NUM_PLAYERS: usize = 4;
@@ -26,6 +27,12 @@ const OBS_CURRENT_BID: usize = MAX_TOTAL_DICE * DICE_FACES; // 48: bid one-hot (
 const OBS_HAS_BID: usize = 1; // 1: has active bid flag
 const OBS_BID_COUNT: usize = 1; // 1: bid count this round
 const OBS_LAST_BIDDER: usize = NUM_PLAYERS; // 4: last bidder one-hot
+
+// Bid history: last N bids, each encoded as bidder (4) + quantity (1) + face (6) + valid flag (1) = 12
+const BID_HISTORY_SIZE: usize = 16; // Store last 16 bids
+const BID_HISTORY_ENTRY_SIZE: usize = NUM_PLAYERS + 1 + DICE_FACES + 1; // 12 floats per entry
+const OBS_BID_HISTORY: usize = BID_HISTORY_SIZE * BID_HISTORY_ENTRY_SIZE; // 192
+
 const OBSERVATION_DIM: usize = OBS_OWN_DICE
     + OBS_DICE_COUNTS
     + OBS_ALIVE_FLAGS
@@ -33,7 +40,8 @@ const OBSERVATION_DIM: usize = OBS_OWN_DICE
     + OBS_CURRENT_BID
     + OBS_HAS_BID
     + OBS_BID_COUNT
-    + OBS_LAST_BIDDER; // 78
+    + OBS_LAST_BIDDER
+    + OBS_BID_HISTORY; // 78 + 192 = 270
 
 /// Action types in Liar's Dice
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +66,55 @@ fn encode_bid(quantity: usize, face: usize) -> usize {
     (quantity - 1) * DICE_FACES + (face - 1)
 }
 
+/// Bid history for tracking past bids in the current round
+#[derive(Debug, Clone)]
+struct BidHistory {
+    /// Ring buffer of bids: (bidder, quantity, face)
+    history: VecDeque<(usize, usize, usize)>,
+}
+
+impl BidHistory {
+    fn new() -> Self {
+        Self {
+            history: VecDeque::with_capacity(BID_HISTORY_SIZE),
+        }
+    }
+
+    fn push(&mut self, bidder: usize, quantity: usize, face: usize) {
+        if self.history.len() >= BID_HISTORY_SIZE {
+            self.history.pop_front();
+        }
+        self.history.push_back((bidder, quantity, face));
+    }
+
+    fn clear(&mut self) {
+        self.history.clear();
+    }
+
+    /// Convert to observation vector (192 floats: 16 bids × 12 floats each)
+    fn to_observation(&self) -> Vec<f32> {
+        let mut obs = vec![0.0; OBS_BID_HISTORY];
+
+        for (i, &(bidder, quantity, face)) in self.history.iter().enumerate() {
+            let base = i * BID_HISTORY_ENTRY_SIZE;
+
+            // Bidder one-hot (4 floats)
+            obs[base + bidder] = 1.0;
+
+            // Quantity normalized (1 float): qty / 8
+            obs[base + NUM_PLAYERS] = quantity as f32 / MAX_TOTAL_DICE as f32;
+
+            // Face one-hot (6 floats)
+            obs[base + NUM_PLAYERS + 1 + (face - 1)] = 1.0;
+
+            // Valid flag (1 float)
+            obs[base + BID_HISTORY_ENTRY_SIZE - 1] = 1.0;
+        }
+
+        obs
+    }
+}
+
 /// Liar's Dice game state
 #[derive(Debug, Clone)]
 pub struct LiarsDice {
@@ -73,6 +130,8 @@ pub struct LiarsDice {
     last_bidder: Option<usize>,
     /// Number of bids in current round (resets each round)
     bid_count: usize,
+    /// Bid history for the current round (resets when round ends)
+    bid_history: BidHistory,
     /// Track elimination order for `GameOutcome::Placements`
     elimination_order: Vec<usize>,
     /// Is the game over?
@@ -93,6 +152,7 @@ impl LiarsDice {
             current_bid: None,
             last_bidder: None,
             bid_count: 0,
+            bid_history: BidHistory::new(),
             elimination_order: Vec::with_capacity(NUM_PLAYERS),
             game_over: false,
             rng: StdRng::seed_from_u64(seed),
@@ -220,6 +280,7 @@ impl LiarsDice {
         self.current_bid = None;
         self.last_bidder = None;
         self.bid_count = 0;
+        self.bid_history.clear();
 
         // Loser starts next round (if still alive), else next alive player
         if self.dice_count[loser] > 0 {
@@ -286,6 +347,11 @@ impl LiarsDice {
         if let Some(bidder) = self.last_bidder {
             obs[idx + bidder] = 1.0;
         }
+        idx += OBS_LAST_BIDDER;
+
+        // Bid history (192 floats)
+        let history_obs = self.bid_history.to_observation();
+        obs[idx..idx + OBS_BID_HISTORY].copy_from_slice(&history_obs);
 
         obs
     }
@@ -382,6 +448,7 @@ impl Environment for LiarsDice {
         self.current_bid = None;
         self.last_bidder = None;
         self.bid_count = 0;
+        self.bid_history.clear();
         self.elimination_order.clear();
         self.game_over = false;
         self.roll_all_dice();
@@ -407,6 +474,9 @@ impl Environment for LiarsDice {
                     self.game_over = true;
                     return (self.get_observation(), rewards, true);
                 }
+
+                // Record bid in history before updating state
+                self.bid_history.push(self.current_player, quantity, face);
 
                 // Execute the bid
                 self.current_bid = Some((quantity, face));
@@ -553,7 +623,7 @@ mod tests {
         let obs = env.reset();
 
         assert_eq!(obs.len(), OBSERVATION_DIM);
-        assert_eq!(obs.len(), 78);
+        assert_eq!(obs.len(), 270); // 78 base + 192 bid history
 
         // All players should have 2 dice
         for p in 0..NUM_PLAYERS {
@@ -569,7 +639,7 @@ mod tests {
     fn test_observation_dimension() {
         let env = LiarsDice::new(42);
         let obs = env.get_observation();
-        assert_eq!(obs.len(), 78);
+        assert_eq!(obs.len(), 270); // 78 base + 192 bid history
     }
 
     #[test]
@@ -1011,6 +1081,111 @@ mod tests {
 
         // Last bidder one-hot (indices 74-77)
         assert_eq!(obs[74], 1.0, "Last bidder is P0");
+    }
+
+    #[test]
+    fn test_bid_history() {
+        let mut env = LiarsDice::new(42);
+        env.reset();
+
+        // Initial observation should have empty history (all zeros in history section)
+        let obs = env.get_observation();
+        let history_start = 78; // After base observation
+        for (i, &val) in obs.iter().enumerate().skip(history_start) {
+            assert_eq!(val, 0.0, "History should be empty initially at index {i}");
+        }
+
+        // Make a bid: P0 bids "2 threes"
+        env.step(encode_bid(2, 3));
+
+        // Check history in observation
+        let obs = env.get_observation();
+
+        // First bid entry at index 78 (history_start)
+        // Bidder P0 one-hot: indices 78-81, expect [1, 0, 0, 0]
+        assert_eq!(obs[78], 1.0, "First bid by P0");
+        assert_eq!(obs[79], 0.0);
+        assert_eq!(obs[80], 0.0);
+        assert_eq!(obs[81], 0.0);
+
+        // Quantity normalized: index 82, expect 2/8 = 0.25
+        assert!((obs[82] - 0.25).abs() < 0.01, "Quantity should be 0.25");
+
+        // Face one-hot: indices 83-88, expect [0, 0, 1, 0, 0, 0] for face 3
+        assert_eq!(obs[83], 0.0);
+        assert_eq!(obs[84], 0.0);
+        assert_eq!(obs[85], 1.0, "Face 3 should be set");
+        assert_eq!(obs[86], 0.0);
+        assert_eq!(obs[87], 0.0);
+        assert_eq!(obs[88], 0.0);
+
+        // Valid flag: index 89
+        assert_eq!(obs[89], 1.0, "Valid flag should be 1");
+
+        // Second bid entry should still be empty
+        let second_entry_start = 78 + 12;
+        for (i, &val) in obs[second_entry_start..(second_entry_start + 12)]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                val,
+                0.0,
+                "Second entry should be empty at index {}",
+                second_entry_start + i
+            );
+        }
+
+        // Make another bid: P1 bids "3 fours"
+        env.step(encode_bid(3, 4));
+
+        let obs = env.get_observation();
+
+        // Second bid entry: P1 bid "3 fours"
+        assert_eq!(obs[second_entry_start + 1], 1.0, "Second bid by P1");
+        assert!(
+            (obs[second_entry_start + 4] - 0.375).abs() < 0.01,
+            "Quantity 3/8"
+        );
+        assert_eq!(obs[second_entry_start + 5 + 3], 1.0, "Face 4");
+        assert_eq!(obs[second_entry_start + 11], 1.0, "Valid flag");
+    }
+
+    #[test]
+    fn test_bid_history_resets_on_round_end() {
+        let mut env = LiarsDice::new(42);
+        env.reset();
+
+        // Set up known dice so we can predict call liar outcome
+        env.dice[0] = [3, 3];
+        env.dice[1] = [3, 3];
+        env.dice[2] = [3, 3];
+        env.dice[3] = [3, 3];
+        // Total 3s: 8
+
+        // Make some bids
+        env.step(encode_bid(2, 3)); // P0 bids "2 threes"
+        env.step(encode_bid(4, 3)); // P1 bids "4 threes"
+
+        // Verify history has 2 entries
+        assert_eq!(env.bid_history.history.len(), 2);
+
+        // P2 calls liar (incorrectly - bid was true with 8 threes)
+        env.step(CALL_LIAR_ACTION);
+
+        // After round ends, history should be cleared
+        assert_eq!(
+            env.bid_history.history.len(),
+            0,
+            "History should be cleared after round"
+        );
+
+        // Observation should have empty history
+        let obs = env.get_observation();
+        let history_start = 78;
+        for (i, &val) in obs.iter().enumerate().skip(history_start) {
+            assert_eq!(val, 0.0, "History should be empty after round at index {i}");
+        }
     }
 
     #[test]
