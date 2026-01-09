@@ -261,7 +261,7 @@ impl Environment for ConnectFour {
                 self.game_over = true;
                 self.winner = Some(self.current_player);
                 rewards[current] = 1.0; // Winner gets 1.0
-                rewards[other] = 0.0; // Loser gets 0.0
+                rewards[other] = -1.0; // Loser gets -1.0
                 return (self.get_observation(), rewards, true);
             }
         }
@@ -269,8 +269,8 @@ impl Environment for ConnectFour {
         // Draw
         if self.is_full() {
             self.game_over = true;
-            rewards[0] = 0.5; // Both get 1/N = 0.5
-            rewards[1] = 0.5;
+            rewards[0] = 0.0;
+            rewards[1] = 0.0;
             return (self.get_observation(), rewards, true);
         }
 
@@ -405,7 +405,7 @@ mod tests {
         let (_, rewards, done) = env.step(3);
         assert!(done);
         assert_eq!(rewards[0], 1.0); // P0 wins
-        assert_eq!(rewards[1], 0.0); // P1 loses
+        assert_eq!(rewards[1], -1.0); // P1 loses
     }
 
     #[test]
@@ -422,7 +422,7 @@ mod tests {
         let (_, rewards, done) = env.step(0);
         assert!(done);
         assert_eq!(rewards[0], 1.0); // P0 wins
-        assert_eq!(rewards[1], 0.0); // P1 loses
+        assert_eq!(rewards[1], -1.0); // P1 loses
     }
 
     #[test]
@@ -443,7 +443,7 @@ mod tests {
         let (_, rewards, done) = env.step(3);
         assert!(done);
         assert_eq!(rewards[0], 1.0);
-        assert_eq!(rewards[1], 0.0);
+        assert_eq!(rewards[1], -1.0);
     }
 
     #[test]
@@ -528,8 +528,8 @@ mod tests {
 
         let (_, rewards, done) = env.step(0);
         assert!(done);
-        assert_eq!(rewards[0], 0.5);
-        assert_eq!(rewards[1], 0.5);
+        assert_eq!(rewards[0], 0.0);
+        assert_eq!(rewards[1], 0.0);
     }
 
     #[test]
