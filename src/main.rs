@@ -420,14 +420,14 @@ where
                 initial_learner_rating,
             ) {
                 Ok(pool) => {
-                    println!(
+                    progress.println(&format!(
                         "Opponent pool initialized with {} checkpoints",
                         pool.num_available()
-                    );
+                    ));
                     Some(pool)
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to initialize opponent pool: {e}");
+                    progress.eprintln(&format!("Warning: Failed to initialize opponent pool: {e}"));
                     None
                 }
             }
@@ -443,13 +443,13 @@ where
     let num_opponent_envs = if opponent_pool.is_some() {
         let raw = num_envs as f32 * config.opponent_pool_fraction;
         if raw > 0.0 && raw < 1.0 {
-            eprintln!(
+            progress.eprintln(&format!(
                 "Warning: opponent_pool_fraction ({:.1}%) of {} envs = {:.2} envs. \
                  Rounding up to 1 env.",
                 config.opponent_pool_fraction * 100.0,
                 num_envs,
                 raw
-            );
+            ));
             1
         } else {
             raw as usize
@@ -1007,12 +1007,12 @@ where
 
                                 // One-time warning if pool eval is >5% of total execution time
                                 if !pool_eval_warning_shown && pool_eval_pct > 5.0 {
-                                    eprintln!(
+                                    progress.eprintln(&format!(
                                         "Warning: Pool evaluation is taking {pool_eval_pct:.1}% of total \
                                          execution time. Consider increasing \
                                          opponent_pool_eval_interval or decreasing \
                                          opponent_pool_eval_games."
-                                    );
+                                    ));
                                     pool_eval_warning_shown = true;
                                 }
                             }
@@ -1031,7 +1031,9 @@ where
 
                             // Save updated pool ratings
                             if let Err(e) = pool.save_ratings() {
-                                eprintln!("Warning: Failed to save pool ratings after eval: {e}");
+                                progress.eprintln(&format!(
+                                    "Warning: Failed to save pool ratings after eval: {e}"
+                                ));
                             }
 
                             // Update "best" checkpoint based on vs_best_margin if threshold is set
@@ -1059,9 +1061,9 @@ where
                                         if let Err(e) =
                                             checkpoint_manager.set_best_checkpoint(&name)
                                         {
-                                            eprintln!(
+                                            progress.eprintln(&format!(
                                                 "Warning: Failed to update best checkpoint: {e}"
-                                            );
+                                            ));
                                         } else {
                                             progress.println(&format!(
                                                 "[Pool Eval] Updated 'best' -> {name} (margin {:.2} >= {:.2})",
@@ -1073,7 +1075,7 @@ where
                             }
                         }
                         Err(e) => {
-                            eprintln!("Warning: Pool evaluation failed: {e}");
+                            progress.eprintln(&format!("Warning: Pool evaluation failed: {e}"));
                         }
                     }
                 }
@@ -1127,19 +1129,19 @@ where
 
             // Save optimizer state alongside model
             if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
-                eprintln!("Warning: Failed to save optimizer state: {e}");
+                progress.eprintln(&format!("Warning: Failed to save optimizer state: {e}"));
             }
 
             // Save observation normalizer if enabled
             if let Some(ref norm) = obs_normalizer {
                 if let Err(e) = save_normalizer(norm, &checkpoint_path) {
-                    eprintln!("Warning: Failed to save normalizer: {e}");
+                    progress.eprintln(&format!("Warning: Failed to save normalizer: {e}"));
                 }
             }
 
             // Save RNG state for reproducible continuation
             if let Err(e) = save_rng_state(&mut rng, &checkpoint_path) {
-                eprintln!("Warning: Failed to save RNG state: {e}");
+                progress.eprintln(&format!("Warning: Failed to save RNG state: {e}"));
             }
 
             // Add checkpoint to opponent pool
@@ -1147,7 +1149,7 @@ where
                 pool.add_checkpoint(checkpoint_path.clone(), &metadata);
                 // Save pool ratings periodically
                 if let Err(e) = pool.save_ratings() {
-                    eprintln!("Warning: Failed to save pool ratings: {e}");
+                    progress.eprintln(&format!("Warning: Failed to save pool ratings: {e}"));
                 }
             }
 
@@ -1163,7 +1165,7 @@ where
                     .expect("checkpoint has filename")
                     .to_string_lossy();
                 if let Err(e) = checkpoint_manager.set_best_checkpoint(&checkpoint_name) {
-                    eprintln!("Warning: Failed to update best checkpoint: {e}");
+                    progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
                 }
             }
 
@@ -1251,19 +1253,19 @@ where
 
         // Save optimizer state alongside model
         if let Err(e) = save_optimizer::<TB, _, ActorCritic<TB>>(&optimizer, &checkpoint_path) {
-            eprintln!("Warning: Failed to save optimizer state: {e}");
+            progress.eprintln(&format!("Warning: Failed to save optimizer state: {e}"));
         }
 
         // Save observation normalizer if enabled
         if let Some(ref norm) = obs_normalizer {
             if let Err(e) = save_normalizer(norm, &checkpoint_path) {
-                eprintln!("Warning: Failed to save normalizer: {e}");
+                progress.eprintln(&format!("Warning: Failed to save normalizer: {e}"));
             }
         }
 
         // Save RNG state for reproducible continuation
         if let Err(e) = save_rng_state(&mut rng, &checkpoint_path) {
-            eprintln!("Warning: Failed to save RNG state: {e}");
+            progress.eprintln(&format!("Warning: Failed to save RNG state: {e}"));
         }
 
         // Add checkpoint to opponent pool
@@ -1271,7 +1273,7 @@ where
             pool.add_checkpoint(checkpoint_path.clone(), &metadata);
             // Save pool ratings
             if let Err(e) = pool.save_ratings() {
-                eprintln!("Warning: Failed to save pool ratings: {e}");
+                progress.eprintln(&format!("Warning: Failed to save pool ratings: {e}"));
             }
         }
 
@@ -1287,7 +1289,7 @@ where
                 .expect("checkpoint has filename")
                 .to_string_lossy();
             if let Err(e) = checkpoint_manager.set_best_checkpoint(&checkpoint_name) {
-                eprintln!("Warning: Failed to update best checkpoint: {e}");
+                progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
             }
         }
 

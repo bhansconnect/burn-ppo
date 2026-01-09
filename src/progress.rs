@@ -91,6 +91,11 @@ impl TrainingProgress {
         self.main_bar.suspend(|| println!("{msg}"));
     }
 
+    /// Print an error message above the progress bar without breaking the display
+    pub fn eprintln(&self, msg: &str) {
+        self.main_bar.suspend(|| eprintln!("{msg}"));
+    }
+
     /// Finish training and close progress bar
     pub fn finish(&self) {
         self.main_bar.finish_with_message("Training complete!");
