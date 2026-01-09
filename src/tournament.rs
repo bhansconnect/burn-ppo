@@ -1758,7 +1758,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
     // Determine tournament format based on matchup count
     let matchups = (0..n).combinations(E::NUM_PLAYERS).count();
-    let use_swiss = matchups > 50;
+    let use_swiss = matchups > 50 && !args.round_robin;
     let num_rounds = if use_swiss {
         args.rounds.unwrap_or_else(|| {
             #[expect(clippy::cast_sign_loss, reason = "log2 of positive n is positive")]
@@ -2696,6 +2696,7 @@ mod tests {
             seed: Some(42),
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let results = build_results(&contestants, &pods, 1, false, &args, "connect_four");
@@ -2734,6 +2735,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let results = build_results(&contestants, &[], 1, false, &args, "cartpole");
@@ -2766,6 +2768,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let results = build_results(&contestants, &[], 3, true, &args, "connect_four");
@@ -2797,6 +2800,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2830,6 +2834,7 @@ mod tests {
             seed: None,
             random: true, // Add random player
             graph: false,
+            round_robin: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2864,6 +2869,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2897,6 +2903,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -2923,6 +2930,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let result = discover_contestants(&args);
@@ -2954,6 +2962,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         // Empty dir isn't a valid checkpoint or checkpoints dir
@@ -3057,6 +3066,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3121,6 +3131,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3225,6 +3236,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let results = build_results(&contestants, &[], 1, false, &args, "test_env");
@@ -3337,6 +3349,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let results = build_results(&contestants, &pods, 2, true, &args, "test");
@@ -4101,6 +4114,7 @@ mod tests {
             seed: None,
             random: false,
             graph: false,
+            round_robin: false,
         };
 
         let contestants = discover_contestants(&args).unwrap();

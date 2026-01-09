@@ -348,6 +348,7 @@ pub struct EvalArgs {
 
 /// Arguments for tournament mode
 #[derive(Parser, Debug)]
+#[expect(clippy::struct_excessive_bools, reason = "CLI flags are naturally bools")]
 pub struct TournamentArgs {
     /// Checkpoint paths or run directories to include
     /// For run directories, all checkpoints are discovered automatically
@@ -397,6 +398,12 @@ pub struct TournamentArgs {
         help = "Generate rating graph over training steps (default: false)"
     )]
     pub graph: bool,
+
+    #[arg(
+        long = "round-robin",
+        help = "Force round-robin format (default: auto-select based on matchup count)"
+    )]
+    pub round_robin: bool,
 }
 
 /// Legacy alias for backward compatibility
