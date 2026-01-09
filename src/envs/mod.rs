@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_env_gets_correct_obs_dim() {
-        assert_eq!(dispatch_get_obs_dim("cartpole").unwrap(), 4); // CartPole has 4-dim observation
+        assert_eq!(dispatch_get_obs_dim("cartpole").unwrap(), 5); // CartPole: [x, x_dot, theta, theta_dot, time]
         assert_eq!(dispatch_get_obs_dim("connect_four").unwrap(), 86); // ConnectFour: 42*2 + 2
         assert_eq!(dispatch_get_obs_dim("liars_dice").unwrap(), 78); // LiarsDice: 78-dim observation
     }

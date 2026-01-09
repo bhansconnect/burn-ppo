@@ -71,13 +71,21 @@ impl CartPole {
     }
 
     /// Get state as observation vector
+    /// Includes normalized timestep (0-1) so value function can predict time-dependent returns
     fn get_obs(&self) -> Vec<f32> {
-        vec![self.x, self.x_dot, self.theta, self.theta_dot]
+        let normalized_time = self.steps as f32 / MAX_STEPS as f32;
+        vec![
+            self.x,
+            self.x_dot,
+            self.theta,
+            self.theta_dot,
+            normalized_time,
+        ]
     }
 }
 
 impl Environment for CartPole {
-    const OBSERVATION_DIM: usize = 4;
+    const OBSERVATION_DIM: usize = 5; // [x, x_dot, theta, theta_dot, normalized_time]
     const ACTION_COUNT: usize = 2;
     const NAME: &'static str = "cartpole";
 
@@ -319,11 +327,13 @@ mod tests {
         let mut env = CartPole::new(42);
         let obs = env.reset();
 
-        assert_eq!(obs.len(), 4);
-        // All initial values should be small
-        for val in &obs {
+        assert_eq!(obs.len(), 5); // [x, x_dot, theta, theta_dot, normalized_time]
+                                  // Physical values should be small (not checking time at index 4)
+        for val in &obs[..4] {
             assert!(val.abs() < 0.1);
         }
+        // Time should be 0 after reset
+        assert_eq!(obs[4], 0.0);
     }
 
     #[test]
@@ -333,9 +343,11 @@ mod tests {
 
         let (obs, rewards, done) = env.step(1); // Push right
 
-        assert_eq!(obs.len(), 4);
+        assert_eq!(obs.len(), 5);
         assert_eq!(rewards, vec![1.0]);
         assert!(!done);
+        // After one step, normalized time should be 1/500 = 0.002
+        assert!((obs[4] - 0.002).abs() < 0.001);
     }
 
     #[test]

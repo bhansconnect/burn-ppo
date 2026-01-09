@@ -464,7 +464,7 @@ pub struct Config {
     pub gae_lambda: f64,
     #[serde(default = "default_clip_epsilon")]
     pub clip_epsilon: f64,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub clip_value: bool,
     #[serde(default = "default_entropy_coef")]
     pub entropy_coef: f64,
@@ -720,7 +720,7 @@ impl Default for Config {
             gamma: default_gamma(),
             gae_lambda: default_gae_lambda(),
             clip_epsilon: default_clip_epsilon(),
-            clip_value: default_true(),
+            clip_value: false,
             entropy_coef: default_entropy_coef(),
             entropy_anneal: false,
             entropy_coef_final: None,
