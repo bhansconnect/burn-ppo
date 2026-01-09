@@ -1365,7 +1365,9 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| backend::default_backend());
             backend::warn_if_better_backend_available(backend_name);
             dispatch_backend!(backend_name, device, {
-                eval::run_evaluation::<TB>(&eval_args, &device)
+                eval::run_evaluation::<<TB as burn::tensor::backend::AutodiffBackend>::InnerBackend>(
+                    &eval_args, &device,
+                )
             })
         }
         Some(Command::Tournament(tournament_args)) => {
@@ -1375,7 +1377,9 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| backend::default_backend());
             backend::warn_if_better_backend_available(backend_name);
             dispatch_backend!(backend_name, device, {
-                tournament::run_tournament::<TB>(&tournament_args, &device)
+                tournament::run_tournament::<
+                    <TB as burn::tensor::backend::AutodiffBackend>::InnerBackend,
+                >(&tournament_args, &device)
             })
         }
         Some(Command::Train(args)) => {
