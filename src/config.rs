@@ -239,8 +239,11 @@ pub struct TrainArgs {
     #[arg(long, help = "Games per pool evaluation (default: 128)")]
     pub opponent_pool_eval_games: Option<usize>,
 
-    #[arg(long, help = "Opponents to sample for evaluation (default: 10)")]
-    pub opponent_pool_eval_opponents: Option<usize>,
+    #[arg(
+        long,
+        help = "Max opponents in active pool for training/eval (default: 10)"
+    )]
+    pub opponent_pool_size_limit: Option<usize>,
 
     #[arg(
         long,
@@ -558,9 +561,12 @@ pub struct Config {
     /// Number of games per pool evaluation
     #[serde(default = "default_opponent_pool_eval_games")]
     pub opponent_pool_eval_games: usize,
-    /// Number of opponents to sample for each evaluation
-    #[serde(default = "default_opponent_pool_eval_opponents")]
-    pub opponent_pool_eval_opponents: usize,
+    /// Maximum opponents in active pool (for both training and evaluation)
+    #[serde(
+        default = "default_opponent_pool_size_limit",
+        alias = "opponent_pool_eval_opponents"
+    )]
+    pub opponent_pool_size_limit: usize,
     /// Initial softmax temperature for pool evaluation (None = use environment default)
     #[serde(default)]
     pub pool_eval_temp: Option<f32>,
@@ -684,7 +690,7 @@ const fn default_opponent_pool_sample_temperature() -> f32 {
 const fn default_opponent_pool_eval_games() -> usize {
     128
 }
-const fn default_opponent_pool_eval_opponents() -> usize {
+const fn default_opponent_pool_size_limit() -> usize {
     10
 }
 
@@ -737,7 +743,7 @@ impl Default for Config {
             opponent_pool_eval_enabled: true,
             opponent_pool_eval_interval: None, // Defaults to checkpoint_freq
             opponent_pool_eval_games: default_opponent_pool_eval_games(),
-            opponent_pool_eval_opponents: default_opponent_pool_eval_opponents(),
+            opponent_pool_size_limit: default_opponent_pool_size_limit(),
             pool_eval_temp: None, // Use environment default
             pool_eval_temp_final: 0.0,
             pool_eval_temp_cutoff: None, // Disabled by default
@@ -943,8 +949,8 @@ impl Config {
         if let Some(v) = args.opponent_pool_eval_games {
             self.opponent_pool_eval_games = v;
         }
-        if let Some(v) = args.opponent_pool_eval_opponents {
-            self.opponent_pool_eval_opponents = v;
+        if let Some(v) = args.opponent_pool_size_limit {
+            self.opponent_pool_size_limit = v;
         }
         if let Some(v) = args.pool_eval_temp {
             self.pool_eval_temp = Some(v);
@@ -1121,8 +1127,8 @@ impl Config {
         if args.opponent_pool_eval_games.is_some() {
             ignored.push("--opponent-pool-eval-games");
         }
-        if args.opponent_pool_eval_opponents.is_some() {
-            ignored.push("--opponent-pool-eval-opponents");
+        if args.opponent_pool_size_limit.is_some() {
+            ignored.push("--opponent-pool-size-limit");
         }
 
         // Experiment
@@ -1250,8 +1256,8 @@ impl Config {
             if self.opponent_pool_eval_games == 0 {
                 bail!("opponent_pool_eval_games must be > 0");
             }
-            if self.opponent_pool_eval_opponents == 0 {
-                bail!("opponent_pool_eval_opponents must be > 0");
+            if self.opponent_pool_size_limit == 0 {
+                bail!("opponent_pool_size_limit must be > 0");
             }
         }
 

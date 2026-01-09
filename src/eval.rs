@@ -780,7 +780,6 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
     current_normalizer: Option<&ObsNormalizer>,
     opponent_pool: &mut crate::opponent_pool::OpponentPool<B>,
     num_games: usize,
-    num_opponents_to_sample: usize,
     config: &Config,
     device: &B::Device,
     seed: u64,
@@ -811,8 +810,8 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
         });
     }
 
-    // Sample opponents for evaluation (always includes highest-rated)
-    let sampled_indices = opponent_pool.sample_eval_opponents(num_opponents_to_sample);
+    // Get active opponents for evaluation (limited by pool_size_limit)
+    let sampled_indices = opponent_pool.sample_eval_opponents();
     let num_sampled = sampled_indices.len();
 
     // Track which index is the "best" (highest-rated) for vs_best metrics

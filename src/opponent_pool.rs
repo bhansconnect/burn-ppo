@@ -178,6 +178,12 @@ pub struct OpponentPool<B: Backend> {
     /// Learner's rating (persisted across evaluations within a training run)
     /// Initialized from parent checkpoint if forked, otherwise starts at 25.0
     learner_rating: WengLinRating,
+
+    /// Active subset of opponent indices (limited by `pool_size_limit`)
+    active_indices: Vec<usize>,
+
+    /// Maximum number of active opponents
+    pool_size_limit: usize,
 }
 
 /// Persisted pool ratings file format (`pool_ratings.json`)
@@ -217,6 +223,7 @@ impl<B: Backend> OpponentPool<B> {
         device: B::Device,
         seed: u64,
         initial_learner_rating: Option<(f64, f64)>,
+        pool_size_limit: usize,
     ) -> Result<Self> {
         // Initialize learner rating:
         // - If forked/resumed: use parent's rating with reset uncertainty
@@ -243,6 +250,8 @@ impl<B: Backend> OpponentPool<B> {
             device,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             learner_rating,
+            active_indices: Vec::new(),
+            pool_size_limit,
         };
 
         // Load existing ratings (may override learner_rating if resuming same run)
@@ -250,6 +259,9 @@ impl<B: Backend> OpponentPool<B> {
 
         // Scan for checkpoints and merge with loaded ratings
         pool.scan_checkpoints()?;
+
+        // Initialize active subset
+        pool.refresh_active_subset();
 
         Ok(pool)
     }
@@ -268,6 +280,37 @@ impl<B: Backend> OpponentPool<B> {
     /// Check if pool has enough opponents for training
     pub fn has_opponents(&self) -> bool {
         !self.available.is_empty()
+    }
+
+    /// Refresh the active opponent subset
+    ///
+    /// Samples up to `pool_size_limit` unique opponents using rating-weighted sampling.
+    /// Call this at initialization and at each rotation to get variety.
+    pub fn refresh_active_subset(&mut self) {
+        if self.available.is_empty() {
+            self.active_indices.clear();
+            return;
+        }
+
+        let max_active = self.pool_size_limit.min(self.available.len());
+        let mut selected = Vec::with_capacity(max_active);
+
+        // Sample opponents using rating-weighted (or uniform) sampling
+        while selected.len() < max_active {
+            if let Some(idx) = self.sample_opponent(&selected) {
+                selected.push(idx);
+            } else {
+                break;
+            }
+        }
+
+        self.active_indices = selected;
+    }
+
+    /// Get the current active opponent indices
+    #[expect(dead_code, reason = "reserved for debugging and metrics")]
+    pub fn active_indices(&self) -> &[usize] {
+        &self.active_indices
     }
 
     /// Get the learner's current rating
@@ -482,12 +525,80 @@ impl<B: Backend> OpponentPool<B> {
         )
     }
 
+    /// Sample a single opponent from the active subset, excluding already-assigned indices
+    fn sample_opponent_from_active(&mut self, exclude: &[usize]) -> Option<usize> {
+        if self.active_indices.is_empty() {
+            return None;
+        }
+
+        // Get eligible opponent indices from active subset
+        let eligible: Vec<usize> = self
+            .active_indices
+            .iter()
+            .filter(|&&i| !exclude.contains(&i))
+            .copied()
+            .collect();
+
+        if eligible.is_empty() {
+            // Fall back to any active opponent if all are excluded
+            return Some(self.active_indices[self.rng.gen_range(0..self.active_indices.len())]);
+        }
+
+        // Uniform sampling: pick randomly from eligible
+        if self.uniform_sampling {
+            let idx = self.rng.gen_range(0..eligible.len());
+            return Some(eligible[idx]);
+        }
+
+        // Rating-weighted sampling: get ratings for eligible opponents
+        let eligible_with_ratings: Vec<(usize, f64)> = eligible
+            .iter()
+            .map(|&i| (i, self.available[i].1.rating_mu))
+            .collect();
+
+        // Compute softmax probabilities
+        let max_rating = eligible_with_ratings
+            .iter()
+            .map(|(_, r)| *r)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let exp_ratings: Vec<f64> = eligible_with_ratings
+            .iter()
+            .map(|(_, r)| ((r - max_rating) / f64::from(self.temperature)).exp())
+            .collect();
+
+        let sum: f64 = exp_ratings.iter().sum();
+        if sum == 0.0 {
+            // Uniform fallback
+            let idx = self.rng.gen_range(0..eligible_with_ratings.len());
+            return Some(eligible_with_ratings[idx].0);
+        }
+
+        // Sample from distribution
+        let sample: f64 = self.rng.r#gen();
+        let mut cumsum = 0.0;
+        for (i, &exp) in exp_ratings.iter().enumerate() {
+            cumsum += exp / sum;
+            if sample < cumsum {
+                return Some(eligible_with_ratings[i].0);
+            }
+        }
+
+        Some(
+            eligible_with_ratings
+                .last()
+                .expect("eligible list is non-empty at this point")
+                .0,
+        )
+    }
+
     /// Sample opponents for all slots (`num_players` - 1 unique opponents)
+    /// Samples ONLY from the active subset
     pub fn sample_all_slots(&mut self) -> Vec<usize> {
         let mut assigned = Vec::with_capacity(self.num_opponent_slots);
 
         for _ in 0..self.num_opponent_slots {
-            if let Some(idx) = self.sample_opponent(&assigned) {
+            if let Some(idx) = self.sample_opponent_from_active(&assigned) {
                 assigned.push(idx);
             }
         }
@@ -695,32 +806,12 @@ impl<B: Backend> OpponentPool<B> {
         &mut self.rng
     }
 
-    /// Sample opponents for evaluation
+    /// Get opponents for evaluation
     ///
-    /// Samples `num_opponents` using rating-weighted sampling, always including
-    /// the highest-rated opponent (the "best").
-    pub fn sample_eval_opponents(&mut self, num_opponents: usize) -> Vec<usize> {
-        if self.available.is_empty() {
-            return Vec::new();
-        }
-
-        let mut selected = Vec::with_capacity(num_opponents);
-
-        // Always include highest-rated opponent
-        if let Some(best_idx) = self.highest_rated() {
-            selected.push(best_idx);
-        }
-
-        // Sample remaining opponents
-        while selected.len() < num_opponents && selected.len() < self.available.len() {
-            if let Some(idx) = self.sample_opponent(&selected) {
-                selected.push(idx);
-            } else {
-                break;
-            }
-        }
-
-        selected
+    /// Returns the active subset of opponents (limited by `pool_size_limit`).
+    /// The active subset is refreshed at each rotation.
+    pub fn sample_eval_opponents(&self) -> Vec<usize> {
+        self.active_indices.clone()
     }
 
     /// Get available opponent paths and ratings for evaluation

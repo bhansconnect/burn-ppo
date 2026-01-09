@@ -418,6 +418,7 @@ where
                 device.clone(),
                 config.seed,
                 initial_learner_rating,
+                config.opponent_pool_size_limit,
             ) {
                 Ok(pool) => {
                     progress.println(&format!(
@@ -603,6 +604,9 @@ where
 
                 // Refresh pool (scan for new checkpoints)
                 let _ = pool.scan_checkpoints();
+
+                // Re-sample active subset (provides variety + includes new checkpoints)
+                pool.refresh_active_subset();
 
                 // Queue new opponents for all env states (graceful rotation)
                 for state in &mut env_states {
@@ -939,7 +943,6 @@ where
                         obs_normalizer.as_ref(),
                         pool,
                         config.opponent_pool_eval_games,
-                        config.opponent_pool_eval_opponents,
                         config,
                         device,
                         config.seed.wrapping_add(global_step as u64),
