@@ -1568,15 +1568,18 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                 &running,
                 move |i| ConnectFour::new(seed + i as u64),
             ),
-            "liars_dice" => run_training::<TB, LiarsDice, _>(
-                &mode,
-                &config,
-                &run_dir,
-                resumed_metadata.as_ref(),
-                &device,
-                &running,
-                move |i| LiarsDice::new(seed + i as u64),
-            ),
+            "liars_dice" => {
+                let reward_shaping_coef = config.reward_shaping_coef;
+                run_training::<TB, LiarsDice, _>(
+                    &mode,
+                    &config,
+                    &run_dir,
+                    resumed_metadata.as_ref(),
+                    &device,
+                    &running,
+                    move |i| LiarsDice::new_with_config(seed + i as u64, reward_shaping_coef),
+                )
+            }
             _ => bail!(
                 "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice",
                 config.env

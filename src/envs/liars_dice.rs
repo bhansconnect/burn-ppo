@@ -79,9 +79,29 @@ pub struct LiarsDice {
     game_over: bool,
     /// Random number generator
     rng: StdRng,
+    /// Reward shaping coefficient (per-round survival bonus)
+    reward_shaping_coef: f32,
 }
 
 impl LiarsDice {
+    /// Create with custom reward shaping coefficient
+    pub fn new_with_config(seed: u64, reward_shaping_coef: f32) -> Self {
+        let mut env = Self {
+            dice: [[0; DICE_PER_PLAYER]; NUM_PLAYERS],
+            dice_count: [DICE_PER_PLAYER; NUM_PLAYERS],
+            current_player: 0,
+            current_bid: None,
+            last_bidder: None,
+            bid_count: 0,
+            elimination_order: Vec::with_capacity(NUM_PLAYERS),
+            game_over: false,
+            rng: StdRng::seed_from_u64(seed),
+            reward_shaping_coef,
+        };
+        env.roll_all_dice();
+        env
+    }
+
     /// Roll all dice for all players
     fn roll_all_dice(&mut self) {
         for player in 0..NUM_PLAYERS {
@@ -351,19 +371,7 @@ impl Environment for LiarsDice {
     const EVAL_TEMP: f32 = 1.0; // Stochastic play essential for bluffing
 
     fn new(seed: u64) -> Self {
-        let mut env = Self {
-            dice: [[0; DICE_PER_PLAYER]; NUM_PLAYERS],
-            dice_count: [DICE_PER_PLAYER; NUM_PLAYERS],
-            current_player: 0,
-            current_bid: None,
-            last_bidder: None,
-            bid_count: 0,
-            elimination_order: Vec::with_capacity(NUM_PLAYERS),
-            game_over: false,
-            rng: StdRng::seed_from_u64(seed),
-        };
-        env.roll_all_dice();
-        env
+        Self::new_with_config(seed, 0.0) // Default: no reward shaping (pure zero-sum)
     }
 
     fn reset(&mut self) -> Vec<f32> {
@@ -420,15 +428,32 @@ impl Environment for LiarsDice {
                 // Resolve the call
                 let loser = self.resolve_call();
 
-                // Reward all surviving players who didn't lose
+                // Start new round FIRST (handles elimination and game end)
+                // This updates dice_count before we assign rewards
+                self.start_new_round(loser);
+
+                // Assign rewards based on post-round state:
+                // 1. Survival reward to all players still in game (reward shaping)
                 for (p, reward) in rewards.iter_mut().enumerate() {
-                    if self.dice_count[p] > 0 && p != loser {
-                        *reward = 1.0;
+                    if self.dice_count[p] > 0 {
+                        *reward = self.reward_shaping_coef;
                     }
                 }
 
-                // Start new round (handles elimination and game end)
-                self.start_new_round(loser);
+                // 2. Elimination penalty (overrides survival reward)
+                if self.dice_count[loser] == 0 {
+                    rewards[loser] = -1.0 / (NUM_PLAYERS - 1) as f32;
+                }
+
+                // 3. Winner bonus (added to survival reward)
+                if self.game_over {
+                    for (reward, &dice) in rewards.iter_mut().zip(self.dice_count.iter()) {
+                        if dice > 0 {
+                            *reward += 1.0;
+                            break;
+                        }
+                    }
+                }
 
                 (self.get_observation(), rewards, self.game_over)
             }
@@ -633,11 +658,9 @@ mod tests {
         assert_eq!(env.dice_count[0], 1); // P0 lost a die
         assert_eq!(env.dice_count[1], 2); // P1 still has 2
 
-        // P0 should have gotten 0, everyone else got 1
-        assert_eq!(rewards[0], 0.0);
-        assert_eq!(rewards[1], 1.0);
-        assert_eq!(rewards[2], 1.0);
-        assert_eq!(rewards[3], 1.0);
+        // With default reward_shaping_coef = 0.0, all surviving players get 0.0
+        // (P0 lost a die but survives with 1 die remaining)
+        assert_eq!(rewards, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -663,9 +686,9 @@ mod tests {
         assert_eq!(env.dice_count[0], 2); // P0 still has 2
         assert_eq!(env.dice_count[1], 1); // P1 lost a die
 
-        // P1 should have gotten 0
-        assert_eq!(rewards[1], 0.0);
-        assert_eq!(rewards[0], 1.0);
+        // With default reward_shaping_coef = 0.0, all surviving players get 0.0
+        // (P1 lost a die but survives with 1 die remaining)
+        assert_eq!(rewards, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -864,11 +887,9 @@ mod tests {
         env.step(encode_bid(1, 1)); // P0 bids "1 one" (none exist)
         let (_, rewards, _) = env.step(CALL_LIAR_ACTION); // P1 calls
 
-        // P0 (loser) gets 0, everyone else gets 1
-        assert_eq!(rewards[0], 0.0);
-        assert_eq!(rewards[1], 1.0);
-        assert_eq!(rewards[2], 1.0);
-        assert_eq!(rewards[3], 1.0);
+        // With default reward_shaping_coef = 0.0, all surviving players get 0.0
+        // (P0 lost a die but survives with 1 die remaining)
+        assert_eq!(rewards, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1079,8 +1100,13 @@ mod tests {
         assert!(done, "Game should be over");
         assert_eq!(env.dice_count[2], 0, "P2 eliminated");
         assert_eq!(env.dice_count[3], 1, "P3 still has dice");
-        assert_eq!(rewards[3], 1.0, "P3 gets reward");
-        assert_eq!(rewards[2], 0.0, "P2 gets no reward");
+        // Zero-sum rewards: P2 eliminated gets -1/3, P3 wins gets +1
+        assert_eq!(rewards[3], 1.0, "P3 gets winner reward");
+        assert!(
+            (rewards[2] - (-1.0 / 3.0)).abs() < 0.001,
+            "P2 gets elimination penalty: {:?}",
+            rewards[2]
+        );
     }
 
     #[test]
@@ -1156,5 +1182,61 @@ mod tests {
         // Bids above quantity 3 should be invalid
         assert!(!mask[encode_bid(4, 1)], "4 1s invalid - exceeds dice count");
         assert!(!mask[encode_bid(8, 6)], "8 6s invalid - exceeds dice count");
+    }
+
+    #[test]
+    fn test_reward_shaping() {
+        // Test with non-zero reward shaping coefficient
+        let mut env = LiarsDice::new_with_config(42, 0.05);
+        env.reset();
+
+        // Set up known dice: all players have [2, 2]
+        for p in 0..NUM_PLAYERS {
+            env.dice[p][0] = 2;
+            env.dice[p][1] = 2;
+        }
+        // No 1s, so bidding on 1s will fail
+
+        env.step(encode_bid(1, 1)); // P0 bids "1 one" (doesn't exist)
+        let (_, rewards, _) = env.step(CALL_LIAR_ACTION); // P1 calls
+
+        // P0 lost a die but survives (2 -> 1 dice)
+        // With reward_shaping_coef = 0.05, all surviving players get +0.05
+        assert!((rewards[0] - 0.05).abs() < 0.001, "P0 survives, gets +0.05");
+        assert!((rewards[1] - 0.05).abs() < 0.001, "P1 survives, gets +0.05");
+        assert!((rewards[2] - 0.05).abs() < 0.001, "P2 survives, gets +0.05");
+        assert!((rewards[3] - 0.05).abs() < 0.001, "P3 survives, gets +0.05");
+    }
+
+    #[test]
+    fn test_elimination_reward() {
+        // Test elimination gives -1/(N-1) penalty
+        let mut env = LiarsDice::new(42);
+        env.reset();
+
+        // Set P0 to 1 die so they'll be eliminated
+        env.dice_count[0] = 1;
+        env.dice[0] = [2, 0];
+        env.dice[1] = [3, 4];
+        env.dice[2] = [5, 6];
+        env.dice[3] = [2, 3];
+        // No 1s
+
+        env.step(encode_bid(1, 1)); // P0 bids "1 one" (doesn't exist)
+        let (_, rewards, done) = env.step(CALL_LIAR_ACTION); // P1 calls
+
+        // P0 eliminated
+        assert!(!done, "Game not over yet (3 players remain)");
+        assert_eq!(env.dice_count[0], 0, "P0 eliminated");
+        // P0 gets elimination penalty: -1/3
+        assert!(
+            (rewards[0] - (-1.0 / 3.0)).abs() < 0.001,
+            "P0 elimination penalty: {:?}",
+            rewards[0]
+        );
+        // Others get default reward shaping (0.0)
+        assert_eq!(rewards[1], 0.0, "P1 survives with 0 shaping");
+        assert_eq!(rewards[2], 0.0, "P2 survives with 0 shaping");
+        assert_eq!(rewards[3], 0.0, "P3 survives with 0 shaping");
     }
 }

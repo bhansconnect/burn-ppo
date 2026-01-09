@@ -118,6 +118,10 @@ pub struct TrainArgs {
     #[arg(long, help = "Steps per rollout (default: 128)")]
     pub num_steps: Option<usize>,
 
+    /// Reward shaping coefficient for dense rewards (default: 0.0)
+    #[arg(long)]
+    pub reward_shaping_coef: Option<f32>,
+
     /// Enable/disable learning rate annealing (use --lr-anneal=false to disable)
     #[arg(long, help = "Enable learning rate annealing (default: true)")]
     pub lr_anneal: Option<bool>,
@@ -164,7 +168,7 @@ pub struct TrainArgs {
     #[arg(long, help = "Minimum entropy coefficient (default: 0.001)")]
     pub adaptive_entropy_min_coef: Option<f64>,
 
-    #[arg(long, help = "Maximum entropy coefficient (default: 0.05)")]
+    #[arg(long, help = "Maximum entropy coefficient (default: 0.1)")]
     pub adaptive_entropy_max_coef: Option<f64>,
 
     #[arg(
@@ -434,6 +438,13 @@ pub struct Config {
     pub num_envs: NumEnvs,
     #[serde(default = "default_num_steps")]
     pub num_steps: usize,
+    /// Reward shaping coefficient for dense rewards (default 0.0).
+    /// Used differently by each environment:
+    /// - Liar's Dice: per-round survival bonus.
+    ///
+    /// Set to 0.0 for pure zero-sum/sparse rewards.
+    #[serde(default = "default_reward_shaping_coef")]
+    pub reward_shaping_coef: f32,
 
     // PPO hyperparameters
     #[serde(default = "default_learning_rate")]
@@ -479,7 +490,7 @@ pub struct Config {
     /// Minimum entropy coefficient. Default: 0.001
     #[serde(default = "default_adaptive_entropy_min_coef")]
     pub adaptive_entropy_min_coef: f64,
-    /// Maximum entropy coefficient. Default: 0.05
+    /// Maximum entropy coefficient. Default: 0.1
     #[serde(default = "default_adaptive_entropy_max_coef")]
     pub adaptive_entropy_max_coef: f64,
     /// Adjustment step size for bang-bang control. Default: 0.001
@@ -598,6 +609,9 @@ pub struct Config {
 const fn default_num_steps() -> usize {
     128
 }
+const fn default_reward_shaping_coef() -> f32 {
+    0.0 // Pure zero-sum by default
+}
 const fn default_learning_rate() -> f64 {
     2.5e-4
 }
@@ -631,7 +645,7 @@ const fn default_adaptive_entropy_min_coef() -> f64 {
     0.001
 }
 const fn default_adaptive_entropy_max_coef() -> f64 {
-    0.05
+    0.1
 }
 const fn default_adaptive_entropy_delta() -> f64 {
     0.001 // Adjustment step size
@@ -702,6 +716,7 @@ impl Default for Config {
             env: "cartpole".to_string(), // For tests only
             num_envs: NumEnvs::default(),
             num_steps: default_num_steps(),
+            reward_shaping_coef: default_reward_shaping_coef(),
             learning_rate: default_learning_rate(),
             lr_anneal: default_true(),
             lr_final: 0.0,
@@ -812,6 +827,9 @@ impl Config {
         }
         if let Some(n) = args.num_envs {
             self.num_envs = NumEnvs::Explicit(n);
+        }
+        if let Some(v) = args.reward_shaping_coef {
+            self.reward_shaping_coef = v;
         }
 
         // PPO hyperparameters
