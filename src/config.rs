@@ -148,6 +148,34 @@ pub struct TrainArgs {
     #[arg(long)]
     pub entropy_coef_final: Option<f64>,
 
+    /// Enable adaptive entropy coefficient control (targets specific entropy levels)
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub adaptive_entropy: Option<bool>,
+
+    /// Start target as ratio of max entropy (0-1) for adaptive entropy
+    #[arg(long)]
+    pub adaptive_entropy_start: Option<f64>,
+
+    /// Final target as ratio of max entropy (0-1) for adaptive entropy
+    #[arg(long)]
+    pub adaptive_entropy_final: Option<f64>,
+
+    /// Warmup fraction before decay starts for adaptive entropy (0-1)
+    #[arg(long)]
+    pub adaptive_entropy_warmup: Option<f64>,
+
+    /// Minimum entropy coefficient for adaptive entropy
+    #[arg(long)]
+    pub adaptive_entropy_min_coef: Option<f64>,
+
+    /// Maximum entropy coefficient for adaptive entropy
+    #[arg(long)]
+    pub adaptive_entropy_max_coef: Option<f64>,
+
+    /// Adjustment step size for adaptive entropy
+    #[arg(long)]
+    pub adaptive_entropy_delta: Option<f64>,
+
     #[arg(long)]
     pub value_coef: Option<f64>,
 
@@ -443,6 +471,32 @@ pub struct Config {
     /// Final entropy coefficient when annealing (None = 10% of initial)
     #[serde(default)]
     pub entropy_coef_final: Option<f64>,
+
+    // Adaptive entropy control (PID-inspired target tracking)
+    /// Enable adaptive entropy coefficient control.
+    /// Adjusts coefficient to maintain target entropy levels throughout training.
+    /// Mutually exclusive with `entropy_anneal` (this takes precedence).
+    #[serde(default)]
+    pub adaptive_entropy: bool,
+    /// Start target as ratio of max entropy (0-1). Default: 0.7 (70% of `ln(num_actions)`)
+    #[serde(default = "default_adaptive_entropy_start")]
+    pub adaptive_entropy_start: f64,
+    /// Final target as ratio of max entropy (0-1). Default: 0.2 (20% of `ln(num_actions)`)
+    #[serde(default = "default_adaptive_entropy_final")]
+    pub adaptive_entropy_final: f64,
+    /// Warmup fraction before decay starts (0-1). Default: 0.1 (10% of training)
+    #[serde(default = "default_adaptive_entropy_warmup")]
+    pub adaptive_entropy_warmup: f64,
+    /// Minimum entropy coefficient. Default: 0.001
+    #[serde(default = "default_adaptive_entropy_min_coef")]
+    pub adaptive_entropy_min_coef: f64,
+    /// Maximum entropy coefficient. Default: 0.05
+    #[serde(default = "default_adaptive_entropy_max_coef")]
+    pub adaptive_entropy_max_coef: f64,
+    /// Adjustment step size for bang-bang control. Default: 0.001
+    #[serde(default = "default_adaptive_entropy_delta")]
+    pub adaptive_entropy_delta: f64,
+
     #[serde(default = "default_value_coef")]
     pub value_coef: f64,
     #[serde(default = "default_max_grad_norm")]
@@ -567,6 +621,27 @@ const fn default_clip_epsilon() -> f64 {
 const fn default_entropy_coef() -> f64 {
     0.01
 }
+
+// Adaptive entropy defaults
+const fn default_adaptive_entropy_start() -> f64 {
+    0.7 // 70% of max entropy (high exploration early)
+}
+const fn default_adaptive_entropy_final() -> f64 {
+    0.2 // 20% of max entropy (exploitation late)
+}
+const fn default_adaptive_entropy_warmup() -> f64 {
+    0.1 // 10% of training at constant high target
+}
+const fn default_adaptive_entropy_min_coef() -> f64 {
+    0.001
+}
+const fn default_adaptive_entropy_max_coef() -> f64 {
+    0.05
+}
+const fn default_adaptive_entropy_delta() -> f64 {
+    0.001 // Adjustment step size
+}
+
 const fn default_value_coef() -> f64 {
     0.5
 }
@@ -642,6 +717,13 @@ impl Default for Config {
             entropy_coef: default_entropy_coef(),
             entropy_anneal: false,
             entropy_coef_final: None,
+            adaptive_entropy: false,
+            adaptive_entropy_start: default_adaptive_entropy_start(),
+            adaptive_entropy_final: default_adaptive_entropy_final(),
+            adaptive_entropy_warmup: default_adaptive_entropy_warmup(),
+            adaptive_entropy_min_coef: default_adaptive_entropy_min_coef(),
+            adaptive_entropy_max_coef: default_adaptive_entropy_max_coef(),
+            adaptive_entropy_delta: default_adaptive_entropy_delta(),
             value_coef: default_value_coef(),
             max_grad_norm: default_max_grad_norm(),
             target_kl: None,
@@ -766,6 +848,27 @@ impl Config {
         }
         if let Some(v) = args.entropy_coef_final {
             self.entropy_coef_final = Some(v);
+        }
+        if let Some(v) = args.adaptive_entropy {
+            self.adaptive_entropy = v;
+        }
+        if let Some(v) = args.adaptive_entropy_start {
+            self.adaptive_entropy_start = v;
+        }
+        if let Some(v) = args.adaptive_entropy_final {
+            self.adaptive_entropy_final = v;
+        }
+        if let Some(v) = args.adaptive_entropy_warmup {
+            self.adaptive_entropy_warmup = v;
+        }
+        if let Some(v) = args.adaptive_entropy_min_coef {
+            self.adaptive_entropy_min_coef = v;
+        }
+        if let Some(v) = args.adaptive_entropy_max_coef {
+            self.adaptive_entropy_max_coef = v;
+        }
+        if let Some(v) = args.adaptive_entropy_delta {
+            self.adaptive_entropy_delta = v;
         }
         if let Some(v) = args.value_coef {
             self.value_coef = v;
@@ -930,6 +1033,27 @@ impl Config {
         if args.entropy_coef_final.is_some() {
             ignored.push("--entropy-coef-final");
         }
+        if args.adaptive_entropy.is_some() {
+            ignored.push("--adaptive-entropy");
+        }
+        if args.adaptive_entropy_start.is_some() {
+            ignored.push("--adaptive-entropy-start");
+        }
+        if args.adaptive_entropy_final.is_some() {
+            ignored.push("--adaptive-entropy-final");
+        }
+        if args.adaptive_entropy_warmup.is_some() {
+            ignored.push("--adaptive-entropy-warmup");
+        }
+        if args.adaptive_entropy_min_coef.is_some() {
+            ignored.push("--adaptive-entropy-min-coef");
+        }
+        if args.adaptive_entropy_max_coef.is_some() {
+            ignored.push("--adaptive-entropy-max-coef");
+        }
+        if args.adaptive_entropy_delta.is_some() {
+            ignored.push("--adaptive-entropy-delta");
+        }
         if args.value_coef.is_some() {
             ignored.push("--value-coef");
         }
@@ -1074,6 +1198,29 @@ impl Config {
         if self.entropy_coef < 0.0 {
             bail!("entropy_coef must be >= 0");
         }
+
+        // Validate adaptive entropy config
+        if self.adaptive_entropy {
+            if self.adaptive_entropy_start < 0.0 || self.adaptive_entropy_start > 1.0 {
+                bail!("adaptive_entropy_start must be in [0, 1]");
+            }
+            if self.adaptive_entropy_final < 0.0 || self.adaptive_entropy_final > 1.0 {
+                bail!("adaptive_entropy_final must be in [0, 1]");
+            }
+            if self.adaptive_entropy_warmup < 0.0 || self.adaptive_entropy_warmup > 1.0 {
+                bail!("adaptive_entropy_warmup must be in [0, 1]");
+            }
+            if self.adaptive_entropy_min_coef < 0.0 {
+                bail!("adaptive_entropy_min_coef must be >= 0");
+            }
+            if self.adaptive_entropy_max_coef <= self.adaptive_entropy_min_coef {
+                bail!("adaptive_entropy_max_coef must be > adaptive_entropy_min_coef");
+            }
+            if self.adaptive_entropy_delta <= 0.0 {
+                bail!("adaptive_entropy_delta must be > 0");
+            }
+        }
+
         if self.num_epochs == 0 {
             bail!("num_epochs must be > 0");
         }

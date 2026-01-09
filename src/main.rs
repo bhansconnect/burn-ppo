@@ -14,6 +14,7 @@
 mod backend;
 mod checkpoint;
 mod config;
+mod entropy;
 mod env;
 mod envs;
 mod eval;
@@ -184,6 +185,14 @@ where
         action_count,
         num_players
     );
+
+    // Warning for conflicting entropy config
+    if config.adaptive_entropy && config.entropy_anneal {
+        eprintln!(
+            "Warning: Both adaptive_entropy and entropy_anneal are enabled. \
+             adaptive_entropy takes precedence; entropy_anneal will be ignored."
+        );
+    }
 
     // Create observation normalizer if enabled
     let mut obs_normalizer: Option<ObsNormalizer> = if config.normalize_obs {
@@ -482,6 +491,17 @@ where
     // - Multiplayer + pool_eval enabled: manual update (auto_update_best = false)
     let use_avg_return_for_best = num_players == 1;
 
+    // Adaptive entropy controller (if enabled)
+    let mut entropy_controller = if config.adaptive_entropy {
+        Some(entropy::AdaptiveEntropyController::new(
+            config,
+            action_count,
+            config.entropy_coef,
+        ))
+    } else {
+        None
+    };
+
     // Training loop
     for update in 0..num_updates {
         profile::profile_scope!("training_update");
@@ -513,18 +533,26 @@ where
             config.learning_rate
         };
 
-        // Entropy coefficient annealing (decay to final value, default 50% of initial)
-        // Note: Official PPO uses constant entropy (ICLR blog). 50% is a safer default
-        // than the previous 10% which caused premature convergence in board games.
-        let ent_coef = if config.entropy_anneal {
-            let actual_update = update_offset + update;
-            let progress_frac = actual_update as f64 / total_updates as f64;
+        // Entropy coefficient calculation:
+        // 1. Adaptive entropy: PID-inspired control targeting specific entropy levels
+        // 2. Entropy annealing: linear decay to final value
+        // 3. Constant: use entropy_coef as-is
+        let actual_update = update_offset + update;
+        let progress_frac = actual_update as f64 / total_updates as f64;
+
+        let (ent_coef, entropy_target) = if let Some(ref mut controller) = entropy_controller {
+            // Adaptive entropy takes precedence
+            controller.get_coefficient(progress_frac)
+        } else if config.entropy_anneal {
+            // Linear annealing (default: decay to 50% of initial)
             let final_coef = config
                 .entropy_coef_final
                 .unwrap_or(config.entropy_coef * 0.5);
-            config.entropy_coef + (final_coef - config.entropy_coef) * progress_frac
+            let coef = config.entropy_coef + (final_coef - config.entropy_coef) * progress_frac;
+            (coef, 0.0) // No target for annealing mode
         } else {
-            config.entropy_coef
+            // Constant coefficient
+            (config.entropy_coef, 0.0)
         };
 
         // Collect rollouts using non-autodiff model for inference
@@ -688,6 +716,11 @@ where
         model = updated_model;
         last_metrics = Some(metrics.clone());
 
+        // Record entropy for adaptive controller (used in next iteration)
+        if let Some(ref mut controller) = entropy_controller {
+            controller.record_entropy(metrics.entropy);
+        }
+
         global_step += steps_per_update;
 
         // Update progress bar
@@ -727,6 +760,11 @@ where
             logger.log_scalar("train/policy_loss", metrics.policy_loss, global_step)?;
             logger.log_scalar("train/value_loss", metrics.value_loss, global_step)?;
             logger.log_scalar("train/entropy", metrics.entropy, global_step)?;
+            // Log adaptive entropy metrics when enabled
+            if config.adaptive_entropy {
+                logger.log_scalar("train/entropy_target", entropy_target as f32, global_step)?;
+                logger.log_scalar("train/entropy_coef", ent_coef as f32, global_step)?;
+            }
             logger.log_scalar("train/approx_kl", metrics.approx_kl, global_step)?;
             logger.log_scalar("train/clip_fraction", metrics.clip_fraction, global_step)?;
             logger.log_scalar("train/learning_rate", lr as f32, global_step)?;
