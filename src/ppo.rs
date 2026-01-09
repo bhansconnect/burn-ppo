@@ -944,6 +944,12 @@ pub fn compute_gae_multiplayer<B: Backend>(
             let acting_player = acting_players_data[idx];
             let done = dones_data[idx];
 
+            // Reset BEFORE processing: clears rewards from future episodes
+            // (already processed in our backwards iteration)
+            if done > 0.5 {
+                reward_carry[e].fill(0.0);
+            }
+
             // This player's immediate reward + any accumulated from other turns
             let r_idx = (t * num_envs + e) * num_players + acting_player;
             attributed_rewards[idx] = all_rewards_data[r_idx] + reward_carry[e][acting_player];
@@ -954,11 +960,6 @@ pub fn compute_gae_multiplayer<B: Backend>(
                 if p != acting_player {
                     *carry += all_rewards_data[(t * num_envs + e) * num_players + p];
                 }
-            }
-
-            // Reset on episode boundary
-            if done > 0.5 {
-                reward_carry[e].fill(0.0);
             }
         }
     }
@@ -984,6 +985,21 @@ pub fn compute_gae_multiplayer<B: Backend>(
             let value = all_values_data[(t * num_envs + e) * num_players + player];
             let done = dones_data[idx];
 
+            // Reset BEFORE processing: clears carry from future episodes
+            // (already processed in our backwards iteration)
+            if done > 0.5 {
+                gae_carry[e].fill(0.0);
+                // Reset next_value for non-acting players only:
+                // - Acting player: keep for bootstrapping earlier same-player steps
+                // - Others: reset to prevent bleed from future episodes (their future
+                //   rewards are already in attributed_rewards via reward carry)
+                for (p, nv) in next_value[e].iter_mut().enumerate() {
+                    if p != player {
+                        *nv = 0.0;
+                    }
+                }
+            }
+
             // TD error using this player's next value
             let delta = (gamma * next_value[e][player]).mul_add(1.0 - done, reward) - value;
 
@@ -995,12 +1011,6 @@ pub fn compute_gae_multiplayer<B: Backend>(
             // Update carry for this player
             gae_carry[e][player] = advantage;
             next_value[e][player] = value;
-
-            // Reset all players' GAE carry on episode boundary
-            if done > 0.5 {
-                gae_carry[e].fill(0.0);
-                next_value[e].fill(0.0);
-            }
         }
     }
 
@@ -1619,6 +1629,498 @@ mod tests {
 
         assert!(buffer.advantages.is_some());
         assert!(buffer.returns.is_some());
+    }
+
+    #[test]
+    fn test_gae_multiplayer_same_player_consecutive() {
+        // P0 acts twice in a row, ending the episode
+        // Verifies bootstrapping works for same-player chains
+
+        let device = Default::default();
+        let gamma = 0.99_f32;
+        let lambda = 0.95_f32;
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 1, 4, 2, &device);
+
+        // P0 acts both steps, step 1 is terminal
+        buffer.dones = Tensor::from_floats([[0.0], [1.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [0]], &device);
+
+        // P0 gets +1 reward at terminal step
+        buffer.all_rewards = Tensor::from_floats([[[0.0, 0.0]], [[1.0, 0.0]]], &device);
+
+        buffer.all_values = Tensor::from_floats(
+            [[[0.5, 0.5]], [[0.8, 0.5]]], // P0 expects 0.8 at terminal
+            &device,
+        );
+
+        let last_values = Tensor::zeros([1, 2], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, gamma, lambda, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // Step 1 (terminal): delta = 1.0 - 0.8 = 0.2
+        let expected_step1 = 1.0 - 0.8;
+        assert!(
+            (advs[1] - expected_step1).abs() < 1e-5,
+            "Step 1: expected {}, got {}",
+            expected_step1,
+            advs[1]
+        );
+
+        // Step 0: delta = 0.0 + gamma * V1 - V0 = 0.99 * 0.8 - 0.5 = 0.292
+        // advantage = delta + gamma * lambda * A1 = 0.292 + 0.99 * 0.95 * 0.2
+        let delta0 = gamma * 0.8 - 0.5;
+        let expected_step0 = delta0 + gamma * lambda * expected_step1;
+        assert!(
+            (advs[0] - expected_step0).abs() < 1e-5,
+            "Step 0: expected {}, got {}",
+            expected_step0,
+            advs[0]
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_different_player_terminal_no_bleed() {
+        // Episode 1: P0 acts, P1 acts (terminal)
+        // Episode 2: P0 acts
+        // P0's advantage at step 0 should NOT bootstrap from Episode 2
+
+        let device = Default::default();
+        let gamma = 0.99_f32;
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 2, &device);
+
+        buffer.dones = Tensor::from_floats([[0.0], [1.0], [1.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [1], [0]], &device);
+
+        // Episode 1: P0 loses (-1), P1 wins (+1)
+        // Episode 2: P0 wins (+1)
+        buffer.all_rewards = Tensor::from_floats(
+            [
+                [[0.0, 0.0]],
+                [[-1.0, 1.0]], // Episode 1 end
+                [[1.0, -1.0]], // Episode 2 end
+            ],
+            &device,
+        );
+
+        // Give Episode 2 P0 a high value to detect bleed
+        buffer.all_values = Tensor::from_floats(
+            [
+                [[0.0, 0.0]],
+                [[0.0, 0.0]],
+                [[0.9, 0.0]], // Episode 2: P0 expects 0.9
+            ],
+            &device,
+        );
+
+        let last_values = Tensor::zeros([1, 2], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, gamma, 0.95, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // Step 0 (P0, Episode 1): attributed_reward = r0[P0] + r1[P0] = 0 + (-1) = -1
+        // With correct code: delta = -1 + gamma * 0 - 0 = -1 (next_value reset for P0)
+        // With buggy code: delta = -1 + gamma * 0.9 - 0 = -0.109 (wrong!)
+        //
+        // P0 loses in Episode 1, so advantage should be strongly negative
+        assert!(
+            advs[0] < -0.5,
+            "P0 step 0 should have strongly negative advantage (lost game), got {}",
+            advs[0]
+        );
+
+        // If buggy code uses V2=0.9 from Episode 2:
+        // delta = -1 + 0.99 * 0.9 = -0.109 (almost neutral - WRONG!)
+        assert!(
+            advs[0] < -0.9,
+            "P0 advantage should be close to -1 (attributed reward), got {} (possible Episode 2 bleed)",
+            advs[0]
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_reward_attribution_boundary() {
+        // Verify rewards don't bleed from Episode 2 into Episode 1
+        // Episode 1: steps 0-1, P1 wins
+        // Episode 2: steps 2-3, P0 wins big (+10)
+
+        let device = Default::default();
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 1, 4, 2, &device);
+
+        buffer.dones = Tensor::from_floats([[0.0], [1.0], [0.0], [1.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [1], [0], [1]], &device);
+
+        buffer.all_rewards = Tensor::from_floats(
+            [
+                [[0.0, 0.0]],
+                [[-1.0, 1.0]], // Episode 1: P0 loses, P1 wins
+                [[0.0, 0.0]],
+                [[10.0, -10.0]], // Episode 2: P0 wins big
+            ],
+            &device,
+        );
+
+        buffer.all_values = Tensor::zeros([4, 1, 2], &device);
+
+        let last_values = Tensor::zeros([1, 2], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // P0's advantage in Episode 1 should reflect losing (-1), not Episode 2's win
+        assert!(
+            advs[0] < 0.0,
+            "P0 step 0 (Episode 1) should be negative (lost), got {}",
+            advs[0]
+        );
+
+        // P1's advantage in Episode 1 should reflect winning (+1)
+        assert!(
+            advs[1] > 0.0,
+            "P1 step 1 (Episode 1) should be positive (won), got {}",
+            advs[1]
+        );
+
+        // Episode 2 should be independent
+        assert!(
+            advs[2] > 5.0,
+            "P0 step 2 (Episode 2) should reflect +10 win, got {}",
+            advs[2]
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_three_players() {
+        // 3-player game: P0, P1, P2 take turns
+        // Only P2 wins at terminal step
+
+        let device = Default::default();
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 3, &device);
+
+        buffer.dones = Tensor::from_floats([[0.0], [0.0], [1.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [1], [2]], &device);
+
+        // P2 wins, others lose
+        buffer.all_rewards = Tensor::from_floats(
+            [[[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]], [[-1.0, -1.0, 2.0]]],
+            &device,
+        );
+
+        buffer.all_values = Tensor::zeros([3, 1, 3], &device);
+
+        let last_values = Tensor::zeros([1, 3], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 3, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // P0 and P1 should have negative advantages (they lose)
+        assert!(
+            advs[0] < 0.0,
+            "P0 should have negative advantage, got {}",
+            advs[0]
+        );
+        assert!(
+            advs[1] < 0.0,
+            "P1 should have negative advantage, got {}",
+            advs[1]
+        );
+
+        // P2 should have positive advantage (wins)
+        assert!(
+            advs[2] > 0.0,
+            "P2 should have positive advantage, got {}",
+            advs[2]
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_long_alternating_episode() {
+        // 6-step episode: P0, P1, P0, P1, P0, P1 (terminal)
+        // P0 acts at 0, 2, 4; P1 acts at 1, 3, 5
+        // Tests that value chains work correctly over multiple turns
+
+        let device = Default::default();
+        let gamma = 0.99_f32;
+        let lambda = 0.95_f32;
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(6, 1, 4, 2, &device);
+
+        buffer.dones = Tensor::from_floats([[0.0], [0.0], [0.0], [0.0], [0.0], [1.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [1], [0], [1], [0], [1]], &device);
+
+        // Reward only at end: P0 wins
+        buffer.all_rewards = Tensor::from_floats(
+            [
+                [[0.0, 0.0]],
+                [[0.0, 0.0]],
+                [[0.0, 0.0]],
+                [[0.0, 0.0]],
+                [[0.0, 0.0]],
+                [[1.0, -1.0]],
+            ],
+            &device,
+        );
+
+        // Increasing value estimates for P0 (correctly predicting win)
+        buffer.all_values = Tensor::from_floats(
+            [
+                [[0.3, 0.7]],
+                [[0.4, 0.6]],
+                [[0.5, 0.5]],
+                [[0.6, 0.4]],
+                [[0.7, 0.3]],
+                [[0.8, 0.2]],
+            ],
+            &device,
+        );
+
+        let last_values = Tensor::zeros([1, 2], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, gamma, lambda, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // All P0 steps should have positive advantages
+        assert!(
+            advs[0] > 0.0,
+            "P0 step 0 should be positive, got {}",
+            advs[0]
+        );
+        assert!(
+            advs[2] > 0.0,
+            "P0 step 2 should be positive, got {}",
+            advs[2]
+        );
+        assert!(
+            advs[4] > 0.0,
+            "P0 step 4 should be positive, got {}",
+            advs[4]
+        );
+
+        // All P1 steps should have negative advantages
+        assert!(
+            advs[1] < 0.0,
+            "P1 step 1 should be negative, got {}",
+            advs[1]
+        );
+        assert!(
+            advs[3] < 0.0,
+            "P1 step 3 should be negative, got {}",
+            advs[3]
+        );
+        assert!(
+            advs[5] < 0.0,
+            "P1 step 5 should be negative, got {}",
+            advs[5]
+        );
+
+        // Advantages should decrease in magnitude as we approach terminal
+        // (less uncertainty as game progresses)
+        assert!(
+            advs[0].abs() > advs[2].abs(),
+            "Earlier advantages should be larger in magnitude"
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_different_player_terminal_exact() {
+        // Verify exact advantage values when different player acts at terminal
+        // Episode: Step 0 (P0 acts), Step 1 (P1 acts, done)
+
+        let device = Default::default();
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 1, 4, 2, &device);
+
+        buffer.dones = Tensor::from_floats([[0.0], [1.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [1]], &device);
+
+        // P0 loses (-1), P1 wins (+1) at terminal step
+        buffer.all_rewards = Tensor::from_floats([[[0.0, 0.0]], [[-1.0, 1.0]]], &device);
+
+        // All values = 0 for simple calculation
+        buffer.all_values = Tensor::zeros([2, 1, 2], &device);
+
+        let last_values = Tensor::zeros([1, 2], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // Step 1 (P1, terminal): delta = 1 + 0 - 0 = 1, advantage = 1
+        assert!(
+            (advs[1] - 1.0).abs() < 1e-5,
+            "P1 terminal advantage should be 1.0, got {}",
+            advs[1]
+        );
+
+        // Step 0 (P0): attributed_reward = 0 + (-1) = -1 (P0's reward from step 1 via carry)
+        // next_value[P0] = 0 (reset at episode boundary)
+        // delta = -1 + gamma * 0 - 0 = -1, advantage = -1
+        assert!(
+            (advs[0] - (-1.0)).abs() < 1e-5,
+            "P0 advantage should be -1.0, got {}",
+            advs[0]
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_same_player_across_boundary() {
+        // P0 acts at end of Episode 1 AND start of Episode 2
+        // Verify P0's values don't bleed across episodes
+
+        let device = Default::default();
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 2, &device);
+
+        // Episode 1: step 0 (P0), step 1 (P0, done)
+        // Episode 2: step 2 (P0, done)
+        buffer.dones = Tensor::from_floats([[0.0], [1.0], [1.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [0], [0]], &device);
+
+        // Episode 1: P0 loses (-1 at step 1)
+        // Episode 2: P0 wins (+10 at step 2)
+        buffer.all_rewards =
+            Tensor::from_floats([[[0.0, 0.0]], [[-1.0, 0.0]], [[10.0, 0.0]]], &device);
+
+        // Different values to detect bleed
+        buffer.all_values = Tensor::from_floats(
+            [
+                [[0.0, 0.0]], // Step 0
+                [[0.0, 0.0]], // Step 1 (Episode 1 terminal)
+                [[5.0, 0.0]], // Step 2 (Episode 2) - high value
+            ],
+            &device,
+        );
+
+        let last_values = Tensor::zeros([1, 2], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // Step 2 (Episode 2): delta = 10 - 5 = 5, advantage = 5
+        assert!(
+            (advs[2] - 5.0).abs() < 1e-5,
+            "Episode 2 advantage should be 5.0, got {}",
+            advs[2]
+        );
+
+        // Step 1 (Episode 1 terminal): delta = -1 - 0 = -1
+        // P0's next_value should NOT be 5.0 from Episode 2
+        assert!(
+            (advs[1] - (-1.0)).abs() < 1e-5,
+            "Episode 1 terminal advantage should be -1.0, got {}",
+            advs[1]
+        );
+
+        // Step 0 (Episode 1): Should bootstrap from step 1's value (0), not step 2's value (5)
+        // delta = 0 + gamma * 0 - 0 = 0
+        // advantage = delta + gamma * lambda * (-1) = -0.9405
+        let expected = -(0.99 * 0.95);
+        assert!(
+            (advs[0] - expected).abs() < 1e-5,
+            "Episode 1 step 0 advantage should be {}, got {}",
+            expected,
+            advs[0]
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_multiple_envs_isolated() {
+        // Two environments with different episode boundaries
+        // Verify they don't interfere with each other
+
+        let device = Default::default();
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 2, 4, 2, &device);
+
+        // Env 0: done at step 1, Env 1: not done
+        buffer.dones = Tensor::from_floats([[0.0, 0.0], [1.0, 0.0]], &device);
+        buffer.acting_players = Tensor::from_ints([[0, 0], [1, 1]], &device);
+
+        // Env 0: P1 wins at step 1
+        // Env 1: ongoing game, no terminal rewards
+        buffer.all_rewards = Tensor::from_floats(
+            [[[0.0, 0.0], [0.0, 0.0]], [[-1.0, 1.0], [0.0, 0.0]]],
+            &device,
+        );
+
+        buffer.all_values = Tensor::from_floats(
+            [[[0.5, 0.5], [0.3, 0.3]], [[0.6, 0.4], [0.4, 0.4]]],
+            &device,
+        );
+
+        let last_values = Tensor::from_floats([[0.0, 0.0], [0.5, 0.5]], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+        // Layout: [step0_env0, step0_env1, step1_env0, step1_env1]
+
+        // Env 0, step 1 (P1, done): delta = 1 + 0 - 0.4 = 0.6
+        assert!(
+            (advs[2] - 0.6).abs() < 1e-5,
+            "Env 0 step 1 advantage should be 0.6, got {}",
+            advs[2]
+        );
+
+        // Env 1, step 1 (P1, not done): should bootstrap from last_values
+        // delta = 0 + gamma * 0.5 - 0.4 = 0.495 - 0.4 = 0.095
+        let env1_step1_expected = 0.99 * 0.5 - 0.4;
+        assert!(
+            (advs[3] - env1_step1_expected).abs() < 1e-4,
+            "Env 1 step 1 advantage should be ~{}, got {}",
+            env1_step1_expected,
+            advs[3]
+        );
+    }
+
+    #[test]
+    fn test_gae_multiplayer_no_done_flags() {
+        // No episodes end - verify normal GAE computation works
+
+        let device = Default::default();
+
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 2, &device);
+
+        // No done flags - single ongoing episode
+        buffer.dones = Tensor::zeros([3, 1], &device);
+        buffer.acting_players = Tensor::from_ints([[0], [1], [0]], &device);
+
+        buffer.all_rewards =
+            Tensor::from_floats([[[0.1, 0.0]], [[0.0, 0.2]], [[0.3, 0.0]]], &device);
+
+        buffer.all_values =
+            Tensor::from_floats([[[0.5, 0.5]], [[0.5, 0.5]], [[0.5, 0.5]]], &device);
+
+        // Bootstrap values
+        let last_values = Tensor::from_floats([[0.6, 0.6]], &device);
+        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+
+        let advs = buffer.advantages.unwrap().to_data();
+        let advs = advs.as_slice::<f32>().unwrap();
+
+        // All advantages should be computed (not NaN or zero due to bad resets)
+        assert!(advs[0].is_finite(), "Step 0 advantage should be finite");
+        assert!(advs[1].is_finite(), "Step 1 advantage should be finite");
+        assert!(advs[2].is_finite(), "Step 2 advantage should be finite");
+
+        // Step 2 (P0): delta = 0.3 + gamma * 0.6 - 0.5 = 0.3 + 0.594 - 0.5 = 0.394
+        let step2_delta = 0.3 + 0.99 * 0.6 - 0.5;
+        assert!(
+            (advs[2] - step2_delta).abs() < 1e-4,
+            "Step 2 advantage should be ~{}, got {}",
+            step2_delta,
+            advs[2]
+        );
     }
 
     #[test]
