@@ -1330,9 +1330,12 @@ fn generate_rating_graph(contestants: &[Contestant], ratings: &[WengLinRating]) 
         .fold(f64::MIN, f64::max);
 
     // Include random baseline in y range
-    let random_rating = random.first().map(|(idx, _)| ratings[*idx].rating);
-    let y_min = random_rating.map_or(y_min, |r| y_min.min(r - 1.0));
-    let y_max = random_rating.map_or(y_max, |r| y_max.max(r + 1.0));
+    let random_rating = random.first().map(|(idx, _)| {
+        let r = &ratings[*idx];
+        (r.rating, r.uncertainty)
+    });
+    let y_min = random_rating.map_or(y_min, |(r, sigma)| y_min.min(r - 2.0 * sigma - 1.0));
+    let y_max = random_rating.map_or(y_max, |(r, sigma)| y_max.max(r + 2.0 * sigma + 1.0));
 
     // Add padding to y range
     let y_range = y_max - y_min;
@@ -1410,7 +1413,23 @@ fn generate_rating_graph(contestants: &[Contestant], ratings: &[WengLinRating]) 
     }
 
     // 9. Draw random baseline if present
-    if let Some(rr) = random_rating {
+    if let Some((rr, sigma)) = random_rating {
+        let lower = rr - 2.0 * sigma;
+        let upper = rr + 2.0 * sigma;
+
+        // Draw confidence band (filled area)
+        let polygon = vec![
+            (x_min as f64, upper),
+            (x_max as f64, upper),
+            (x_max as f64, lower),
+            (x_min as f64, lower),
+        ];
+        chart.draw_series(std::iter::once(Polygon::new(
+            polygon,
+            BLACK.mix(0.2).filled(),
+        )))?;
+
+        // Draw the line
         chart
             .draw_series(LineSeries::new(
                 vec![(x_min as f64, rr), (x_max as f64, rr)],
