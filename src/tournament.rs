@@ -1380,9 +1380,50 @@ fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
         .position(SeriesLabelPosition::UpperLeft)
         .draw()?;
 
+    // 11. Draw rating guide text in bottom-right corner
+    let guide_text = [
+        "Rating Δ Guide:",
+        "+4 pts → 67% win",
+        "+8 pts → 82% win",
+        "+12 pts → 90% win",
+        "+16 pts → 95% win",
+        "Shaded: 95% CI (±2σ)",
+    ];
+
+    let (width, height) = root.dim_in_pixel();
+    let text_x = i32::try_from(width).unwrap_or(1200) - 160;
+    let text_y = i32::try_from(height).unwrap_or(800) - 110;
+
+    // Draw background box for readability
+    root.draw(&Rectangle::new(
+        [(text_x - 8, text_y - 4), (text_x + 150, text_y + 100)],
+        ShapeStyle {
+            color: WHITE.mix(0.85).to_rgba(),
+            filled: true,
+            stroke_width: 1,
+        },
+    ))?;
+    root.draw(&Rectangle::new(
+        [(text_x - 8, text_y - 4), (text_x + 150, text_y + 100)],
+        BLACK.stroke_width(1),
+    ))?;
+
+    for (i, line) in guide_text.iter().enumerate() {
+        let style = if i == 0 {
+            ("sans-serif", 13).into_font().style(FontStyle::Bold)
+        } else {
+            ("sans-serif", 12).into_font()
+        };
+        root.draw(&Text::new(
+            *line,
+            (text_x, text_y + i32::try_from(i).unwrap_or(0) * 16),
+            style,
+        ))?;
+    }
+
     root.present()?;
 
-    // 11. Print path and open
+    // 12. Print path and open
     println!("\nGraph saved to: {}", temp_path.display());
 
     #[cfg(target_os = "macos")]
