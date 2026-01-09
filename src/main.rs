@@ -413,6 +413,7 @@ where
                 checkpoints_dir,
                 num_players_usize,
                 config.opponent_pool_sample_temperature,
+                config.opponent_pool_uniform_sampling,
                 config.clone(),
                 device.clone(),
                 config.seed,

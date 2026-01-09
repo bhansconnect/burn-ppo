@@ -227,6 +227,10 @@ pub struct TrainArgs {
     #[arg(long)]
     pub opponent_pool_sample_temperature: Option<f32>,
 
+    /// Use uniform random sampling instead of rating-weighted sampling
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub opponent_pool_uniform_sampling: Option<bool>,
+
     /// Enable periodic pool evaluation
     #[arg(long, action = clap::ArgAction::Set)]
     pub opponent_pool_eval_enabled: Option<bool>,
@@ -560,6 +564,9 @@ pub struct Config {
     /// Softmax temperature for opponent sampling (higher = more uniform)
     #[serde(default = "default_opponent_pool_sample_temperature")]
     pub opponent_pool_sample_temperature: f32,
+    /// Use uniform random sampling for opponents (ignores temperature/ratings)
+    #[serde(default)]
+    pub opponent_pool_uniform_sampling: bool,
     /// Enable periodic pool evaluation
     #[serde(default = "default_true")]
     pub opponent_pool_eval_enabled: bool,
@@ -744,6 +751,7 @@ impl Default for Config {
             opponent_pool_fraction: default_opponent_pool_fraction(),
             opponent_pool_rotation_steps: default_opponent_pool_rotation_steps(),
             opponent_pool_sample_temperature: default_opponent_pool_sample_temperature(),
+            opponent_pool_uniform_sampling: false,
             opponent_pool_eval_enabled: true,
             opponent_pool_eval_interval: None, // Defaults to checkpoint_freq
             opponent_pool_eval_games: default_opponent_pool_eval_games(),
@@ -940,6 +948,9 @@ impl Config {
         }
         if let Some(v) = args.opponent_pool_sample_temperature {
             self.opponent_pool_sample_temperature = v;
+        }
+        if let Some(v) = args.opponent_pool_uniform_sampling {
+            self.opponent_pool_uniform_sampling = v;
         }
         if let Some(v) = args.opponent_pool_eval_enabled {
             self.opponent_pool_eval_enabled = v;

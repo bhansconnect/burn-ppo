@@ -163,6 +163,9 @@ pub struct OpponentPool<B: Backend> {
     /// Sampling temperature for softmax
     temperature: f32,
 
+    /// Use uniform random sampling instead of rating-weighted
+    uniform_sampling: bool,
+
     /// Config for model loading
     config: Config,
 
@@ -209,6 +212,7 @@ impl<B: Backend> OpponentPool<B> {
         checkpoints_dir: PathBuf,
         num_players: usize,
         temperature: f32,
+        uniform_sampling: bool,
         config: Config,
         device: B::Device,
         seed: u64,
@@ -234,6 +238,7 @@ impl<B: Backend> OpponentPool<B> {
             num_opponent_slots: num_players.saturating_sub(1),
             checkpoints_dir: checkpoints_dir.clone(),
             temperature,
+            uniform_sampling,
             config,
             device,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
@@ -415,13 +420,13 @@ impl<B: Backend> OpponentPool<B> {
             return None;
         }
 
-        // Get eligible opponents
-        let eligible: Vec<(usize, f64)> = self
+        // Get eligible opponent indices
+        let eligible: Vec<usize> = self
             .available
             .iter()
             .enumerate()
             .filter(|(i, _)| !exclude.contains(i))
-            .map(|(i, (_, rating))| (i, rating.rating_mu))
+            .map(|(i, _)| i)
             .collect();
 
         if eligible.is_empty() {
@@ -429,13 +434,25 @@ impl<B: Backend> OpponentPool<B> {
             return Some(self.rng.gen_range(0..self.available.len()));
         }
 
+        // Uniform sampling: pick randomly from eligible
+        if self.uniform_sampling {
+            let idx = self.rng.gen_range(0..eligible.len());
+            return Some(eligible[idx]);
+        }
+
+        // Rating-weighted sampling: get ratings for eligible opponents
+        let eligible_with_ratings: Vec<(usize, f64)> = eligible
+            .iter()
+            .map(|&i| (i, self.available[i].1.rating_mu))
+            .collect();
+
         // Compute softmax probabilities
-        let max_rating = eligible
+        let max_rating = eligible_with_ratings
             .iter()
             .map(|(_, r)| *r)
             .fold(f64::NEG_INFINITY, f64::max);
 
-        let exp_ratings: Vec<f64> = eligible
+        let exp_ratings: Vec<f64> = eligible_with_ratings
             .iter()
             .map(|(_, r)| ((r - max_rating) / f64::from(self.temperature)).exp())
             .collect();
@@ -443,8 +460,8 @@ impl<B: Backend> OpponentPool<B> {
         let sum: f64 = exp_ratings.iter().sum();
         if sum == 0.0 {
             // Uniform fallback
-            let idx = self.rng.gen_range(0..eligible.len());
-            return Some(eligible[idx].0);
+            let idx = self.rng.gen_range(0..eligible_with_ratings.len());
+            return Some(eligible_with_ratings[idx].0);
         }
 
         // Sample from distribution
@@ -453,12 +470,12 @@ impl<B: Backend> OpponentPool<B> {
         for (i, &exp) in exp_ratings.iter().enumerate() {
             cumsum += exp / sum;
             if sample < cumsum {
-                return Some(eligible[i].0);
+                return Some(eligible_with_ratings[i].0);
             }
         }
 
         Some(
-            eligible
+            eligible_with_ratings
                 .last()
                 .expect("eligible list is non-empty at this point")
                 .0,
