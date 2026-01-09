@@ -777,6 +777,25 @@ where
             logger.log_scalar("train/total_loss", metrics.total_loss, global_step)?;
             logger.log_scalar("train/value_mean", metrics.value_mean, global_step)?;
             logger.log_scalar("train/returns_mean", metrics.returns_mean, global_step)?;
+            logger.log_scalar("train/adv_mean_raw", metrics.adv_mean_raw, global_step)?;
+            logger.log_scalar("train/adv_std_raw", metrics.adv_std_raw, global_step)?;
+            logger.log_scalar("train/adv_min_raw", metrics.adv_min_raw, global_step)?;
+            logger.log_scalar("train/adv_max_raw", metrics.adv_max_raw, global_step)?;
+            logger.log_scalar(
+                "train/value_error_mean",
+                metrics.value_error_mean,
+                global_step,
+            )?;
+            logger.log_scalar(
+                "train/value_error_std",
+                metrics.value_error_std,
+                global_step,
+            )?;
+            logger.log_scalar(
+                "train/value_error_max",
+                metrics.value_error_max,
+                global_step,
+            )?;
 
             // Steps per second (since last log)
             let now = std::time::Instant::now();

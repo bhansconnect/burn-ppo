@@ -1076,6 +1076,14 @@ struct MinibatchMetrics {
     total_loss: f32,
     value_mean: f32,
     returns_mean: f32,
+    // Diagnostic metrics
+    adv_mean_raw: f32,
+    adv_std_raw: f32,
+    adv_min_raw: f32,
+    adv_max_raw: f32,
+    value_error_mean: f32,
+    value_error_std: f32,
+    value_error_max: f32,
 }
 
 /// Training metrics from a single update
@@ -1091,6 +1099,14 @@ pub struct UpdateMetrics {
     pub total_loss: f32,
     pub value_mean: f32,
     pub returns_mean: f32,
+    // Diagnostic metrics
+    pub adv_mean_raw: f32,
+    pub adv_std_raw: f32,
+    pub adv_min_raw: f32,
+    pub adv_max_raw: f32,
+    pub value_error_mean: f32,
+    pub value_error_std: f32,
+    pub value_error_max: f32,
 }
 
 /// Perform PPO update on collected rollouts
@@ -1195,6 +1211,13 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     let mut total_loss_sum = 0.0;
     let mut total_value_mean = 0.0;
     let mut total_returns_mean = 0.0;
+    let mut total_adv_mean_raw = 0.0;
+    let mut total_adv_std_raw = 0.0;
+    let mut total_adv_min_raw = f32::INFINITY;
+    let mut total_adv_max_raw = f32::NEG_INFINITY;
+    let mut total_value_error_mean = 0.0;
+    let mut total_value_error_std = 0.0;
+    let mut total_value_error_max = f32::NEG_INFINITY;
     let mut num_updates = 0;
 
     let mut model = model;
@@ -1259,6 +1282,12 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_returns: Tensor<B, 1> = Tensor::from_inner(mb_returns_inner);
             let mb_acting_players: Tensor<B, 1, Int> = Tensor::from_inner(mb_acting_players_inner);
             let mb_old_values: Tensor<B, 1> = Tensor::from_inner(mb_old_values_inner);
+
+            // Capture raw advantage stats before normalization (for debugging)
+            let adv_mean_raw_t = mb_advantages_raw.clone().mean();
+            let adv_std_raw_t = mb_advantages_raw.clone().var(0).sqrt();
+            let adv_min_raw_t = mb_advantages_raw.clone().min();
+            let adv_max_raw_t = mb_advantages_raw.clone().max();
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
@@ -1347,6 +1376,12 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                     + value_loss.clone() * config.value_coef
                     + entropy_loss;
 
+                // Value prediction error: |V(s) - actual_return|
+                let value_errors = (values.clone() - mb_returns.clone()).abs();
+                let value_error_mean_t = value_errors.clone().mean();
+                let value_error_std_t = value_errors.clone().var(0).sqrt();
+                let value_error_max_t = value_errors.max();
+
                 // Capture values for metrics before backward
                 let values_mean = values.mean();
                 let returns_mean = mb_returns.mean();
@@ -1377,6 +1412,13 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                     total_loss: scalar(loss.inner().reshape([1])),
                     value_mean: scalar(values_mean.inner().reshape([1])),
                     returns_mean: scalar(returns_mean.inner().reshape([1])),
+                    adv_mean_raw: scalar(adv_mean_raw_t.inner().reshape([1])),
+                    adv_std_raw: scalar(adv_std_raw_t.inner().reshape([1])),
+                    adv_min_raw: scalar(adv_min_raw_t.inner().reshape([1])),
+                    adv_max_raw: scalar(adv_max_raw_t.inner().reshape([1])),
+                    value_error_mean: scalar(value_error_mean_t.inner().reshape([1])),
+                    value_error_std: scalar(value_error_std_t.inner().reshape([1])),
+                    value_error_max: scalar(value_error_max_t.inner().reshape([1])),
                 };
 
                 (grads, metrics)
@@ -1406,6 +1448,13 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 total_loss_sum += metrics.total_loss;
                 total_value_mean += metrics.value_mean;
                 total_returns_mean += metrics.returns_mean;
+                total_adv_mean_raw += metrics.adv_mean_raw;
+                total_adv_std_raw += metrics.adv_std_raw;
+                total_adv_min_raw = total_adv_min_raw.min(metrics.adv_min_raw);
+                total_adv_max_raw = total_adv_max_raw.max(metrics.adv_max_raw);
+                total_value_error_mean += metrics.value_error_mean;
+                total_value_error_std += metrics.value_error_std;
+                total_value_error_max = total_value_error_max.max(metrics.value_error_max);
                 num_updates += 1;
 
                 // KL early stopping: stop epoch if KL divergence exceeds threshold
@@ -1449,6 +1498,13 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         total_loss: total_loss_sum / num_updates as f32,
         value_mean: total_value_mean / num_updates as f32,
         returns_mean: total_returns_mean / num_updates as f32,
+        adv_mean_raw: total_adv_mean_raw / num_updates as f32,
+        adv_std_raw: total_adv_std_raw / num_updates as f32,
+        adv_min_raw: total_adv_min_raw,
+        adv_max_raw: total_adv_max_raw,
+        value_error_mean: total_value_error_mean / num_updates as f32,
+        value_error_std: total_value_error_std / num_updates as f32,
+        value_error_max: total_value_error_max,
     };
 
     (model, metrics)
