@@ -104,6 +104,16 @@ impl MatchupGames {
     }
 }
 
+/// A single game result for batch rating updates
+/// Used to collect all games across the tournament before shuffling and rating
+#[derive(Debug, Clone)]
+struct SingleGameResult {
+    /// Indices of contestants in this game
+    contestants: Vec<usize>,
+    /// Placement for each contestant (1-indexed, 1=first place)
+    placements: Vec<usize>,
+}
+
 /// A contestant in the tournament
 #[derive(Clone, Debug)]
 pub struct Contestant {
@@ -111,8 +121,6 @@ pub struct Contestant {
     pub name: String,
     /// Source for action selection
     pub source: PlayerSource,
-    /// Current skill rating (mu, sigma)
-    pub rating: WengLinRating,
     /// Indices of opponents already faced
     pub opponents_faced: Vec<usize>,
     /// Placement counts: [placement-1] = count (1st place at index 0)
@@ -134,7 +142,6 @@ impl Contestant {
         Self {
             name,
             source,
-            rating: WengLinRating::new(),
             opponents_faced: Vec::new(),
             placement_counts: Vec::new(),
             games_played: 0,
@@ -761,11 +768,11 @@ fn swiss_pods(contestants: &[Contestant], pod_size: usize) -> Vec<Vec<usize>> {
         return form_dutch_pods(&ranked_indices, pod_size, contestants);
     }
 
-    // Subsequent rounds: sort by Swiss points (desc), rating as tiebreaker
+    // Subsequent rounds: sort by Swiss points (desc), initial_seed as tiebreaker
     let mut ranked: Vec<(usize, f64, f64)> = contestants
         .iter()
         .enumerate()
-        .map(|(i, c)| (i, c.swiss_points, c.rating.rating))
+        .map(|(i, c)| (i, c.swiss_points, c.initial_seed))
         .collect();
     ranked.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
@@ -890,60 +897,24 @@ fn round_robin_pods(n: usize, pod_size: usize) -> Vec<Vec<usize>> {
     (0..n).combinations(pod_size).collect()
 }
 
-/// Update ratings from per-game placements using `weng_lin_multi_team` (N-player compatible)
-/// Games are shuffled to avoid bias from completion order (shorter games finish first)
-///
+/// Update stats (placement counts, Swiss points, etc.) from game results.
 /// Swiss points are awarded based on match-level placement:
 /// 1. Sum raw placement points across all games in the match
 /// 2. Rank contestants by raw totals to determine match placements
 /// 3. Award Swiss points based on match placement using fractional ranking
-fn update_ratings_from_games(
-    contestants: &mut [Contestant],
-    matchup: &MatchupGames,
-    config: &WengLinConfig,
-) {
+///
+/// Note: Ratings are updated separately via `update_ratings_batch` at tournament end
+fn update_stats_from_games(contestants: &mut [Contestant], matchup: &MatchupGames) {
     if matchup.games.is_empty() {
         return;
     }
-
-    // Shuffle games to avoid bias from completion order
-    let mut games = matchup.games.clone();
-    let seed = games.len() as u64;
-    let mut rng = StdRng::seed_from_u64(seed);
-    games.shuffle(&mut rng);
 
     let num_players = matchup.contestants.len();
 
     // Track raw points per contestant for match-level scoring
     let mut raw_points: Vec<f64> = vec![0.0; num_players];
 
-    for game in &games {
-        // Build rating groups for weng_lin_multi_team
-        // Each "team" is a single player
-        let ratings: Vec<WengLinRating> = matchup
-            .contestants
-            .iter()
-            .map(|&idx| contestants[idx].rating)
-            .collect();
-
-        let rating_refs: Vec<[WengLinRating; 1]> = ratings.iter().map(|r| [*r]).collect();
-
-        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_refs
-            .iter()
-            .enumerate()
-            .map(|(i, rating_arr)| {
-                let placement = game.placements[i];
-                (rating_arr.as_slice(), MultiTeamOutcome::new(placement))
-            })
-            .collect();
-
-        let new_ratings = weng_lin_multi_team(&rating_groups, config);
-
-        // Update contestant ratings
-        for (i, &contestant_idx) in matchup.contestants.iter().enumerate() {
-            contestants[contestant_idx].rating = new_ratings[i][0];
-        }
-
+    for game in &matchup.games {
         // Check if this is a draw (all placements equal)
         let is_draw = game.placements.windows(2).all(|w| w[0] == w[1]);
 
@@ -1019,6 +990,55 @@ fn update_ratings_from_games(
     }
 }
 
+/// Compute ratings from all tournament games in a shuffled order.
+/// Returns a Vec of ratings indexed by contestant index.
+/// This is called at the end of the tournament to ensure unbiased sampling.
+fn compute_ratings(
+    num_contestants: usize,
+    all_games: &[SingleGameResult],
+    config: &WengLinConfig,
+    rng: &mut StdRng,
+) -> Vec<WengLinRating> {
+    // Initialize all ratings to default (25.0 mu, 8.333 sigma)
+    let mut ratings: Vec<WengLinRating> =
+        (0..num_contestants).map(|_| WengLinRating::new()).collect();
+
+    if all_games.is_empty() {
+        return ratings;
+    }
+
+    // Shuffle all games for unbiased rating updates
+    let mut games = all_games.to_vec();
+    games.shuffle(rng);
+
+    for game in &games {
+        // Build rating groups for weng_lin_multi_team
+        // Each "team" is a single player
+        let game_ratings: Vec<WengLinRating> =
+            game.contestants.iter().map(|&idx| ratings[idx]).collect();
+
+        let rating_refs: Vec<[WengLinRating; 1]> = game_ratings.iter().map(|r| [*r]).collect();
+
+        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_refs
+            .iter()
+            .enumerate()
+            .map(|(i, rating_arr)| {
+                let placement = game.placements[i];
+                (rating_arr.as_slice(), MultiTeamOutcome::new(placement))
+            })
+            .collect();
+
+        let new_ratings = weng_lin_multi_team(&rating_groups, config);
+
+        // Update ratings
+        for (i, &contestant_idx) in game.contestants.iter().enumerate() {
+            ratings[contestant_idx] = new_ratings[i][0];
+        }
+    }
+
+    ratings
+}
+
 /// Print a quick guide to interpreting Openskill ratings
 pub fn print_rating_guide() {
     println!();
@@ -1029,37 +1049,47 @@ pub fn print_rating_guide() {
 }
 
 /// Print current standings
-fn print_standings(contestants: &[Contestant], header: &str) {
+/// If ratings is None, shows standings without ratings (used during tournament)
+/// If ratings is Some, includes final ratings (used after tournament)
+fn print_standings(contestants: &[Contestant], header: &str, ratings: Option<&[WengLinRating]>) {
     println!("\n{header}");
 
-    // Sort by Swiss points (descending), rating as tiebreaker
+    // Sort by Swiss points (descending), initial_seed as tiebreaker
     let mut ranked: Vec<(usize, &Contestant)> = contestants.iter().enumerate().collect();
     ranked.sort_by(|a, b| {
         b.1.swiss_points
             .partial_cmp(&a.1.swiss_points)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                b.1.rating
-                    .rating
-                    .partial_cmp(&a.1.rating.rating)
+                b.1.initial_seed
+                    .partial_cmp(&a.1.initial_seed)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
 
-    for (rank, (_, c)) in ranked.iter().enumerate() {
-        println!(
-            "  {:2}. {:20} {:6.1}pts  (rating: {:.1} ± {:.1})",
-            rank + 1,
-            c.name,
-            c.swiss_points,
-            c.rating.rating,
-            c.rating.uncertainty
-        );
+    for (rank, (idx, c)) in ranked.iter().enumerate() {
+        if let Some(r) = ratings {
+            println!(
+                "  {:2}. {:20} {:6.1}pts  (rating: {:.1} ± {:.1})",
+                rank + 1,
+                c.name,
+                c.swiss_points,
+                r[*idx].rating,
+                r[*idx].uncertainty
+            );
+        } else {
+            println!("  {:2}. {:20} {:6.1}pts", rank + 1, c.name, c.swiss_points);
+        }
     }
 }
 
 /// Print final tournament summary
-fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games: usize) {
+fn print_final_summary(
+    contestants: &[Contestant],
+    ratings: &[WengLinRating],
+    num_rounds: usize,
+    num_games: usize,
+) {
     println!("\n{}", "=".repeat(80));
     println!("=== Tournament Results ===");
     println!(
@@ -1083,8 +1113,8 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
         });
 
     // First, print results sorted by name (reverse order: newest networks first)
-    let mut by_name: Vec<&Contestant> = contestants.iter().collect();
-    by_name.sort_by(|a, b| b.name.cmp(&a.name));
+    let mut by_name: Vec<(usize, &Contestant)> = contestants.iter().enumerate().collect();
+    by_name.sort_by(|a, b| b.1.name.cmp(&a.1.name));
 
     println!("=== Results by Name (newest first) ===");
     println!(
@@ -1094,10 +1124,11 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
     let width = 60 + placement_headers.len() * 4;
     println!("{:-<width$}", "");
 
-    for c in &by_name {
-        let sigma = c.rating.uncertainty;
-        let low = c.rating.rating - 2.0 * sigma;
-        let high = c.rating.rating + 2.0 * sigma;
+    for (idx, c) in &by_name {
+        let r = &ratings[*idx];
+        let sigma = r.uncertainty;
+        let low = r.rating - 2.0 * sigma;
+        let high = r.rating + 2.0 * sigma;
 
         let placement_str: String =
             c.placement_counts
@@ -1110,12 +1141,12 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
 
         println!(
             "     {:20}  {:>8.1}  {:>7.1}  [{:>5.1}, {:>5.1}]  {}",
-            c.name, c.swiss_points, c.rating.rating, low, high, placement_str
+            c.name, c.swiss_points, r.rating, low, high, placement_str
         );
     }
     println!();
 
-    // Sort by Swiss points (descending), rating as tiebreaker
+    // Sort by Swiss points (descending), initial_seed as tiebreaker
     println!("=== Results by Swiss Points ===");
     let mut ranked: Vec<(usize, &Contestant)> = contestants.iter().enumerate().collect();
     ranked.sort_by(|a, b| {
@@ -1123,9 +1154,8 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
             .partial_cmp(&a.1.swiss_points)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                b.1.rating
-                    .rating
-                    .partial_cmp(&a.1.rating.rating)
+                b.1.initial_seed
+                    .partial_cmp(&a.1.initial_seed)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
@@ -1137,10 +1167,11 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
     let width = 60 + placement_headers.len() * 4;
     println!("{:-<width$}", "");
 
-    for (rank, (_, c)) in ranked.iter().enumerate() {
-        let sigma = c.rating.uncertainty;
-        let low = c.rating.rating - 2.0 * sigma;
-        let high = c.rating.rating + 2.0 * sigma;
+    for (rank, (idx, c)) in ranked.iter().enumerate() {
+        let r = &ratings[*idx];
+        let sigma = r.uncertainty;
+        let low = r.rating - 2.0 * sigma;
+        let high = r.rating + 2.0 * sigma;
 
         // Build placement counts string
         let placement_str: String =
@@ -1157,7 +1188,7 @@ fn print_final_summary(contestants: &[Contestant], num_rounds: usize, num_games:
             rank + 1,
             c.name,
             c.swiss_points,
-            c.rating.rating,
+            r.rating,
             low,
             high,
             placement_str
@@ -1217,8 +1248,20 @@ fn format_step(step: usize) -> String {
     }
 }
 
+/// Assign consistent colors to run names (sorted alphabetically)
+fn assign_run_colors(run_names: &[String]) -> Vec<(String, RGBColor)> {
+    let colors = [BLUE, RED, GREEN, MAGENTA, CYAN];
+    let mut sorted_names: Vec<_> = run_names.to_vec();
+    sorted_names.sort();
+    sorted_names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name, colors[i % colors.len()]))
+        .collect()
+}
+
 /// Generate and display a rating graph for tournament contestants
-fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
+fn generate_rating_graph(contestants: &[Contestant], ratings: &[WengLinRating]) -> Result<()> {
     // Helper for x-axis label formatting (must be defined before use)
     #[expect(
         clippy::cast_sign_loss,
@@ -1232,10 +1275,11 @@ fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
         format_step(x.max(0.0) as usize)
     }
 
-    // 1. Separate checkpoints from random player
+    // 1. Separate checkpoints from random player (with indices)
     let (checkpoints, random): (Vec<_>, Vec<_>) = contestants
         .iter()
-        .partition(|c| matches!(c.source, PlayerSource::Checkpoint(_)));
+        .enumerate()
+        .partition(|(_, c)| matches!(c.source, PlayerSource::Checkpoint(_)));
 
     if checkpoints.is_empty() {
         println!("No checkpoints to graph");
@@ -1245,13 +1289,14 @@ fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
     // 2. Extract data: (step, rating, lower, upper, run_id)
     let mut data: Vec<(usize, f64, f64, f64, String)> = checkpoints
         .iter()
-        .filter_map(|c| {
+        .filter_map(|(idx, c)| {
             let step = extract_step(&c.name)?;
-            let sigma = c.rating.uncertainty;
-            let lower = c.rating.rating - 2.0 * sigma;
-            let upper = c.rating.rating + 2.0 * sigma;
+            let r = &ratings[*idx];
+            let sigma = r.uncertainty;
+            let lower = r.rating - 2.0 * sigma;
+            let upper = r.rating + 2.0 * sigma;
             let run = extract_run_id(&c.name).to_string();
-            Some((step, c.rating.rating, lower, upper, run))
+            Some((step, r.rating, lower, upper, run))
         })
         .collect();
 
@@ -1285,7 +1330,7 @@ fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
         .fold(f64::MIN, f64::max);
 
     // Include random baseline in y range
-    let random_rating = random.first().map(|r| r.rating.rating);
+    let random_rating = random.first().map(|(idx, _)| ratings[*idx].rating);
     let y_min = random_rating.map_or(y_min, |r| y_min.min(r - 1.0));
     let y_max = random_rating.map_or(y_max, |r| y_max.max(r + 1.0));
 
@@ -1322,11 +1367,14 @@ fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
         .y_desc("Rating")
         .draw()?;
 
-    // 8. Define colors for runs
-    let colors = [BLUE, RED, GREEN, MAGENTA, CYAN];
+    // 8. Assign consistent colors to runs (sorted alphabetically)
+    let run_names: Vec<String> = runs.keys().cloned().collect();
+    let run_colors = assign_run_colors(&run_names);
 
-    for (i, (run_name, points)) in runs.iter().enumerate() {
-        let color = colors[i % colors.len()];
+    for (run_name, color) in run_colors {
+        let Some(points) = runs.get(&run_name) else {
+            continue;
+        };
 
         // Sort points by step for this run
         let mut points = points.clone();
@@ -1350,7 +1398,7 @@ fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
         let label = if run_name.is_empty() {
             "rating"
         } else {
-            run_name
+            &run_name
         };
 
         chart
@@ -1441,25 +1489,187 @@ fn generate_rating_graph(contestants: &[Contestant]) -> Result<()> {
     Ok(())
 }
 
+/// Generate and display a Swiss points graph for tournament contestants
+fn generate_swiss_points_graph(contestants: &[Contestant]) -> Result<()> {
+    // Helper for x-axis label formatting
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "x-axis values are non-negative training steps"
+    )]
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "plotters API requires &f64 for label formatters"
+    )]
+    fn format_x_label(x: &f64) -> String {
+        format_step(x.max(0.0) as usize)
+    }
+
+    // 1. Separate checkpoints from random player
+    let (checkpoints, random): (Vec<_>, Vec<_>) = contestants
+        .iter()
+        .partition(|c| matches!(c.source, PlayerSource::Checkpoint(_)));
+
+    if checkpoints.is_empty() {
+        println!("No checkpoints to graph");
+        return Ok(());
+    }
+
+    // 2. Extract data: (step, swiss_points, run_id)
+    let mut data: Vec<(usize, f64, String)> = checkpoints
+        .iter()
+        .filter_map(|c| {
+            let step = extract_step(&c.name)?;
+            let run = extract_run_id(&c.name).to_string();
+            Some((step, c.swiss_points, run))
+        })
+        .collect();
+
+    if data.is_empty() {
+        println!("No checkpoints with parseable step numbers to graph");
+        return Ok(());
+    }
+
+    // 3. Sort by step
+    data.sort_by_key(|(step, ..)| *step);
+
+    // 4. Group by run
+    let mut runs: HashMap<String, Vec<(usize, f64)>> = HashMap::new();
+    for (step, points, run) in data {
+        runs.entry(run).or_default().push((step, points));
+    }
+
+    // 5. Calculate axis ranges
+    let all_points: Vec<_> = runs.values().flatten().collect();
+    let x_min = all_points.iter().map(|(s, _)| *s).min().unwrap_or(0);
+    let x_max = all_points.iter().map(|(s, _)| *s).max().unwrap_or(1);
+    let y_min = all_points.iter().map(|(_, p)| *p).fold(f64::MAX, f64::min);
+    let y_max = all_points.iter().map(|(_, p)| *p).fold(f64::MIN, f64::max);
+
+    // Include random baseline in y range
+    let random_points = random.first().map(|r| r.swiss_points);
+    let y_min = random_points.map_or(y_min, |r| y_min.min(r - 1.0));
+    let y_max = random_points.map_or(y_max, |r| y_max.max(r + 1.0));
+
+    // Add padding to y range
+    let y_range = y_max - y_min;
+    let y_min = y_min - y_range * 0.05;
+    let y_max = y_max + y_range * 0.05;
+
+    // 6. Create temp file
+    let temp_path = std::env::temp_dir().join(format!(
+        "tournament_swiss_{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    ));
+
+    // 7. Create chart
+    let root = BitMapBackend::new(&temp_path, (1200, 800)).into_drawing_area();
+    root.fill(&WHITE)?;
+
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Swiss Points by Training Step", ("sans-serif", 30))
+        .margin(20)
+        .x_label_area_size(50)
+        .y_label_area_size(60)
+        .build_cartesian_2d(x_min as f64..x_max as f64, y_min..y_max)?;
+
+    chart
+        .configure_mesh()
+        .x_label_formatter(&format_x_label)
+        .y_label_formatter(&|y| format!("{y:.1}"))
+        .x_desc("Training Step")
+        .y_desc("Swiss Points")
+        .draw()?;
+
+    // 8. Assign consistent colors to runs (sorted alphabetically)
+    let run_names: Vec<String> = runs.keys().cloned().collect();
+    let run_colors = assign_run_colors(&run_names);
+
+    for (run_name, color) in run_colors {
+        let Some(points) = runs.get(&run_name) else {
+            continue;
+        };
+
+        // Sort points by step for this run
+        let mut points = points.clone();
+        points.sort_by_key(|(s, _)| *s);
+
+        // Draw points line
+        let points_line: Vec<_> = points.iter().map(|(s, p)| (*s as f64, *p)).collect();
+        let label = if run_name.is_empty() {
+            "points"
+        } else {
+            &run_name
+        };
+
+        chart
+            .draw_series(LineSeries::new(points_line, color.stroke_width(2)))?
+            .label(label)
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], color.stroke_width(2))
+            });
+    }
+
+    // 9. Draw random baseline if present
+    if let Some(rp) = random_points {
+        chart
+            .draw_series(LineSeries::new(
+                vec![(x_min as f64, rp), (x_max as f64, rp)],
+                BLACK.stroke_width(2),
+            ))?
+            .label("random")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLACK.stroke_width(2)));
+    }
+
+    // 10. Draw legend
+    chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
+        .position(SeriesLabelPosition::UpperLeft)
+        .draw()?;
+
+    root.present()?;
+
+    // 11. Print path and open
+    println!("Swiss graph saved to: {}", temp_path.display());
+
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(&temp_path).spawn();
+
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("xdg-open").arg(&temp_path).spawn();
+
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("cmd")
+        .args(["/C", "start", ""])
+        .arg(&temp_path)
+        .spawn();
+
+    Ok(())
+}
+
 /// Build tournament results for JSON export
 fn build_results(
     contestants: &[Contestant],
+    ratings: &[WengLinRating],
     pods: &[(usize, MatchupGames)], // (round, result)
     num_rounds: usize,
     use_swiss: bool,
     args: &TournamentArgs,
     env_name: &str,
 ) -> TournamentResults {
-    // Sort by Swiss points (descending), rating as tiebreaker
+    // Sort by Swiss points (descending), initial_seed as tiebreaker
     let mut ranked: Vec<(usize, &Contestant)> = contestants.iter().enumerate().collect();
     ranked.sort_by(|a, b| {
         b.1.swiss_points
             .partial_cmp(&a.1.swiss_points)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                b.1.rating
-                    .rating
-                    .partial_cmp(&a.1.rating.rating)
+                b.1.initial_seed
+                    .partial_cmp(&a.1.initial_seed)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     });
@@ -1467,8 +1677,9 @@ fn build_results(
     let rankings: Vec<RankingEntry> = ranked
         .iter()
         .enumerate()
-        .map(|(rank, (_, c))| {
-            let sigma = c.rating.uncertainty;
+        .map(|(rank, (idx, c))| {
+            let r = &ratings[*idx];
+            let sigma = r.uncertainty;
             let source = match &c.source {
                 PlayerSource::Checkpoint(p) => Some(p.display().to_string()),
                 _ => None,
@@ -1478,10 +1689,10 @@ fn build_results(
                 name: c.name.clone(),
                 source,
                 swiss_points: c.swiss_points,
-                rating: c.rating.rating,
+                rating: r.rating,
                 uncertainty: sigma,
-                rating_low: c.rating.rating - 2.0 * sigma,
-                rating_high: c.rating.rating + 2.0 * sigma,
+                rating_low: r.rating - 2.0 * sigma,
+                rating_high: r.rating + 2.0 * sigma,
                 placement_counts: c.placement_counts.clone(),
                 draw_count: c.draw_count,
                 games_played: c.games_played,
@@ -1804,6 +2015,9 @@ fn run_tournament_env<B: Backend, E: Environment>(
     // Track all pod results for JSON output
     let mut all_pods: Vec<(usize, MatchupGames)> = Vec::new();
 
+    // Collect all game results for batch rating update at the end
+    let mut all_game_results: Vec<SingleGameResult> = Vec::new();
+
     // Progress bar setup
     let multi_progress = MultiProgress::new();
 
@@ -1825,14 +2039,14 @@ fn run_tournament_env<B: Backend, E: Environment>(
             let mut bye_recipients: Vec<usize> = Vec::new();
 
             if num_byes > 0 {
-                // Find lowest-ranked players (by Swiss points, then rating) who haven't had a bye
+                // Find lowest-ranked players (by Swiss points, then initial_seed) who haven't had a bye
                 let mut bye_candidates: Vec<(usize, f64, f64)> = contestants
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| !c.has_bye)
-                    .map(|(i, c)| (i, c.swiss_points, c.rating.rating))
+                    .map(|(i, c)| (i, c.swiss_points, c.initial_seed))
                     .collect();
-                // Sort ascending by points, then ascending by rating (lowest gets bye)
+                // Sort ascending by points, then ascending by initial_seed (lowest gets bye)
                 bye_candidates.sort_by(|a, b| {
                     a.1.partial_cmp(&b.1)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -1904,7 +2118,15 @@ fn run_tournament_env<B: Backend, E: Environment>(
                     println!("  {}", result.summary(&names));
                 });
 
-                update_ratings_from_games(contestants, &result, &wl_config);
+                // Collect games for batch rating update at end
+                for game in &result.games {
+                    all_game_results.push(SingleGameResult {
+                        contestants: result.contestants.clone(),
+                        placements: game.placements.clone(),
+                    });
+                }
+
+                update_stats_from_games(contestants, &result);
                 all_pods.push((round, result));
                 matchup_pb.inc(1);
             }
@@ -1912,7 +2134,11 @@ fn run_tournament_env<B: Backend, E: Environment>(
             matchup_pb.finish_and_clear();
             rounds_pb.inc(1);
             multi_progress.suspend(|| {
-                print_standings(contestants, &format!("Standings after round {round}:"));
+                print_standings(
+                    contestants,
+                    &format!("Standings after round {round}:"),
+                    None,
+                );
             });
         }
         rounds_pb.finish_and_clear();
@@ -1951,7 +2177,15 @@ fn run_tournament_env<B: Backend, E: Environment>(
                 println!("  {}", result.summary(&names));
             });
 
-            update_ratings_from_games(contestants, &result, &wl_config);
+            // Collect games for batch rating update at end
+            for game in &result.games {
+                all_game_results.push(SingleGameResult {
+                    contestants: result.contestants.clone(),
+                    placements: game.placements.clone(),
+                });
+            }
+
+            update_stats_from_games(contestants, &result);
             all_pods.push((1, result)); // Round 1 for all round-robin games
             pb.inc(1);
         }
@@ -1959,14 +2193,20 @@ fn run_tournament_env<B: Backend, E: Environment>(
         pb.finish_and_clear();
     }
 
+    // Compute final ratings from all games with shuffled order for unbiased sampling
+    let ratings = compute_ratings(contestants.len(), &all_game_results, &wl_config, &mut rng);
+
     // Final summary
     print_rating_guide();
-    print_final_summary(contestants, num_rounds, args.num_games);
+    print_final_summary(contestants, &ratings, num_rounds, args.num_games);
 
     // Graph output if requested
     if args.graph {
-        if let Err(e) = generate_rating_graph(contestants) {
-            eprintln!("Failed to generate graph: {e}");
+        if let Err(e) = generate_rating_graph(contestants, &ratings) {
+            eprintln!("Failed to generate rating graph: {e}");
+        }
+        if let Err(e) = generate_swiss_points_graph(contestants) {
+            eprintln!("Failed to generate swiss points graph: {e}");
         }
     }
 
@@ -1974,6 +2214,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
     if let Some(output_path) = &args.output {
         let results = build_results(
             contestants,
+            &ratings,
             &all_pods,
             num_rounds,
             use_swiss,
@@ -1993,6 +2234,30 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Test helper: updates stats and computes ratings for a single matchup.
+    /// Returns the computed ratings.
+    fn update_stats_and_ratings(
+        contestants: &mut [Contestant],
+        matchup: &MatchupGames,
+        config: &WengLinConfig,
+    ) -> Vec<WengLinRating> {
+        // Update stats
+        update_stats_from_games(contestants, matchup);
+
+        // Convert matchup to SingleGameResult and compute ratings
+        let games: Vec<SingleGameResult> = matchup
+            .games
+            .iter()
+            .map(|g| SingleGameResult {
+                contestants: matchup.contestants.clone(),
+                placements: g.placements.clone(),
+            })
+            .collect();
+
+        let mut rng = StdRng::seed_from_u64(42);
+        compute_ratings(contestants.len(), &games, config, &mut rng)
+    }
+
     #[test]
     fn test_contestant_new() {
         let contestant = Contestant::new("TestPlayer".to_string(), PlayerSource::Random, 0.0);
@@ -2002,8 +2267,7 @@ mod tests {
         assert_eq!(contestant.wins(), 0);
         assert_eq!(contestant.losses(), 0);
         assert_eq!(contestant.draws(), 0);
-        // Default WengLin rating should be 25.0
-        assert!((contestant.rating.rating - 25.0).abs() < 0.1);
+        // Ratings are computed at tournament end, not stored on Contestant
     }
 
     #[test]
@@ -2243,8 +2507,7 @@ mod tests {
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
 
-        let initial_rating_a = contestants[0].rating.rating;
-        let initial_rating_b = contestants[1].rating.rating;
+        let initial_rating = 25.0; // Default WengLin rating
 
         // Player A wins (1st place), Player B loses (2nd place)
         let matchup = MatchupGames {
@@ -2254,12 +2517,12 @@ mod tests {
             }],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        let ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         // Winner's rating should increase
-        assert!(contestants[0].rating.rating > initial_rating_a);
+        assert!(ratings[0].rating > initial_rating);
         // Loser's rating should decrease
-        assert!(contestants[1].rating.rating < initial_rating_b);
+        assert!(ratings[1].rating < initial_rating);
         // Stats updated
         assert_eq!(contestants[0].wins(), 1);
         assert_eq!(contestants[0].losses(), 0);
@@ -2283,7 +2546,7 @@ mod tests {
             }],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        let _ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         assert_eq!(contestants[0].losses(), 1);
         assert_eq!(contestants[1].wins(), 1);
@@ -2297,8 +2560,7 @@ mod tests {
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
 
-        let initial_rating_a = contestants[0].rating.rating;
-        let initial_rating_b = contestants[1].rating.rating;
+        let initial_rating = 25.0; // Default WengLin rating
 
         // Draw: both players get same placement
         let matchup = MatchupGames {
@@ -2308,11 +2570,11 @@ mod tests {
             }],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        let ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         // Ratings should stay approximately the same for equal-rated players
-        assert!((contestants[0].rating.rating - initial_rating_a).abs() < 1.0);
-        assert!((contestants[1].rating.rating - initial_rating_b).abs() < 1.0);
+        assert!((ratings[0].rating - initial_rating).abs() < 1.0);
+        assert!((ratings[1].rating - initial_rating).abs() < 1.0);
         assert_eq!(contestants[0].draws(), 1);
         assert_eq!(contestants[1].draws(), 1);
     }
@@ -2332,7 +2594,7 @@ mod tests {
             }],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        let _ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         assert!(contestants[0].opponents_faced.contains(&1));
         assert!(contestants[1].opponents_faced.contains(&0));
@@ -2368,10 +2630,10 @@ mod tests {
             ],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        let ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         // A won more, should have higher rating
-        assert!(contestants[0].rating.rating > contestants[1].rating.rating);
+        assert!(ratings[0].rating > ratings[1].rating);
         assert_eq!(contestants[0].wins(), 3);
         assert_eq!(contestants[0].losses(), 1);
         assert_eq!(contestants[0].draws(), 1);
@@ -2593,19 +2855,14 @@ mod tests {
     }
 
     #[test]
-    fn test_swiss_pods_with_different_ratings() {
-        let mut contestants = vec![
-            Contestant::new("High".to_string(), PlayerSource::Random, 0.0),
-            Contestant::new("Low".to_string(), PlayerSource::Random, 0.0),
-            Contestant::new("Medium".to_string(), PlayerSource::Random, 0.0),
-            Contestant::new("MidHigh".to_string(), PlayerSource::Random, 0.0),
+    fn test_swiss_pods_with_different_seeds() {
+        // Use initial_seed to vary contestant strength
+        let contestants = vec![
+            Contestant::new("High".to_string(), PlayerSource::Random, 30.0),
+            Contestant::new("Low".to_string(), PlayerSource::Random, 15.0),
+            Contestant::new("Medium".to_string(), PlayerSource::Random, 25.0),
+            Contestant::new("MidHigh".to_string(), PlayerSource::Random, 28.0),
         ];
-
-        // Modify ratings
-        contestants[0].rating.rating = 30.0;
-        contestants[1].rating.rating = 15.0;
-        contestants[2].rating.rating = 25.0;
-        contestants[3].rating.rating = 28.0;
 
         let pods = swiss_pods(&contestants, 2);
         // With 4 contestants, should get 2 pods
@@ -2657,12 +2914,22 @@ mod tests {
             Contestant::new("Loser".to_string(), PlayerSource::Random, 0.0),
         ];
 
-        contestants[0].rating.rating = 28.0;
         contestants[0].placement_counts = vec![3, 0]; // 3 wins (1st place), 0 losses (2nd place)
         contestants[0].games_played = 3;
-        contestants[1].rating.rating = 22.0;
         contestants[1].placement_counts = vec![0, 3]; // 0 wins, 3 losses
         contestants[1].games_played = 3;
+
+        // Create mock ratings for the test
+        let ratings = vec![
+            WengLinRating {
+                rating: 28.0,
+                uncertainty: 8.0,
+            },
+            WengLinRating {
+                rating: 22.0,
+                uncertainty: 8.0,
+            },
+        ];
 
         // Create MatchupGames with 3 games where Winner (idx 0) wins all
         let matchup_games = MatchupGames {
@@ -2699,7 +2966,15 @@ mod tests {
             round_robin: false,
         };
 
-        let results = build_results(&contestants, &pods, 1, false, &args, "connect_four");
+        let results = build_results(
+            &contestants,
+            &ratings,
+            &pods,
+            1,
+            false,
+            &args,
+            "connect_four",
+        );
 
         assert_eq!(results.rankings.len(), 2);
         assert_eq!(results.rankings[0].name, "Winner"); // Higher rating is first
@@ -2720,6 +2995,8 @@ mod tests {
             .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random, f64::from(i)))
             .collect();
 
+        let ratings: Vec<WengLinRating> = (0..4).map(|_| WengLinRating::new()).collect();
+
         let args = TournamentArgs {
             sources: vec![],
             backend: None,
@@ -2738,7 +3015,7 @@ mod tests {
             round_robin: false,
         };
 
-        let results = build_results(&contestants, &[], 1, false, &args, "cartpole");
+        let results = build_results(&contestants, &ratings, &[], 1, false, &args, "cartpole");
 
         // round-robin format
         assert_eq!(results.config.format, "round-robin");
@@ -2752,6 +3029,8 @@ mod tests {
         let contestants: Vec<Contestant> = (0..10)
             .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random, f64::from(i)))
             .collect();
+
+        let ratings: Vec<WengLinRating> = (0..10).map(|_| WengLinRating::new()).collect();
 
         let args = TournamentArgs {
             sources: vec![],
@@ -2771,7 +3050,7 @@ mod tests {
             round_robin: false,
         };
 
-        let results = build_results(&contestants, &[], 3, true, &args, "connect_four");
+        let results = build_results(&contestants, &ratings, &[], 3, true, &args, "connect_four");
 
         assert_eq!(results.config.format, "swiss");
     }
@@ -3221,6 +3500,8 @@ mod tests {
         contestants[0].draw_count = 1;
         contestants[0].games_played = 8;
 
+        let ratings = vec![WengLinRating::new()];
+
         let args = TournamentArgs {
             sources: vec![],
             backend: None,
@@ -3239,7 +3520,7 @@ mod tests {
             round_robin: false,
         };
 
-        let results = build_results(&contestants, &[], 1, false, &args, "test_env");
+        let results = build_results(&contestants, &ratings, &[], 1, false, &args, "test_env");
 
         assert_eq!(results.rankings.len(), 1);
         assert_eq!(
@@ -3271,7 +3552,7 @@ mod tests {
         ];
 
         // Just verify it doesn't panic
-        print_standings(&contestants, "Test Header");
+        print_standings(&contestants, "Test Header", None);
     }
 
     #[test]
@@ -3280,9 +3561,10 @@ mod tests {
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
+        let ratings: Vec<WengLinRating> = (0..2).map(|_| WengLinRating::new()).collect();
 
         // Just verify it doesn't panic
-        print_final_summary(&contestants, 3, 10);
+        print_final_summary(&contestants, &ratings, 3, 10);
     }
 
     #[test]
@@ -3293,6 +3575,8 @@ mod tests {
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
+
+        let ratings: Vec<WengLinRating> = (0..2).map(|_| WengLinRating::new()).collect();
 
         let pods = vec![
             (
@@ -3352,7 +3636,7 @@ mod tests {
             round_robin: false,
         };
 
-        let results = build_results(&contestants, &pods, 2, true, &args, "test");
+        let results = build_results(&contestants, &ratings, &pods, 2, true, &args, "test");
 
         assert_eq!(results.pods.len(), 2);
         assert_eq!(results.pods[0].round, 1);
@@ -3550,7 +3834,7 @@ mod tests {
             }],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         // Winner gets 1 point, loser gets 0
         assert!((contestants[0].swiss_points - 1.0).abs() < 0.001);
@@ -3585,7 +3869,7 @@ mod tests {
             ],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         // With match-level scoring:
         // A has more raw points (2.5 vs 1.5) → 1st place → 1.0 Swiss points
@@ -3847,7 +4131,7 @@ mod tests {
             ],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         // Both have equal raw points (2 each), so they tie for 1st place
         // With fractional ranking: both get 0.5 Swiss points (share positions 1&2)
@@ -3884,7 +4168,7 @@ mod tests {
             ],
         };
 
-        update_ratings_from_games(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
 
         // A should be 1st, D should be last
         // A: 4*3 = 12 raw points → 1st → 3.0 Swiss points

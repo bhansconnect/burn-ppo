@@ -348,7 +348,10 @@ pub struct EvalArgs {
 
 /// Arguments for tournament mode
 #[derive(Parser, Debug)]
-#[expect(clippy::struct_excessive_bools, reason = "CLI flags are naturally bools")]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI flags are naturally bools"
+)]
 pub struct TournamentArgs {
     /// Checkpoint paths or run directories to include
     /// For run directories, all checkpoints are discovered automatically
