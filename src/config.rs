@@ -70,21 +70,23 @@ pub struct TrainArgs {
     #[arg(long, conflicts_with = "resume")]
     pub fork: Option<PathBuf>,
 
-    /// Compute backend (defaults to ndarray; small networks often don't benefit from GPU due to data transfer overhead, though performance varies)
-    #[arg(long)]
+    #[arg(long, help = "Compute backend (default: ndarray)")]
     pub backend: Option<String>,
 
     // --- Overrides ---
-    #[arg(long)]
+    #[arg(long, help = "Environment name (default: from config file)")]
     pub env: Option<String>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Number of parallel environments (default: auto/CPU cores)"
+    )]
     pub num_envs: Option<usize>,
 
-    #[arg(long)]
+    #[arg(long, help = "Learning rate (default: 0.00025)")]
     pub learning_rate: Option<f64>,
 
-    #[arg(long)]
+    #[arg(long, help = "Total training timesteps (default: 1000000)")]
     pub total_timesteps: Option<usize>,
 
     /// Maximum training time with unit suffix (e.g., "30s", "5m", "2h")
@@ -92,181 +94,176 @@ pub struct TrainArgs {
     #[arg(long)]
     pub max_training_time: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Random seed (default: 42)")]
     pub seed: Option<u64>,
 
     #[arg(long)]
     pub run_name: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, help = "Activation function (default: tanh)")]
     pub activation: Option<String>,
 
     // --- Network ---
     /// Use separate actor and critic networks instead of shared backbone
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help = "Use separate actor/critic networks (default: false)")]
     pub split_networks: Option<bool>,
 
-    #[arg(long)]
+    #[arg(long, help = "Hidden layer size (default: 64)")]
     pub hidden_size: Option<usize>,
 
-    #[arg(long)]
+    #[arg(long, help = "Number of hidden layers (default: 2)")]
     pub num_hidden: Option<usize>,
 
     // --- PPO Hyperparameters ---
-    #[arg(long)]
+    #[arg(long, help = "Steps per rollout (default: 128)")]
     pub num_steps: Option<usize>,
 
     /// Enable/disable learning rate annealing (use --lr-anneal=false to disable)
-    #[arg(long)]
+    #[arg(long, help = "Enable learning rate annealing (default: true)")]
     pub lr_anneal: Option<bool>,
 
-    /// Final learning rate when annealing (default: 0)
-    #[arg(long)]
+    #[arg(long, help = "Final learning rate when annealing (default: 0)")]
     pub lr_final: Option<f64>,
 
-    #[arg(long)]
+    #[arg(long, help = "Discount factor (default: 0.99)")]
     pub gamma: Option<f64>,
 
-    #[arg(long)]
+    #[arg(long, help = "GAE lambda (default: 0.95)")]
     pub gae_lambda: Option<f64>,
 
-    #[arg(long)]
+    #[arg(long, help = "PPO clipping epsilon (default: 0.2)")]
     pub clip_epsilon: Option<f64>,
 
-    /// Enable/disable value clipping (use --clip-value=false to disable)
-    #[arg(long)]
+    #[arg(long, help = "Enable value clipping (default: false)")]
     pub clip_value: Option<bool>,
 
-    #[arg(long)]
+    #[arg(long, help = "Entropy coefficient (default: 0.01)")]
     pub entropy_coef: Option<f64>,
 
-    /// Enable entropy coefficient annealing
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help = "Enable entropy coefficient annealing (default: false)")]
     pub entropy_anneal: Option<bool>,
 
-    /// Final entropy coefficient when annealing (defaults to 10% of initial)
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Final entropy coefficient when annealing (default: 10% of initial)"
+    )]
     pub entropy_coef_final: Option<f64>,
 
-    /// Enable adaptive entropy coefficient control (targets specific entropy levels)
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help = "Enable adaptive entropy control (default: false)")]
     pub adaptive_entropy: Option<bool>,
 
-    /// Start target as ratio of max entropy (0-1) for adaptive entropy
-    #[arg(long)]
+    #[arg(long, help = "Start target as ratio of max entropy (default: 0.7)")]
     pub adaptive_entropy_start: Option<f64>,
 
-    /// Final target as ratio of max entropy (0-1) for adaptive entropy
-    #[arg(long)]
+    #[arg(long, help = "Final target as ratio of max entropy (default: 0.2)")]
     pub adaptive_entropy_final: Option<f64>,
 
-    /// Warmup fraction before decay starts for adaptive entropy (0-1)
-    #[arg(long)]
+    #[arg(long, help = "Warmup fraction before decay starts (default: 0.1)")]
     pub adaptive_entropy_warmup: Option<f64>,
 
-    /// Minimum entropy coefficient for adaptive entropy
-    #[arg(long)]
+    #[arg(long, help = "Minimum entropy coefficient (default: 0.001)")]
     pub adaptive_entropy_min_coef: Option<f64>,
 
-    /// Maximum entropy coefficient for adaptive entropy
-    #[arg(long)]
+    #[arg(long, help = "Maximum entropy coefficient (default: 0.05)")]
     pub adaptive_entropy_max_coef: Option<f64>,
 
-    /// Adjustment step size for adaptive entropy
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Adjustment step size for adaptive entropy (default: 0.001)"
+    )]
     pub adaptive_entropy_delta: Option<f64>,
 
-    #[arg(long)]
+    #[arg(long, help = "Value loss coefficient (default: 0.5)")]
     pub value_coef: Option<f64>,
 
-    #[arg(long)]
+    #[arg(long, help = "Max gradient norm for clipping (default: 0.5)")]
     pub max_grad_norm: Option<f64>,
 
-    /// KL divergence threshold for early stopping
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "KL divergence threshold for early stopping (default: disabled)"
+    )]
     pub target_kl: Option<f64>,
 
-    /// Enable observation normalization
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help = "Enable observation normalization (default: false)")]
     pub normalize_obs: Option<bool>,
 
     // --- Training ---
-    #[arg(long)]
+    #[arg(long, help = "PPO epochs per update (default: 4)")]
     pub num_epochs: Option<usize>,
 
-    #[arg(long)]
+    #[arg(long, help = "Number of minibatches per epoch (default: 4)")]
     pub num_minibatches: Option<usize>,
 
-    #[arg(long)]
+    #[arg(long, help = "Adam optimizer epsilon (default: 0.00001)")]
     pub adam_epsilon: Option<f64>,
 
     // --- Checkpointing/Logging ---
-    #[arg(long)]
+    #[arg(long, help = "Directory for run outputs (default: runs)")]
     pub run_dir: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, help = "Checkpoint save frequency in steps (default: 10000)")]
     pub checkpoint_freq: Option<usize>,
 
-    #[arg(long)]
+    #[arg(long, help = "Logging frequency in steps (default: 1000)")]
     pub log_freq: Option<usize>,
 
     // --- Opponent Pool Training ---
-    /// Enable opponent pool training for multiplayer games
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help = "Enable opponent pool training (default: true)")]
     pub opponent_pool_enabled: Option<bool>,
 
-    /// Fraction of environments for opponent games (0.0-1.0)
-    #[arg(long)]
+    #[arg(long, help = "Fraction of envs for opponent games (default: 0.25)")]
     pub opponent_pool_fraction: Option<f32>,
 
-    /// Steps between opponent rotation
-    #[arg(long)]
+    #[arg(long, help = "Steps between opponent rotation (default: 2000)")]
     pub opponent_pool_rotation_steps: Option<usize>,
 
-    /// Softmax temperature for opponent sampling
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Softmax temperature for opponent sampling (default: 1.0)"
+    )]
     pub opponent_pool_sample_temperature: Option<f32>,
 
-    /// Use uniform random sampling instead of rating-weighted sampling
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help = "Use uniform random sampling (default: false)")]
     pub opponent_pool_uniform_sampling: Option<bool>,
 
-    /// Enable periodic pool evaluation
-    #[arg(long, action = clap::ArgAction::Set)]
+    #[arg(long, action = clap::ArgAction::Set, help = "Enable periodic pool evaluation (default: true)")]
     pub opponent_pool_eval_enabled: Option<bool>,
 
-    /// Steps between pool evaluations
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Steps between pool evaluations (default: checkpoint_freq)"
+    )]
     pub opponent_pool_eval_interval: Option<usize>,
 
-    /// Number of games per pool evaluation
-    #[arg(long)]
+    #[arg(long, help = "Games per pool evaluation (default: 128)")]
     pub opponent_pool_eval_games: Option<usize>,
 
-    /// Number of opponents to sample for evaluation
-    #[arg(long)]
+    #[arg(long, help = "Opponents to sample for evaluation (default: 10)")]
     pub opponent_pool_eval_opponents: Option<usize>,
 
-    /// Initial softmax temperature for pool evaluation (uses environment default if not specified)
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Initial softmax temp for pool eval (default: env default)"
+    )]
     pub pool_eval_temp: Option<f32>,
 
-    /// Final temperature after cutoff moves for pool evaluation (default 0.0)
-    #[arg(long)]
+    #[arg(long, help = "Final temp after cutoff for pool eval (default: 0.0)")]
     pub pool_eval_temp_final: Option<f32>,
 
-    /// Move number to switch temperature for pool evaluation
-    #[arg(long)]
+    #[arg(long, help = "Move number to switch temperature (default: disabled)")]
     pub pool_eval_temp_cutoff: Option<usize>,
 
-    /// Gradually decay pool eval temperature over cutoff moves
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Gradually decay pool eval temp over cutoff (default: false)"
+    )]
     pub pool_eval_temp_decay: bool,
 
-    /// Win rate threshold for updating "best" checkpoint from pool eval.
-    /// 0.5 = match best, 0.55 = 55% win rate (recommended), 1.0 = always win.
-    /// Valid range: 0.5 to 1.0. None = use training rating for multiplayer.
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Win rate threshold for best checkpoint (default: use rating)"
+    )]
     pub pool_eval_best_margin: Option<f32>,
 }
 
@@ -281,8 +278,7 @@ pub struct EvalArgs {
     #[arg(long = "checkpoint", short = 'c')]
     pub checkpoints: Vec<PathBuf>,
 
-    /// Compute backend (defaults to ndarray; small networks often don't benefit from GPU due to data transfer overhead, though performance varies)
-    #[arg(long)]
+    #[arg(long, help = "Compute backend (default: ndarray)")]
     pub backend: Option<String>,
 
     /// Human players (specify name for each human player)
@@ -290,8 +286,10 @@ pub struct EvalArgs {
     #[arg(long = "human")]
     pub humans: Vec<String>,
 
-    /// Add a random player (useful for baseline comparisons)
-    #[arg(long = "random")]
+    #[arg(
+        long = "random",
+        help = "Add a random player as baseline (default: false)"
+    )]
     pub random: bool,
 
     /// Environment name (required if no checkpoint provided)
@@ -306,44 +304,38 @@ pub struct EvalArgs {
     #[arg(long, default_value = "64")]
     pub num_envs: usize,
 
-    /// Show per-step output (watch mode)
-    #[arg(long)]
+    #[arg(long, help = "Show per-step output, watch mode (default: false)")]
     pub watch: bool,
 
-    /// Step mode: press Enter to advance each move (implies --watch)
-    #[arg(long)]
+    #[arg(long, help = "Step mode: press Enter to advance (default: false)")]
     pub step: bool,
 
-    /// Enable smooth animation (in-place frame updates)
-    #[arg(long)]
+    #[arg(long, help = "Enable smooth animation (default: false)")]
     pub animate: bool,
 
-    /// Frames per second for animation (default: 10)
+    /// Frames per second for animation
     #[arg(long, default_value = "10")]
     pub fps: u32,
 
-    /// Random seed for reproducibility
-    #[arg(long)]
+    #[arg(long, help = "Random seed for reproducibility (default: random)")]
     pub seed: Option<u64>,
 
-    /// Initial softmax temperature (uses environment default if not specified)
-    #[arg(long)]
+    #[arg(long, help = "Initial softmax temperature (default: env default)")]
     pub temp: Option<f32>,
 
-    /// Temperature after cutoff (requires --temp-cutoff)
-    #[arg(long)]
+    #[arg(long, help = "Temperature after cutoff (default: 0.0)")]
     pub temp_final: Option<f32>,
 
-    /// Move number to switch from initial to final temperature
-    #[arg(long)]
+    #[arg(long, help = "Move number to switch temperature (default: disabled)")]
     pub temp_cutoff: Option<usize>,
 
-    /// Disable temperature cutoff (overrides environment default)
-    #[arg(long)]
+    #[arg(long, help = "Disable temperature cutoff (default: false)")]
     pub no_temp_cutoff: bool,
 
-    /// Gradually decay temperature over cutoff moves (requires --temp-cutoff)
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Gradually decay temperature over cutoff (default: false)"
+    )]
     pub temp_decay: bool,
 }
 
@@ -355,8 +347,7 @@ pub struct TournamentArgs {
     #[arg(required = true)]
     pub sources: Vec<PathBuf>,
 
-    /// Compute backend (defaults to ndarray; small networks often don't benefit from GPU due to data transfer overhead, though performance varies)
-    #[arg(long)]
+    #[arg(long, help = "Compute backend (default: ndarray)")]
     pub backend: Option<String>,
 
     /// Number of games per matchup between contestants
@@ -367,46 +358,37 @@ pub struct TournamentArgs {
     #[arg(long, default_value = "64")]
     pub num_envs: usize,
 
-    /// Number of Swiss rounds (default: auto = ceil(log2(n)) + 1)
-    /// Ignored for round-robin (N <= 8 contestants)
-    #[arg(long)]
+    #[arg(long, help = "Swiss rounds (default: auto = ceil(log2(n)) + 1)")]
     pub rounds: Option<usize>,
 
-    /// Maximum checkpoints to select from each run directory
-    /// Selects evenly spaced checkpoints including first and last
-    #[arg(long)]
+    #[arg(long, help = "Max checkpoints per run directory (default: unlimited)")]
     pub limit_per_run: Option<usize>,
 
-    /// Include a random agent as baseline
-    #[arg(long)]
+    #[arg(long, help = "Include a random agent as baseline (default: false)")]
     pub random: bool,
 
-    /// Initial softmax temperature (uses environment default if not specified)
-    #[arg(long)]
+    #[arg(long, help = "Initial softmax temperature (default: env default)")]
     pub temp: Option<f32>,
 
-    /// Temperature after cutoff (requires --temp-cutoff)
-    #[arg(long)]
+    #[arg(long, help = "Temperature after cutoff (default: 0.0)")]
     pub temp_final: Option<f32>,
 
-    /// Move number to switch from initial to final temperature
-    #[arg(long)]
+    #[arg(long, help = "Move number to switch temperature (default: disabled)")]
     pub temp_cutoff: Option<usize>,
 
-    /// Disable temperature cutoff (overrides environment default)
-    #[arg(long)]
+    #[arg(long, help = "Disable temperature cutoff (default: false)")]
     pub no_temp_cutoff: bool,
 
-    /// Random seed for reproducibility
-    #[arg(long)]
+    #[arg(long, help = "Random seed for reproducibility (default: random)")]
     pub seed: Option<u64>,
 
-    /// Save results to JSON file
-    #[arg(short = 'o', long)]
+    #[arg(short = 'o', long, help = "Save results to JSON file (default: none)")]
     pub output: Option<PathBuf>,
 
-    /// Generate and display a graph of ratings over training steps
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Generate rating graph over training steps (default: false)"
+    )]
     pub graph: bool,
 }
 
