@@ -1482,7 +1482,8 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         }
     }
 
-    // Compute explained variance from full buffer
+    // Compute explained variance from buffer, filtering by valid_mask if present
+    // (opponent pool training includes opponent turns that shouldn't be in the metric)
     let values_data: Vec<f32> = buffer
         .values
         .clone()
@@ -1498,7 +1499,19 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
         .to_vec()
         .expect("returns to vec");
 
-    let explained_variance = compute_explained_variance(&values_data, &returns_data);
+    let explained_variance = if let Some(ref mask) = buffer.valid_mask {
+        // Filter to only learner turns (valid_mask > 0.5)
+        let mask_data: Vec<f32> = mask.clone().into_data().to_vec().expect("mask to vec");
+        let (filtered_values, filtered_returns): (Vec<f32>, Vec<f32>) = mask_data
+            .iter()
+            .zip(values_data.iter().zip(returns_data.iter()))
+            .filter(|(&m, _)| m > 0.5)
+            .map(|(_, (&v, &r))| (v, r))
+            .unzip();
+        compute_explained_variance(&filtered_values, &filtered_returns)
+    } else {
+        compute_explained_variance(&values_data, &returns_data)
+    };
 
     // Average metrics
     let metrics = UpdateMetrics {
