@@ -164,6 +164,7 @@ fn run_training<TB, E, F>(
 ) -> Result<()>
 where
     TB: burn::tensor::backend::AutodiffBackend,
+    TB::FloatElem: Into<f32>,
     E: Environment,
     F: Fn(usize) -> E,
 {

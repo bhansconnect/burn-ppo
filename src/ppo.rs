@@ -1186,7 +1186,10 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     learning_rate: f64,
     entropy_coef: f64,
     rng: &mut impl Rng,
-) -> (ActorCritic<B>, UpdateMetrics) {
+) -> (ActorCritic<B>, UpdateMetrics)
+where
+    B::FloatElem: Into<f32>,
+{
     profile_function!();
     let device = model.devices()[0].clone();
     let num_players = buffer.num_players() as usize;
@@ -1349,30 +1352,15 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             // Capture raw advantage stats as f32 scalars immediately (no autodiff overhead)
             // Using .inner() avoids creating detached autodiff nodes that could leak
             let mb_advantages_raw_inner = mb_advantages_raw.clone().inner();
-            let adv_mean_raw: f32 = mb_advantages_raw_inner
-                .clone()
-                .mean()
-                .into_data()
-                .as_slice::<f32>()
-                .expect("adv_mean to f32")[0];
+            let adv_mean_raw: f32 = mb_advantages_raw_inner.clone().mean().into_scalar().into();
             let adv_std_raw: f32 = mb_advantages_raw_inner
                 .clone()
                 .var(0)
                 .sqrt()
-                .into_data()
-                .as_slice::<f32>()
-                .expect("adv_std to f32")[0];
-            let adv_min_raw: f32 = mb_advantages_raw_inner
-                .clone()
-                .min()
-                .into_data()
-                .as_slice::<f32>()
-                .expect("adv_min to f32")[0];
-            let adv_max_raw: f32 = mb_advantages_raw_inner
-                .max()
-                .into_data()
-                .as_slice::<f32>()
-                .expect("adv_max to f32")[0];
+                .into_scalar()
+                .into();
+            let adv_min_raw: f32 = mb_advantages_raw_inner.clone().min().into_scalar().into();
+            let adv_max_raw: f32 = mb_advantages_raw_inner.max().into_scalar().into();
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
@@ -1464,40 +1452,18 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 // Value prediction error: |V(s) - actual_return|
                 // Extract as f32 scalars via .inner() to avoid autodiff overhead
                 let value_errors_inner = (values.clone() - mb_returns.clone()).abs().inner();
-                let value_error_mean: f32 = value_errors_inner
-                    .clone()
-                    .mean()
-                    .into_data()
-                    .as_slice::<f32>()
-                    .expect("value_error_mean to f32")[0];
+                let value_error_mean: f32 = value_errors_inner.clone().mean().into_scalar().into();
                 let value_error_std: f32 = value_errors_inner
                     .clone()
                     .var(0)
                     .sqrt()
-                    .into_data()
-                    .as_slice::<f32>()
-                    .expect("value_error_std to f32")[0];
-                let value_error_max: f32 = value_errors_inner
-                    .max()
-                    .into_data()
-                    .as_slice::<f32>()
-                    .expect("value_error_max to f32")[0];
+                    .into_scalar()
+                    .into();
+                let value_error_max: f32 = value_errors_inner.max().into_scalar().into();
 
                 // Capture values for metrics as f32 scalars (no autodiff overhead)
-                let values_mean: f32 = values
-                    .clone()
-                    .inner()
-                    .mean()
-                    .into_data()
-                    .as_slice::<f32>()
-                    .expect("values_mean to f32")[0];
-                let returns_mean: f32 = mb_returns
-                    .clone()
-                    .inner()
-                    .mean()
-                    .into_data()
-                    .as_slice::<f32>()
-                    .expect("returns_mean to f32")[0];
+                let values_mean: f32 = values.clone().inner().mean().into_scalar().into();
+                let returns_mean: f32 = mb_returns.clone().inner().mean().into_scalar().into();
 
                 // Backward pass
                 let grads = loss.backward();
@@ -1505,40 +1471,21 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                 // Extract ALL metrics as scalars immediately (frees autodiff graph)
                 // Using .inner().into_data() avoids creating intermediate tensors
                 let metrics = MinibatchMetrics {
-                    policy_loss: (-policy_loss_mean)
-                        .inner()
-                        .into_data()
-                        .as_slice::<f32>()
-                        .expect("policy_loss to f32")[0],
-                    value_loss: value_loss
-                        .inner()
-                        .into_data()
-                        .as_slice::<f32>()
-                        .expect("value_loss to f32")[0],
-                    entropy: entropy
-                        .inner()
-                        .mean()
-                        .into_data()
-                        .as_slice::<f32>()
-                        .expect("entropy to f32")[0],
+                    policy_loss: (-policy_loss_mean).inner().into_scalar().into(),
+                    value_loss: value_loss.inner().into_scalar().into(),
+                    entropy: entropy.inner().mean().into_scalar().into(),
                     approx_kl: ((ratio_inner.clone() - 1.0) - log_ratio_inner)
                         .mean()
-                        .into_data()
-                        .as_slice::<f32>()
-                        .expect("approx_kl to f32")[0],
+                        .into_scalar()
+                        .into(),
                     clip_fraction: (ratio_inner - 1.0)
                         .abs()
                         .greater_elem(config.clip_epsilon)
                         .float()
                         .mean()
-                        .into_data()
-                        .as_slice::<f32>()
-                        .expect("clip_fraction to f32")[0],
-                    total_loss: loss
-                        .inner()
-                        .into_data()
-                        .as_slice::<f32>()
-                        .expect("total_loss to f32")[0],
+                        .into_scalar()
+                        .into(),
+                    total_loss: loss.inner().into_scalar().into(),
                     // These are already f32 scalars extracted earlier
                     value_mean: values_mean,
                     returns_mean,
@@ -1598,11 +1545,6 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             mb_start = mb_end;
         }
     }
-
-    // Force backend synchronization and memory cleanup after all epochs complete
-    // This ensures all autodiff graphs are fully released and memory returned to OS
-    B::sync(&device);
-    B::memory_cleanup(&device);
 
     // Compute explained variance from buffer, filtering by valid_mask if present
     // (opponent pool training includes opponent turns that shouldn't be in the metric)

@@ -79,22 +79,15 @@ fn gather_1d<B: Backend>(input: Tensor<B, 2>, indices: Tensor<B, 1, Int>) -> Ten
 /// This prevents memory leaks from detached autodiff graph nodes.
 pub fn normalize_advantages<B: burn::tensor::backend::AutodiffBackend>(
     advantages: Tensor<B, 1>,
-) -> Tensor<B, 1> {
+) -> Tensor<B, 1>
+where
+    B::FloatElem: Into<f32>,
+{
     profile_scope!("async_normalize_advantages");
     // Extract stats on inner tensor (no autodiff wrapper overhead)
     let adv_inner = advantages.clone().inner();
-    let mean_val: f32 = adv_inner
-        .clone()
-        .mean()
-        .into_data()
-        .as_slice::<f32>()
-        .expect("mean to f32")[0];
-    let std_val: f32 = adv_inner
-        .var(0)
-        .sqrt()
-        .into_data()
-        .as_slice::<f32>()
-        .expect("std to f32")[0];
+    let mean_val: f32 = adv_inner.clone().mean().into_scalar().into();
+    let std_val: f32 = adv_inner.var(0).sqrt().into_scalar().into();
     // Scalar arithmetic - Burn handles broadcasting efficiently
     (advantages - mean_val) / (std_val + 1e-8)
 }

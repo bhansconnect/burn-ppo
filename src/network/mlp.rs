@@ -366,7 +366,7 @@ mod tests {
         assert_eq!(values.dims(), [1, 1]);
 
         // Values should be finite
-        let value_scalar: f32 = values.clone().into_data().as_slice().unwrap()[0];
+        let value_scalar: f32 = values.clone().into_scalar();
         assert!(value_scalar.is_finite());
     }
 }
