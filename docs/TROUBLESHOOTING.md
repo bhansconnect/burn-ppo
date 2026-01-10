@@ -199,3 +199,12 @@ All metrics logged during training:
 | episode/return | Average return over last 100 episodes |
 | episode/return_single | Per-episode return |
 | episode/length | Episode length |
+
+## Entropy
+
+Quick notes on entropy:
+1. Entropy annealing is generally not recommended. While it can work, it often hurts learning.
+2. Adaptive entropy can work well and can help to find good entropy coefficients by analyzing metric logs.
+   That said, it also makes it so that extending training is often broken.
+   It also can lead to spending too much time in exploration or never lowering entropy enough to exploit.
+   While ok to use, push for exploring static entropy coefficients that just work.
