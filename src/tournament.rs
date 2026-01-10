@@ -1787,31 +1787,31 @@ fn run_pod<B: Backend, E: Environment>(
         num_players
     );
 
-    // Check for Random players
-    let has_random = pod.iter().any(|&idx| contestant_to_model[idx].is_none());
-
-    if has_random {
-        return run_pod_with_random::<E>(pod, num_games, rng);
-    }
-
     // Build models array, deduplicating when same model plays multiple positions
+    // Random players get None for model (run_stats_mode_env handles this with uniform logits)
     let mut pod_models: Vec<Option<ActorCritic<B>>> = Vec::new();
     let mut pod_normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
     let mut checkpoint_to_model_map: Vec<usize> = Vec::new();
-    let mut model_cache: HashMap<usize, usize> = HashMap::new();
+    let mut model_cache: HashMap<Option<usize>, usize> = HashMap::new();
 
     for &contestant_idx in pod {
-        let model_idx = contestant_to_model[contestant_idx]
-            .expect("contestant should have model (Random players handled separately)");
-        if let Some(&cached_idx) = model_cache.get(&model_idx) {
-            // Reuse existing model
+        let model_idx_opt = contestant_to_model[contestant_idx];
+        if let Some(&cached_idx) = model_cache.get(&model_idx_opt) {
+            // Reuse existing model slot
             checkpoint_to_model_map.push(cached_idx);
         } else {
-            // Add new model
+            // Add new model slot
             let new_idx = pod_models.len();
-            pod_models.push(Some(models[model_idx].clone()));
-            pod_normalizers.push(normalizers[model_idx].clone());
-            model_cache.insert(model_idx, new_idx);
+            if let Some(model_idx) = model_idx_opt {
+                // Trained model
+                pod_models.push(Some(models[model_idx].clone()));
+                pod_normalizers.push(normalizers[model_idx].clone());
+            } else {
+                // Random player - None model outputs uniform logits
+                pod_models.push(None);
+                pod_normalizers.push(None);
+            }
+            model_cache.insert(model_idx_opt, new_idx);
             checkpoint_to_model_map.push(new_idx);
         }
     }
@@ -1847,7 +1847,8 @@ fn run_pod<B: Backend, E: Environment>(
     }
 }
 
-/// Simplified pod games for when Random players are involved
+/// Simplified pod games for all-random testing (used by tests only)
+#[cfg(test)]
 fn run_pod_with_random<E: Environment>(
     pod: &[usize],
     num_games: usize,

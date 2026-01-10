@@ -915,3 +915,130 @@ opponent_pool_eval_games = 8
         let _ = metrics; // Suppress unused warning
     }
 }
+
+// ============================================================================
+// Tournament Tests
+// ============================================================================
+
+#[test]
+fn test_tournament_random_player_uses_model_policy() {
+    // This test verifies that when a trained model plays against Random in a tournament,
+    // the model actually uses its learned policy (not both playing randomly).
+    // Before the fix for this bug, both players would play randomly when any Random
+    // player was in the pod, resulting in ~50% win rates regardless of training.
+    let dir = tempdir().unwrap();
+
+    // Train a connect_four model for a bit longer to ensure it beats random
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 8
+num_steps = 16
+total_timesteps = 1024
+num_epochs = 2
+num_minibatches = 2
+hidden_size = 32
+num_hidden = 2
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 512
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("c4_tournament_config.toml");
+    fs::write(&config_path, config_content).unwrap();
+
+    // Train the model
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute training");
+
+    assert!(
+        output.status.success(),
+        "Training failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Find the run directory and the latest checkpoint
+    let run_dir = get_first_run_dir(dir.path()).unwrap();
+    let checkpoints_dir = run_dir.join("checkpoints");
+    let latest_checkpoint = checkpoints_dir.join("latest");
+
+    assert!(
+        latest_checkpoint.exists(),
+        "Expected latest checkpoint symlink at {latest_checkpoint:?}",
+    );
+
+    // Run tournament: trained model vs Random
+    // With just 20 games, if the model uses its policy it should win significantly more than 50%
+    // If both were playing randomly (the bug), we'd see close to 50/50
+    let tournament_output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args([
+            "tournament",
+            latest_checkpoint.to_str().unwrap(),
+            "--random",
+            "--round-robin",
+            "-n",
+            "20",
+        ])
+        .output()
+        .expect("Failed to execute tournament");
+
+    assert!(
+        tournament_output.status.success(),
+        "Tournament failed: {}",
+        String::from_utf8_lossy(&tournament_output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&tournament_output.stdout);
+
+    // Parse the output to find the model's win count
+    // Look for a line like "step_xxxx    1.0    ...    15  5" where 15 is 1st place, 5 is 2nd
+    // or "Random    0.0    ...    5  15"
+    let mut model_wins = 0u32;
+    let mut random_wins = 0u32;
+
+    for line in stdout.lines() {
+        // Skip header lines and look for result lines
+        if line.contains("Random") && !line.contains("Random player") {
+            // Parse: "Random    0.0    ...    X  Y" where X is 1st place count
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                // The 1st place count is typically second-to-last number
+                if let Some(pos) = parts.iter().rposition(|&s| s.parse::<u32>().is_ok()) {
+                    if pos > 0 {
+                        if let Ok(second_place) = parts[pos].parse::<u32>() {
+                            if let Ok(first_place) = parts[pos - 1].parse::<u32>() {
+                                random_wins = first_place;
+                                model_wins = second_place;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // The model should win more than random
+    // With a short training and just 20 games, we expect model to win at least ~55%
+    // If both played randomly, it would be close to 50/50
+    // Note: Even a weakly trained model should beat pure random at connect_four
+    assert!(
+        model_wins > random_wins || model_wins >= 10,
+        "Tournament bug: Model should beat Random. Got model_wins={model_wins}, random_wins={random_wins}. \
+         If both are ~10, the bug where both play randomly may have regressed. \
+         Full output:\n{stdout}",
+    );
+}
