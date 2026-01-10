@@ -1294,10 +1294,11 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             let mb_old_values: Tensor<B, 1> = Tensor::from_inner(mb_old_values_inner);
 
             // Capture raw advantage stats before normalization (for debugging)
-            let adv_mean_raw_t = mb_advantages_raw.clone().mean();
-            let adv_std_raw_t = mb_advantages_raw.clone().var(0).sqrt();
-            let adv_min_raw_t = mb_advantages_raw.clone().min();
-            let adv_max_raw_t = mb_advantages_raw.clone().max();
+            // Use .detach() since these are metrics only - not part of loss computation
+            let adv_mean_raw_t = mb_advantages_raw.clone().mean().detach();
+            let adv_std_raw_t = mb_advantages_raw.clone().var(0).sqrt().detach();
+            let adv_min_raw_t = mb_advantages_raw.clone().min().detach();
+            let adv_max_raw_t = mb_advantages_raw.clone().max().detach();
 
             // Normalize advantages at minibatch level (critical for stability)
             let mb_advantages = normalize_advantages(mb_advantages_raw);
@@ -1387,14 +1388,16 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
                     + entropy_loss;
 
                 // Value prediction error: |V(s) - actual_return|
+                // Use .detach() since these are diagnostic metrics only
                 let value_errors = (values.clone() - mb_returns.clone()).abs();
-                let value_error_mean_t = value_errors.clone().mean();
-                let value_error_std_t = value_errors.clone().var(0).sqrt();
-                let value_error_max_t = value_errors.max();
+                let value_error_mean_t = value_errors.clone().mean().detach();
+                let value_error_std_t = value_errors.clone().var(0).sqrt().detach();
+                let value_error_max_t = value_errors.max().detach();
 
                 // Capture values for metrics before backward
-                let values_mean = values.mean();
-                let returns_mean = mb_returns.mean();
+                // Use .detach() since these are logging-only metrics
+                let values_mean = values.mean().detach();
+                let returns_mean = mb_returns.mean().detach();
 
                 // Backward pass
                 let grads = loss.backward();

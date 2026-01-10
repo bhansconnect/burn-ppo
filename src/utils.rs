@@ -76,8 +76,8 @@ fn gather_1d<B: Backend>(input: Tensor<B, 2>, indices: Tensor<B, 1, Int>) -> Ten
 /// Normalize advantages to zero mean and unit variance
 pub fn normalize_advantages<B: Backend>(advantages: Tensor<B, 1>) -> Tensor<B, 1> {
     profile_scope!("async_normalize_advantages");
-    let mean = advantages.clone().mean();
-    let std = advantages.clone().var(0).sqrt();
+    let mean = advantages.clone().mean().detach();
+    let std = advantages.clone().var(0).sqrt().detach();
     (advantages - mean) / (std + 1e-8)
 }
 
