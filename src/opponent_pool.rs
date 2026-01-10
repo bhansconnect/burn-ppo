@@ -145,6 +145,18 @@ impl EnvState {
     }
 }
 
+/// Pending game result for batched rating updates
+///
+/// Game results are collected during training and applied in shuffled order
+/// at rotation time to avoid order-based bias.
+struct PendingGameResult {
+    placements: Vec<usize>,
+    learner_position: usize,
+    /// Maps position to pool index (None for learner position)
+    position_to_opponent: Vec<Option<usize>>,
+    step: usize,
+}
+
 /// Main opponent pool manager
 pub struct OpponentPool<B: Backend> {
     /// All available opponents (checkpoint path + rating metadata)
@@ -184,6 +196,10 @@ pub struct OpponentPool<B: Backend> {
 
     /// Maximum number of active opponents
     pool_size_limit: usize,
+
+    /// Pending game results for batched rating updates
+    /// Applied in shuffled order at rotation time
+    pending_game_results: Vec<PendingGameResult>,
 }
 
 /// Persisted pool ratings file format (`pool_ratings.json`)
@@ -252,6 +268,7 @@ impl<B: Backend> OpponentPool<B> {
             learner_rating,
             active_indices: Vec::new(),
             pool_size_limit,
+            pending_game_results: Vec::new(),
         };
 
         // Load existing ratings (may override learner_rating if resuming same run)
@@ -676,88 +693,111 @@ impl<B: Backend> OpponentPool<B> {
         }
     }
 
-    /// Update ratings after a game completes
+    /// Queue a game result for batched rating update
+    ///
+    /// Game results are collected and applied in shuffled order at rotation time
+    /// to avoid order-based bias (faster games completing first).
     ///
     /// `placements[i]` = 1 for 1st place, 2 for 2nd, etc.
     /// `learner_position` = which seat the learner was in
-    /// `opponents` = pool indices of opponents at each non-learner position
-    pub fn update_ratings_after_game(
+    pub fn queue_game_for_rating(
         &mut self,
         placements: &[usize],
         learner_position: usize,
         env_state: &EnvState,
         current_step: usize,
     ) {
-        let num_players = placements.len();
+        self.pending_game_results.push(PendingGameResult {
+            placements: placements.to_vec(),
+            learner_position,
+            position_to_opponent: env_state.position_to_opponent.clone(),
+            step: current_step,
+        });
+    }
 
-        // Build teams array in position order
-        // Use learner's current rating from pool evaluations to prevent opponent deflation
-        let learner_rating = WengLinRating {
-            rating: self.learner_rating.rating,
-            uncertainty: self.learner_rating.uncertainty,
-        };
-
-        // Collect ratings for all positions
-        let mut team_ratings: Vec<WengLinRating> = Vec::with_capacity(num_players);
-        for pos in 0..num_players {
-            if pos == learner_position {
-                team_ratings.push(learner_rating);
-            } else {
-                let pool_idx = env_state.position_to_opponent[pos]
-                    .expect("non-learner position must have opponent assigned");
-                let (_, rating) = &self.available[pool_idx];
-                team_ratings.push(WengLinRating {
-                    rating: rating.rating_mu,
-                    uncertainty: rating.rating_sigma,
-                });
-            }
+    /// Apply all pending game results to ratings in shuffled order
+    ///
+    /// Called at rotation time to update opponent ratings without order bias.
+    /// Ratings are fetched fresh from the pool for each game (not cached).
+    pub fn apply_pending_ratings(&mut self) {
+        if self.pending_game_results.is_empty() {
+            return;
         }
 
-        // Build rating groups for weng_lin_multi_team
-        let rating_arrs: Vec<[WengLinRating; 1]> = team_ratings.iter().map(|r| [*r]).collect();
-        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_arrs
-            .iter()
-            .enumerate()
-            .map(|(i, arr)| (arr.as_slice(), MultiTeamOutcome::new(placements[i])))
-            .collect();
+        // Shuffle games to avoid completion-order bias
+        self.pending_game_results.shuffle(&mut self.rng);
 
         let wl_config = WengLinConfig::new();
-        let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
 
-        // Update opponent ratings (not learner)
-        let learner_placement = placements[learner_position];
-        #[expect(
-            clippy::needless_range_loop,
-            reason = "need position index for multiple lookups"
-        )]
-        for pos in 0..num_players {
-            if pos == learner_position {
-                continue;
+        for game in &self.pending_game_results {
+            let num_players = game.placements.len();
+
+            // Use learner's current rating from pool evaluations
+            let learner_rating = WengLinRating {
+                rating: self.learner_rating.rating,
+                uncertainty: self.learner_rating.uncertainty,
+            };
+
+            // Collect current ratings for all positions (fetch fresh each game)
+            let mut team_ratings: Vec<WengLinRating> = Vec::with_capacity(num_players);
+            for pos in 0..num_players {
+                if pos == game.learner_position {
+                    team_ratings.push(learner_rating);
+                } else {
+                    let pool_idx = game.position_to_opponent[pos]
+                        .expect("non-learner position must have opponent assigned");
+                    let (_, rating) = &self.available[pool_idx];
+                    team_ratings.push(WengLinRating {
+                        rating: rating.rating_mu,
+                        uncertainty: rating.rating_sigma,
+                    });
+                }
             }
 
-            let pool_idx = env_state.position_to_opponent[pos]
-                .expect("non-learner position must have opponent assigned");
-            let (_, rating) = &mut self.available[pool_idx];
+            // Build rating groups for weng_lin_multi_team
+            let rating_arrs: Vec<[WengLinRating; 1]> = team_ratings.iter().map(|r| [*r]).collect();
+            let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_arrs
+                .iter()
+                .enumerate()
+                .map(|(i, arr)| (arr.as_slice(), MultiTeamOutcome::new(game.placements[i])))
+                .collect();
 
-            // new_ratings[pos] is a Vec with one element (single-player team)
-            if let Some(new_rating) = new_ratings.get(pos).and_then(|v| v.first()) {
-                rating.rating_mu = new_rating.rating;
-                rating.rating_sigma = new_rating.uncertainty;
-            }
-            rating.games_played += 1;
-            rating.last_updated_step = current_step;
+            let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
 
-            // Track if learner beat this opponent
-            let opponent_placement = placements[pos];
-            if learner_placement < opponent_placement {
-                rating.wins_vs_current += 1;
-            }
+            // Update opponent ratings (not learner)
+            let learner_placement = game.placements[game.learner_position];
+            for pos in 0..num_players {
+                if pos == game.learner_position {
+                    continue;
+                }
 
-            // Also update loaded opponent if present
-            if let Some(loaded) = self.loaded.get_mut(&pool_idx) {
-                loaded.rating = rating.clone();
+                let pool_idx = game.position_to_opponent[pos]
+                    .expect("non-learner position must have opponent assigned");
+                let (_, rating) = &mut self.available[pool_idx];
+
+                // new_ratings[pos] is a Vec with one element (single-player team)
+                if let Some(new_rating) = new_ratings.get(pos).and_then(|v| v.first()) {
+                    rating.rating_mu = new_rating.rating;
+                    rating.rating_sigma = new_rating.uncertainty;
+                }
+                rating.games_played += 1;
+                rating.last_updated_step = game.step;
+
+                // Track if learner beat this opponent
+                let opponent_placement = game.placements[pos];
+                if learner_placement < opponent_placement {
+                    rating.wins_vs_current += 1;
+                }
+
+                // Also update loaded opponent if present
+                if let Some(loaded) = self.loaded.get_mut(&pool_idx) {
+                    loaded.rating = rating.clone();
+                }
             }
         }
+
+        // Clear pending results
+        self.pending_game_results.clear();
     }
 
     /// Get rating info for logging

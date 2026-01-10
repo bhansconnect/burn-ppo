@@ -584,11 +584,11 @@ where
                 global_step,
             );
 
-            // Process opponent completions for rating updates
+            // Queue opponent completions for batched rating updates
             for completion in opponent_completions {
                 if !completion.placements.is_empty() {
                     let env_state = &env_states[completion.env_idx];
-                    pool.update_ratings_after_game(
+                    pool.queue_game_for_rating(
                         &completion.placements,
                         env_state.learner_position,
                         env_state,
@@ -601,6 +601,9 @@ where
             steps_since_rotation += steps_per_update;
             if steps_since_rotation >= config.opponent_pool_rotation_steps {
                 steps_since_rotation = 0;
+
+                // Apply pending ratings in shuffled order (avoids completion-order bias)
+                pool.apply_pending_ratings();
 
                 // Refresh pool (scan for new checkpoints)
                 let _ = pool.scan_checkpoints();

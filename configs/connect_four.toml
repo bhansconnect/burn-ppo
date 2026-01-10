@@ -21,7 +21,7 @@ target_kl = 0.02         # KL early stopping
 normalize_obs = false    # Board state doesn't need normalization
 
 # Training - board games need more samples
-total_timesteps = 30_000_000
+total_timesteps = 20_000_000
 num_epochs = 4
 num_minibatches = 4
 adam_epsilon = 1e-5
