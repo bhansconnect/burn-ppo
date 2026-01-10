@@ -1438,13 +1438,13 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
             };
 
             // Optimizer step with GPU sync for accurate timing
-            #[expect(clippy::let_and_return, reason = "scoped for profiling")]
             {
                 model = {
                     profile_scope!("optimizer_step");
                     let grads = GradientsParams::from_grads(grads, &model);
                     let updated = optimizer.step(learning_rate, model, grads);
-                    gpu_sync!(updated.layers[0].weight.val()); // Force sync after weight update
+                    #[cfg(feature = "tracy")]
+                    updated.sync_optimize(); // Force sync after weight update
                     updated
                 };
             }
