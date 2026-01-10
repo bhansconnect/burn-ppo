@@ -74,11 +74,29 @@ fn gather_1d<B: Backend>(input: Tensor<B, 2>, indices: Tensor<B, 1, Int>) -> Ten
 }
 
 /// Normalize advantages to zero mean and unit variance
-pub fn normalize_advantages<B: Backend>(advantages: Tensor<B, 1>) -> Tensor<B, 1> {
+///
+/// Uses `.inner()` to extract stats as f32 scalars without autodiff overhead.
+/// This prevents memory leaks from detached autodiff graph nodes.
+pub fn normalize_advantages<B: burn::tensor::backend::AutodiffBackend>(
+    advantages: Tensor<B, 1>,
+) -> Tensor<B, 1> {
     profile_scope!("async_normalize_advantages");
-    let mean = advantages.clone().mean().detach();
-    let std = advantages.clone().var(0).sqrt().detach();
-    (advantages - mean) / (std + 1e-8)
+    // Extract stats on inner tensor (no autodiff wrapper overhead)
+    let adv_inner = advantages.clone().inner();
+    let mean_val: f32 = adv_inner
+        .clone()
+        .mean()
+        .into_data()
+        .as_slice::<f32>()
+        .expect("mean to f32")[0];
+    let std_val: f32 = adv_inner
+        .var(0)
+        .sqrt()
+        .into_data()
+        .as_slice::<f32>()
+        .expect("std to f32")[0];
+    // Scalar arithmetic - Burn handles broadcasting efficiently
+    (advantages - mean_val) / (std_val + 1e-8)
 }
 
 /// Apply action mask to logits by setting invalid actions to large negative value
@@ -112,10 +130,12 @@ pub fn apply_action_mask<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::{Autodiff, NdArray};
     use rand::SeedableRng;
 
     type TestBackend = NdArray<f32>;
+    type TestAutodiffBackend = Autodiff<NdArray<f32>>;
 
     #[test]
     fn test_sample_categorical_shape() {
@@ -173,17 +193,18 @@ mod tests {
 
     #[test]
     fn test_normalize_advantages() {
-        let device = Default::default();
-        let advantages: Tensor<TestBackend, 1> = Tensor::from_floats([1.0, 2.0, 3.0, 4.0], &device);
+        let device: NdArrayDevice = Default::default();
+        let advantages: Tensor<TestAutodiffBackend, 1> =
+            Tensor::from_floats([1.0, 2.0, 3.0, 4.0], &device);
 
         let normalized = normalize_advantages(advantages);
 
-        // Check mean is approximately 0
-        let mean: f32 = normalized.clone().mean().into_scalar();
+        // Check mean is approximately 0 (use .inner() to get non-autodiff tensor)
+        let mean: f32 = normalized.clone().inner().mean().into_scalar();
         assert!(mean.abs() < 1e-5);
 
         // Check std is approximately 1
-        let std: f32 = normalized.var(0).sqrt().into_scalar();
+        let std: f32 = normalized.inner().var(0).sqrt().into_scalar();
         assert!((std - 1.0).abs() < 1e-4);
     }
 
