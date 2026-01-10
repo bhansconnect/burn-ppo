@@ -34,7 +34,7 @@ impl ConnectFour {
 
         // Inner closure uses ? operator; writing to String is infallible
         let format = |output: &mut String| -> std::fmt::Result {
-            writeln!(output, "  0 1 2 3 4 5 6")?;
+            writeln!(output, "  1 2 3 4 5 6 7")?;
             writeln!(output, " ---------------")?;
 
             for row in 0..ROWS {
@@ -316,12 +316,9 @@ impl Environment for ConnectFour {
     fn parse_action(&self, input: &str) -> Result<usize, String> {
         let input = input.trim();
         if let Ok(col) = input.parse::<usize>() {
-            // Accept 1-7 (human-friendly) or 0-6 (0-indexed)
+            // Accept 1-7 (human-friendly)
             if (1..=7).contains(&col) {
                 return Ok(col - 1); // Convert 1-indexed to 0-indexed
-            }
-            if col < 7 {
-                return Ok(col); // Allow 0-indexed too
             }
         }
         Err("Enter column 1-7".to_string())
@@ -648,7 +645,7 @@ mod tests {
         let rendered = env.render_board();
 
         // Check column headers
-        assert!(rendered.contains("0 1 2 3 4 5 6"));
+        assert!(rendered.contains("1 2 3 4 5 6 7"));
         // Check empty board has dots
         assert!(rendered.contains(". . . . . . ."));
         // Check turn indicator
@@ -693,6 +690,6 @@ mod tests {
         // The Environment::render() method should return Some(String)
         let rendered = env.render();
         assert!(rendered.is_some());
-        assert!(rendered.unwrap().contains("0 1 2 3 4 5 6"));
+        assert!(rendered.unwrap().contains("1 2 3 4 5 6 7"));
     }
 }

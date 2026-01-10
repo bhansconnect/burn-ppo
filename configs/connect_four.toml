@@ -35,7 +35,7 @@ adam_epsilon = 1e-5
 # Network - MLP (default)
 # 3 layers of 128 hidden units (~45k MACs)
 hidden_size = 128
-num_hidden = 3
+num_hidden = 4
 activation = "relu"
 
 # CNN Alternative - E3a architecture (~45k MACs, matches MLP compute)
