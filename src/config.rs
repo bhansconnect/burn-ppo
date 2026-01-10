@@ -213,6 +213,9 @@ pub struct TrainArgs {
     #[arg(long, action = clap::ArgAction::Set, help = "Enable observation normalization (default: false)")]
     pub normalize_obs: Option<bool>,
 
+    #[arg(long, action = clap::ArgAction::Set, help = "Enable return normalization (default: true)")]
+    pub normalize_returns: Option<bool>,
+
     // --- Training ---
     #[arg(long, help = "PPO epochs per update (default: 4)")]
     pub num_epochs: Option<usize>,
@@ -541,6 +544,15 @@ pub struct Config {
     /// Helps with environments that have varying observation scales
     #[serde(default)]
     pub normalize_obs: bool,
+    /// Whether to normalize rewards using running statistics of discounted returns.
+    /// Divides rewards by `sqrt(running_return_variance)` for stable training.
+    /// **Enabled by default** - set to false for sparse reward environments.
+    #[serde(default = "default_true")]
+    pub normalize_returns: bool,
+    /// Clipping range for normalized rewards (default: 10.0)
+    /// Normalized rewards are clamped to [-clip, +clip]
+    #[serde(default = "default_return_clip")]
+    pub return_clip: f32,
 
     // Training
     #[serde(default = "default_total_timesteps")]
@@ -708,6 +720,9 @@ const fn default_value_coef() -> f64 {
 const fn default_max_grad_norm() -> f64 {
     0.5
 }
+const fn default_return_clip() -> f32 {
+    10.0 // Standard VecNormalize default
+}
 const fn default_total_timesteps() -> usize {
     1_000_000
 }
@@ -807,6 +822,8 @@ impl Default for Config {
             max_grad_norm: default_max_grad_norm(),
             target_kl: None,
             normalize_obs: false,
+            normalize_returns: true, // Enabled by default
+            return_clip: default_return_clip(),
             total_timesteps: default_total_timesteps(),
             num_epochs: default_num_epochs(),
             num_minibatches: default_num_minibatches(),
@@ -970,6 +987,9 @@ impl Config {
         }
         if let Some(v) = args.normalize_obs {
             self.normalize_obs = v;
+        }
+        if let Some(v) = args.normalize_returns {
+            self.normalize_returns = v;
         }
         if let Some(v) = args.num_steps {
             self.num_steps = v;
@@ -1173,6 +1193,9 @@ impl Config {
         }
         if args.normalize_obs.is_some() {
             ignored.push("--normalize-obs");
+        }
+        if args.normalize_returns.is_some() {
+            ignored.push("--normalize-returns");
         }
         if args.num_steps.is_some() {
             ignored.push("--num-steps");

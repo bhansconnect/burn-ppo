@@ -101,6 +101,164 @@ impl ObsNormalizer {
     }
 }
 
+/// Running return normalizer for reward normalization
+///
+/// Normalizes rewards by dividing by the standard deviation of rolling discounted returns.
+/// This follows the Stable Baselines3 `VecNormalize` approach:
+/// 1. Track rolling discounted returns per player per environment
+/// 2. Update running variance statistics on these returns (Welford's algorithm)
+/// 3. Normalize rewards by dividing by sqrt(variance)
+///
+/// Key design: Tracks returns per-player-per-env (not just per-env) to match GAE's
+/// gamma application - gamma is only applied between a player's own actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReturnNormalizer {
+    /// Rolling discounted returns per environment per player `[num_envs][num_players]`
+    /// Gamma is only applied when that specific player acts
+    returns: Vec<Vec<f64>>,
+    /// Running variance using Welford's algorithm (M2 accumulator)
+    var: f64,
+    /// Running mean (needed for Welford's variance, not used in normalization)
+    mean: f64,
+    /// Number of samples seen
+    count: f64,
+    /// Discount factor for return computation
+    gamma: f64,
+    /// Clipping range for normalized rewards
+    clip: f32,
+    /// Number of players
+    num_players: usize,
+    /// Small epsilon for numerical stability
+    epsilon: f64,
+}
+
+impl ReturnNormalizer {
+    /// Create a new return normalizer
+    ///
+    /// # Arguments
+    /// * `num_envs` - Number of parallel environments
+    /// * `num_players` - Number of players (1 for single-player games)
+    /// * `gamma` - Discount factor (typically 0.99)
+    /// * `clip` - Clipping range for normalized rewards (typically 10.0)
+    pub fn new(num_envs: usize, num_players: usize, gamma: f64, clip: f32) -> Self {
+        Self {
+            returns: vec![vec![0.0; num_players]; num_envs],
+            var: 0.0,
+            mean: 0.0,
+            count: 0.0,
+            gamma,
+            clip,
+            num_players,
+            epsilon: 1e-8,
+        }
+    }
+
+    /// Update rolling return for a specific player in a specific environment
+    ///
+    /// Gamma is applied per-player, not per-step. This matches GAE's approach
+    /// where gamma represents discounting between a player's own decision points.
+    ///
+    /// Note: Does NOT automatically reset on done - caller should call `reset_player`
+    /// AFTER `update_variance_stats` to ensure the terminal return is captured.
+    pub fn update_return(&mut self, env_idx: usize, player: usize, reward: f32) {
+        // Apply gamma and add reward
+        self.returns[env_idx][player] =
+            self.returns[env_idx][player] * self.gamma + f64::from(reward);
+    }
+
+    /// Reset rolling return for a specific player (call after episode ends)
+    pub fn reset_player(&mut self, env_idx: usize, player: usize) {
+        self.returns[env_idx][player] = 0.0;
+    }
+
+    /// Add current rolling return to Welford variance statistics
+    ///
+    /// Call this only for learner turns to ensure variance reflects learner experience.
+    pub fn update_variance_stats(&mut self, env_idx: usize, player: usize) {
+        let x = self.returns[env_idx][player];
+        self.count += 1.0;
+
+        // Welford's online update
+        let delta = x - self.mean;
+        self.mean += delta / self.count;
+        let delta2 = x - self.mean;
+        self.var += delta * delta2;
+    }
+
+    /// Normalize a reward using current variance statistics
+    ///
+    /// Uses variance-only normalization (no mean subtraction) to preserve
+    /// reward sign and magnitude relationships.
+    pub fn normalize(&self, reward: f32) -> f32 {
+        // Need at least 2 samples for meaningful variance
+        if self.count < 2.0 {
+            return reward;
+        }
+
+        let variance = self.var / self.count;
+        let std = (variance + self.epsilon).sqrt();
+        let normalized = f64::from(reward) / std;
+        (normalized as f32).clamp(-self.clip, self.clip)
+    }
+
+    /// Reset all player returns for an environment (on episode end)
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "API for future use or convenience")
+    )]
+    pub fn reset_env(&mut self, env_idx: usize) {
+        for player in 0..self.num_players {
+            self.returns[env_idx][player] = 0.0;
+        }
+    }
+
+    /// Convenience method for single-player: update returns, stats, and normalize all rewards
+    ///
+    /// For single-player games, this handles the full update cycle:
+    /// 1. Update rolling returns for each env
+    /// 2. Update variance statistics
+    /// 3. Normalize rewards in-place
+    /// 4. Reset rolling returns on episode end
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "API for future single-player convenience")
+    )]
+    pub fn update_and_normalize_all(&mut self, rewards: &mut [f32], dones: &[bool]) {
+        let num_envs = rewards.len();
+        assert_eq!(num_envs, dones.len());
+        assert_eq!(num_envs, self.returns.len());
+
+        for env_idx in 0..num_envs {
+            let reward = rewards[env_idx];
+            let done = dones[env_idx];
+
+            // Update rolling return (player 0 for single-player)
+            self.update_return(env_idx, 0, reward);
+
+            // Update variance stats
+            self.update_variance_stats(env_idx, 0);
+
+            // Normalize reward
+            rewards[env_idx] = self.normalize(reward);
+
+            // Reset rolling return on episode end (after stats captured)
+            if done {
+                self.reset_player(env_idx, 0);
+            }
+        }
+    }
+
+    /// Get variance for debugging/logging
+    #[cfg(test)]
+    pub fn variance(&self) -> f64 {
+        if self.count < 2.0 {
+            0.0
+        } else {
+            self.var / self.count
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +415,189 @@ mod tests {
         // Stats should now be updated
         assert!(norm.count > 2.0);
         assert!((norm.mean[0] - mean_before).abs() > 0.1); // Mean changed
+    }
+
+    // ======== ReturnNormalizer Tests ========
+
+    #[test]
+    fn test_return_normalizer_creation() {
+        let norm = ReturnNormalizer::new(4, 2, 0.99, 10.0);
+        assert_eq!(norm.returns.len(), 4);
+        assert_eq!(norm.returns[0].len(), 2);
+        assert_eq!(norm.num_players, 2);
+    }
+
+    #[test]
+    fn test_return_normalizer_rolling_return() {
+        let mut norm = ReturnNormalizer::new(2, 1, 0.99, 10.0);
+
+        // Update with reward 1.0 for env 0, player 0
+        norm.update_return(0, 0, 1.0);
+        assert!((norm.returns[0][0] - 1.0).abs() < 1e-6);
+
+        // Update again - should apply gamma
+        norm.update_return(0, 0, 1.0);
+        // Expected: 0.99 * 1.0 + 1.0 = 1.99
+        assert!((norm.returns[0][0] - 1.99).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_return_normalizer_reset_player() {
+        let mut norm = ReturnNormalizer::new(2, 1, 0.99, 10.0);
+
+        // Build up some return
+        norm.update_return(0, 0, 10.0);
+        assert!(norm.returns[0][0] > 0.0);
+
+        // reset_player should reset
+        norm.reset_player(0, 0);
+        assert_eq!(norm.returns[0][0], 0.0);
+    }
+
+    #[test]
+    fn test_return_normalizer_variance_stats() {
+        let mut norm = ReturnNormalizer::new(1, 1, 0.99, 10.0);
+
+        // Add several samples - each is a separate episode
+        for reward in [1.0, 2.0, 3.0, 4.0, 5.0] {
+            norm.update_return(0, 0, reward);
+            norm.update_variance_stats(0, 0);
+            norm.reset_player(0, 0); // Reset after stats captured
+        }
+
+        // After 5 samples, variance should be computed
+        assert_eq!(norm.count, 5.0);
+        let variance = norm.variance();
+        // Variance of [1,2,3,4,5] = 2.0
+        assert!((variance - 2.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_return_normalizer_normalize() {
+        let mut norm = ReturnNormalizer::new(1, 1, 0.99, 10.0);
+
+        // Build up variance stats - each is a separate episode
+        for reward in [1.0, 2.0, 3.0, 4.0, 5.0] {
+            norm.update_return(0, 0, reward);
+            norm.update_variance_stats(0, 0);
+            norm.reset_player(0, 0); // Reset after stats captured
+        }
+
+        // Normalize a reward
+        let normalized = norm.normalize(2.0);
+        // With variance ~2.0, std ~1.41, normalized should be ~1.41
+        // (no mean subtraction, just divide by std)
+        assert!(normalized > 0.0); // Positive reward stays positive
+        assert!(normalized < 10.0); // Within clip bounds
+    }
+
+    #[test]
+    fn test_return_normalizer_clipping() {
+        let mut norm = ReturnNormalizer::new(1, 1, 0.99, 5.0); // Clip at 5
+
+        // Build up very small variance
+        for _ in 0..10 {
+            norm.update_return(0, 0, 1.0);
+            norm.update_variance_stats(0, 0);
+            norm.reset_player(0, 0);
+        }
+
+        // Large reward should be clipped
+        let normalized = norm.normalize(100.0);
+        assert!(normalized <= 5.0);
+        assert!(normalized >= -5.0);
+    }
+
+    #[test]
+    fn test_return_normalizer_no_normalize_insufficient_samples() {
+        let mut norm = ReturnNormalizer::new(1, 1, 0.99, 10.0);
+
+        // Only 1 sample - should return raw reward
+        norm.update_return(0, 0, 5.0);
+        norm.update_variance_stats(0, 0);
+        norm.reset_player(0, 0);
+
+        let normalized = norm.normalize(10.0);
+        assert_eq!(normalized, 10.0); // Unchanged
+    }
+
+    #[test]
+    fn test_return_normalizer_per_player_tracking() {
+        let mut norm = ReturnNormalizer::new(1, 2, 0.99, 10.0);
+
+        // Player 0 acts
+        norm.update_return(0, 0, 1.0);
+        assert!((norm.returns[0][0] - 1.0).abs() < 1e-6);
+        assert_eq!(norm.returns[0][1], 0.0); // Player 1 unchanged
+
+        // Player 1 acts - player 0's return should NOT change
+        norm.update_return(0, 1, 2.0);
+        assert!((norm.returns[0][0] - 1.0).abs() < 1e-6); // Still 1.0, no gamma
+        assert!((norm.returns[0][1] - 2.0).abs() < 1e-6);
+
+        // Player 0 acts again - NOW gamma is applied
+        norm.update_return(0, 0, 1.0);
+        // Expected: 0.99 * 1.0 + 1.0 = 1.99
+        assert!((norm.returns[0][0] - 1.99).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_return_normalizer_reset_env() {
+        let mut norm = ReturnNormalizer::new(2, 2, 0.99, 10.0);
+
+        // Build up returns
+        norm.update_return(0, 0, 1.0);
+        norm.update_return(0, 1, 2.0);
+        norm.update_return(1, 0, 3.0);
+
+        // Reset env 0
+        norm.reset_env(0);
+
+        assert_eq!(norm.returns[0][0], 0.0);
+        assert_eq!(norm.returns[0][1], 0.0);
+        assert!((norm.returns[1][0] - 3.0).abs() < 1e-6); // Env 1 unchanged
+    }
+
+    #[test]
+    fn test_return_normalizer_update_and_normalize_all() {
+        let mut norm = ReturnNormalizer::new(3, 1, 0.99, 10.0);
+
+        // First pass to build up stats
+        let mut rewards = vec![1.0, 2.0, 3.0];
+        let dones = vec![true, true, true];
+        norm.update_and_normalize_all(&mut rewards, &dones);
+
+        // Second pass
+        let mut rewards2 = vec![1.0, 2.0, 3.0];
+        let dones2 = vec![true, true, true];
+        norm.update_and_normalize_all(&mut rewards2, &dones2);
+
+        // Third pass - normalization should have effect now
+        let mut rewards3 = vec![2.0, 2.0, 2.0];
+        let dones3 = vec![false, false, false];
+        norm.update_and_normalize_all(&mut rewards3, &dones3);
+
+        // Rewards should be normalized (not all equal to 2.0)
+        // With variance-only normalization, sign is preserved
+        assert!(rewards3[0] > 0.0);
+    }
+
+    #[test]
+    fn test_return_normalizer_serialize_deserialize() {
+        let mut norm = ReturnNormalizer::new(2, 2, 0.99, 10.0);
+
+        // Build up some state
+        norm.update_return(0, 0, 5.0);
+        norm.update_variance_stats(0, 0);
+        norm.update_return(1, 1, 3.0);
+        norm.update_variance_stats(1, 1);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&norm).unwrap();
+        let loaded: ReturnNormalizer = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.returns[0][0], norm.returns[0][0]);
+        assert_eq!(loaded.count, norm.count);
+        assert!((loaded.var - norm.var).abs() < 1e-10);
     }
 }

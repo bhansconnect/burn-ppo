@@ -20,7 +20,7 @@ use rand::Rng;
 use crate::config::Config;
 use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
-use crate::normalization::ObsNormalizer;
+use crate::normalization::{ObsNormalizer, ReturnNormalizer};
 use crate::opponent_pool::{EnvState, OpponentPool};
 use crate::profile::{gpu_sync, profile_function, profile_scope};
 use crate::utils::{
@@ -204,6 +204,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     device: &B::Device,
     rng: &mut impl Rng,
     mut normalizer: Option<&mut ObsNormalizer>,
+    mut return_normalizer: Option<&mut ReturnNormalizer>,
 ) -> Vec<EpisodeStats> {
     profile_function!();
     let num_envs = vec_env.num_envs();
@@ -331,20 +332,53 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         all_completed.extend(completed);
 
         // Extract acting player's reward for backward-compat single-player path
-        let acting_rewards: Vec<f32> = player_rewards
+        let mut acting_rewards: Vec<f32> = player_rewards
             .iter()
             .zip(current_players.iter())
             .map(|(r, &p)| r.get(p).copied().unwrap_or(0.0))
             .collect();
 
+        // Apply return normalization to rewards
+        // In self-play/single-player, all turns are learner turns
+        if let Some(ref mut return_norm) = return_normalizer {
+            for (env_idx, ((reward, &done), &player)) in acting_rewards
+                .iter_mut()
+                .zip(dones.iter())
+                .zip(current_players.iter())
+                .enumerate()
+            {
+                // Update rolling return for this player
+                return_norm.update_return(env_idx, player, *reward);
+                // Update variance stats (all turns are learner in self-play)
+                return_norm.update_variance_stats(env_idx, player);
+                // Normalize the reward
+                *reward = return_norm.normalize(*reward);
+                // Reset rolling return on episode end (after stats captured)
+                if done {
+                    return_norm.reset_player(env_idx, player);
+                }
+            }
+        }
+
         // Flatten all player rewards [num_envs, num_players] -> [num_envs * num_players]
-        let rewards_flat: Vec<f32> = player_rewards
-            .iter()
-            .flat_map(|r| {
-                // Pad with zeros if rewards vec is shorter than num_players
-                (0..num_players).map(|p| r.get(p).copied().unwrap_or(0.0))
-            })
-            .collect();
+        // Use normalized acting player rewards to ensure consistency with single-player path
+        let rewards_flat: Vec<f32> = {
+            let mut flat = Vec::with_capacity(num_envs * num_players);
+            for (env_idx, r) in player_rewards.iter().enumerate() {
+                let acting_player = current_players[env_idx];
+                for p in 0..num_players {
+                    let reward = if p == acting_player {
+                        // Use the (possibly normalized) acting reward
+                        acting_rewards[env_idx]
+                    } else {
+                        // Non-acting players get their raw reward (typically 0)
+                        r.get(p).copied().unwrap_or(0.0)
+                    };
+                    flat.push(reward);
+                }
+            }
+            flat
+        };
 
         // Append to CPU buffers
         all_obs.extend_from_slice(&obs_flat);
@@ -443,6 +477,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     device: &B::Device,
     rng: &mut impl Rng,
     mut normalizer: Option<&mut ObsNormalizer>,
+    mut return_normalizer: Option<&mut ReturnNormalizer>,
     _current_step: usize,
 ) -> (Vec<EpisodeStats>, Vec<OpponentEpisodeCompletion>) {
     profile_function!();
@@ -736,11 +771,33 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             all_log_probs.push(all_env_log_probs[env_idx]);
 
             // Get acting player's reward and value
-            let acting_reward = player_rewards
+            let done = dones.get(env_idx).copied().unwrap_or(false);
+            let mut acting_reward = player_rewards
                 .get(env_idx)
                 .and_then(|r| r.get(current_player))
                 .copied()
                 .unwrap_or(0.0);
+
+            // Apply return normalization
+            // Update rolling return for current player, but only update variance stats for learner turns
+            if let Some(ref mut return_norm) = return_normalizer {
+                // Update rolling return for this player in this env
+                return_norm.update_return(env_idx, current_player, acting_reward);
+
+                // Only update variance stats for learner turns
+                // (opponent turn data should not influence normalization statistics)
+                if is_learner_turn {
+                    return_norm.update_variance_stats(env_idx, current_player);
+                }
+
+                // Normalize the reward
+                acting_reward = return_norm.normalize(acting_reward);
+
+                // Reset rolling return on episode end (after stats captured)
+                if done {
+                    return_norm.reset_player(env_idx, current_player);
+                }
+            }
             all_acting_rewards.push(acting_reward);
 
             let acting_value = all_env_values
@@ -750,21 +807,24 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 .unwrap_or(0.0);
             all_acting_values.push(acting_value);
 
-            all_dones.push(if dones.get(env_idx).copied().unwrap_or(false) {
-                1.0
-            } else {
-                0.0
-            });
+            all_dones.push(if done { 1.0 } else { 0.0 });
 
             // Multi-player data
             all_values_flat.extend_from_slice(&all_env_values[env_idx]);
+            // Use normalized acting_reward for consistency
             let rewards_flat: Vec<f32> = (0..num_players)
                 .map(|p| {
-                    player_rewards
-                        .get(env_idx)
-                        .and_then(|r| r.get(p))
-                        .copied()
-                        .unwrap_or(0.0)
+                    if p == current_player {
+                        // Use the (possibly normalized) acting reward
+                        acting_reward
+                    } else {
+                        // Non-acting players get raw reward (typically 0)
+                        player_rewards
+                            .get(env_idx)
+                            .and_then(|r| r.get(p))
+                            .copied()
+                            .unwrap_or(0.0)
+                    }
                 })
                 .collect();
             all_rewards_flat.extend_from_slice(&rewards_flat);

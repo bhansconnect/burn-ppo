@@ -42,8 +42,8 @@ use clap::Parser;
 use rand::SeedableRng;
 
 use crate::checkpoint::{
-    load_normalizer, load_optimizer, load_rng_state, save_normalizer, save_optimizer,
-    save_rng_state, CheckpointManager, CheckpointMetadata,
+    load_normalizer, load_optimizer, load_return_normalizer, load_rng_state, save_normalizer,
+    save_optimizer, save_return_normalizer, save_rng_state, CheckpointManager, CheckpointMetadata,
 };
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_avg_points, Environment, GameOutcome, VecEnv};
@@ -51,7 +51,7 @@ use crate::envs::{CartPole, ConnectFour, LiarsDice};
 use crate::eval::run_pool_eval;
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
-use crate::normalization::ObsNormalizer;
+use crate::normalization::{ObsNormalizer, ReturnNormalizer};
 use crate::opponent_pool::{EnvState, OpponentPool};
 use crate::ppo::{
     collect_rollouts, collect_rollouts_with_opponents, compute_gae, compute_gae_multiplayer,
@@ -203,6 +203,18 @@ where
         None
     };
 
+    // Create return normalizer if enabled (default: true)
+    let mut return_normalizer: Option<ReturnNormalizer> = if config.normalize_returns {
+        Some(ReturnNormalizer::new(
+            num_envs,
+            num_players as usize,
+            config.gamma,
+            config.return_clip,
+        ))
+    } else {
+        None
+    };
+
     // Create optimizer with gradient clipping
     let optimizer_config = AdamConfig::new()
         .with_epsilon(config.adam_epsilon as f32)
@@ -269,6 +281,22 @@ where
                     }
                     Err(e) => {
                         eprintln!("Warning: Failed to load normalizer: {e}");
+                    }
+                }
+            }
+
+            // Load return normalizer if it was saved (backward compatible - old checkpoints won't have it)
+            if config.normalize_returns {
+                match load_return_normalizer(checkpoint_dir) {
+                    Ok(Some(loaded_norm)) => {
+                        return_normalizer = Some(loaded_norm);
+                        println!("Loaded return normalizer from checkpoint");
+                    }
+                    Ok(None) => {
+                        // No return normalizer saved (old checkpoint), keep the fresh one
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load return normalizer: {e}");
                     }
                 }
             }
@@ -596,6 +624,7 @@ where
                 device,
                 &mut rng,
                 obs_normalizer.as_mut(),
+                return_normalizer.as_mut(),
                 global_step,
             );
 
@@ -649,6 +678,7 @@ where
                 device,
                 &mut rng,
                 obs_normalizer.as_mut(),
+                return_normalizer.as_mut(),
             )
         };
         rollout_time_acc += rollout_start.elapsed();
@@ -1167,6 +1197,13 @@ where
                 }
             }
 
+            // Save return normalizer if enabled
+            if let Some(ref norm) = return_normalizer {
+                if let Err(e) = save_return_normalizer(norm, &checkpoint_path) {
+                    progress.eprintln(&format!("Warning: Failed to save return normalizer: {e}"));
+                }
+            }
+
             // Save RNG state for reproducible continuation
             if let Err(e) = save_rng_state(&mut rng, &checkpoint_path) {
                 progress.eprintln(&format!("Warning: Failed to save RNG state: {e}"));
@@ -1295,6 +1332,13 @@ where
         if let Some(ref norm) = obs_normalizer {
             if let Err(e) = save_normalizer(norm, &checkpoint_path) {
                 progress.eprintln(&format!("Warning: Failed to save normalizer: {e}"));
+            }
+        }
+
+        // Save return normalizer if enabled
+        if let Some(ref norm) = return_normalizer {
+            if let Err(e) = save_return_normalizer(norm, &checkpoint_path) {
+                progress.eprintln(&format!("Warning: Failed to save return normalizer: {e}"));
             }
         }
 

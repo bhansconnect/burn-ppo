@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::network::{ActorCritic, ActorCriticNetwork, MlpActorCritic};
-use crate::normalization::ObsNormalizer;
+use crate::normalization::{ObsNormalizer, ReturnNormalizer};
 
 /// Training metadata saved alongside model weights
 ///
@@ -433,6 +433,31 @@ pub fn load_normalizer(checkpoint_dir: &Path) -> Result<Option<ObsNormalizer>> {
 
     let json = fs::read_to_string(&normalizer_path).context("Failed to read normalizer")?;
     let normalizer: ObsNormalizer = serde_json::from_str(&json)?;
+    Ok(Some(normalizer))
+}
+
+/// Save return normalizer to a checkpoint directory
+///
+/// The normalizer is saved as JSON for easy inspection and portability.
+pub fn save_return_normalizer(normalizer: &ReturnNormalizer, checkpoint_dir: &Path) -> Result<()> {
+    let normalizer_path = checkpoint_dir.join("return_normalizer.json");
+    let json = serde_json::to_string_pretty(normalizer)?;
+    fs::write(normalizer_path, json)?;
+    Ok(())
+}
+
+/// Load return normalizer from a checkpoint directory
+///
+/// Returns None if no return normalizer was saved (older checkpoint or `normalize_returns=false`).
+/// For backward compatibility, missing return normalizer is not an error.
+pub fn load_return_normalizer(checkpoint_dir: &Path) -> Result<Option<ReturnNormalizer>> {
+    let normalizer_path = checkpoint_dir.join("return_normalizer.json");
+    if !normalizer_path.exists() {
+        return Ok(None);
+    }
+
+    let json = fs::read_to_string(&normalizer_path).context("Failed to read return normalizer")?;
+    let normalizer: ReturnNormalizer = serde_json::from_str(&json)?;
     Ok(Some(normalizer))
 }
 
