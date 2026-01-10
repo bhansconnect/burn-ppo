@@ -574,13 +574,13 @@ pub struct Config {
     /// Number of convolutional layers (default: 2)
     #[serde(default = "default_num_conv_layers")]
     pub num_conv_layers: usize,
-    /// Channels per conv layer (default: [64, 64])
+    /// Channels per conv layer (default: [8, 8])
     #[serde(default = "default_conv_channels")]
     pub conv_channels: Vec<usize>,
     /// Kernel size for all conv layers (default: 3)
     #[serde(default = "default_kernel_size")]
     pub kernel_size: usize,
-    /// FC hidden layer size after conv (default: 128)
+    /// FC hidden layer size after conv (default: 32)
     #[serde(default = "default_cnn_fc_hidden_size")]
     pub cnn_fc_hidden_size: usize,
     /// Number of FC layers after conv (default: 1)
@@ -736,13 +736,13 @@ const fn default_num_conv_layers() -> usize {
     2
 }
 fn default_conv_channels() -> Vec<usize> {
-    vec![64, 64]
+    vec![8, 8]
 }
 const fn default_kernel_size() -> usize {
     3
 }
 const fn default_cnn_fc_hidden_size() -> usize {
-    128
+    32
 }
 const fn default_cnn_num_fc_layers() -> usize {
     1
