@@ -15,7 +15,7 @@ use burn::tensor::backend::AutodiffBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::network::ActorCritic;
+use crate::network::{ActorCritic, ActorCriticNetwork, MlpActorCritic};
 use crate::normalization::ObsNormalizer;
 
 /// Training metadata saved alongside model weights
@@ -232,9 +232,38 @@ impl CheckpointManager {
         // Load model using Burn's recorder
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
         let model_path = checkpoint_dir.join("model");
-        let model = default_model
-            .load_file(model_path, &recorder, device)
-            .context("Failed to load model")?;
+
+        // Try loading with new enum format first
+        let model = match default_model.load_file(&model_path, &recorder, device) {
+            Ok(model) => model,
+            Err(e) => {
+                // Check if this might be a legacy checkpoint (pre-CNN, MLP only)
+                if metadata.network_type == "mlp" {
+                    // Try loading as legacy MlpActorCritic directly (old struct format)
+                    let legacy_model = MlpActorCritic::new(
+                        metadata.obs_dim,
+                        metadata.action_count,
+                        metadata.num_players,
+                        &load_config,
+                        device,
+                    );
+                    match legacy_model.load_file(&model_path, &recorder, device) {
+                        Ok(loaded_mlp) => {
+                            // Wrap in enum for compatibility with current code
+                            ActorCriticNetwork::Mlp(loaded_mlp)
+                        }
+                        Err(_) => {
+                            // Both formats failed, return original error
+                            return Err(e).context(
+                                "Failed to load model (tried both new and legacy formats)",
+                            );
+                        }
+                    }
+                } else {
+                    return Err(e).context("Failed to load model");
+                }
+            }
+        };
 
         Ok((model, metadata))
     }
