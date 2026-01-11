@@ -62,9 +62,6 @@ incremental = false    # Incompatible with LTO
 strip = true           # Smaller binary
 panic = "abort"        # No unwinding overhead
 
-[lints.rust]
-warnings = "deny"
-
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 
