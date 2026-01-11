@@ -14,8 +14,6 @@ use burn::module::Module;
 use burn::prelude::*;
 
 use crate::config::Config;
-#[cfg(feature = "tracy")]
-use crate::profile::gpu_sync;
 
 /// Unified actor-critic network supporting multiple architectures
 ///
@@ -91,17 +89,6 @@ impl<B: Backend> ActorCriticNetwork<B> {
     #[cfg(test)]
     pub const fn is_mlp(&self) -> bool {
         matches!(self, Self::Mlp(_))
-    }
-
-    /// Returns a tensor suitable for GPU synchronization (tracy profiling)
-    ///
-    /// This forces a GPU sync by reading weight data, ensuring accurate profiling timing.
-    #[cfg(feature = "tracy")]
-    pub fn sync_optimize(&self) {
-        match self {
-            Self::Mlp(mlp) => gpu_sync!(mlp.layers[0].weight.val()),
-            Self::Cnn(cnn) => gpu_sync!(cnn.conv_layers[0].weight.val()),
-        }
     }
 }
 

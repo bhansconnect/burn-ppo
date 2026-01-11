@@ -54,22 +54,6 @@ macro_rules! profile_frame {
     () => {};
 }
 
-/// Force GPU synchronization for accurate profiling timing.
-/// This forces all queued GPU operations to complete before continuing.
-/// Zero-cost when tracy feature is disabled.
-#[cfg(feature = "tracy")]
-macro_rules! gpu_sync {
-    ($tensor:expr) => {{
-        let _ = $tensor.clone().into_data();
-    }};
-}
-
-#[cfg(not(feature = "tracy"))]
-macro_rules! gpu_sync {
-    ($tensor:expr) => {};
-}
-
-pub(crate) use gpu_sync;
 pub(crate) use profile_frame;
 pub(crate) use profile_function;
 pub(crate) use profile_scope;

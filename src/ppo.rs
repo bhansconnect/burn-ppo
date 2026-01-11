@@ -22,7 +22,7 @@ use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
 use crate::normalization::{ObsNormalizer, ReturnNormalizer};
 use crate::opponent_pool::{EnvState, OpponentPool};
-use crate::profile::{gpu_sync, profile_function, profile_scope};
+use crate::profile::{profile_function, profile_scope};
 use crate::utils::{
     apply_action_mask, entropy_categorical, log_prob_categorical, normalize_advantages,
     sample_categorical,
@@ -1124,11 +1124,24 @@ pub fn compute_explained_variance(values: &[f32], returns: &[f32]) -> f32 {
     1.0 - var_residuals / var_returns
 }
 
-/// Scalar metrics extracted from a single minibatch update
+/// Raw tensor values extracted during loss computation for metrics
 ///
-/// These are extracted immediately after `backward()` to free the autodiff graph.
-/// Using `.inner().into_scalar()` converts autodiff tensors to plain f32 values,
-/// allowing the computation graph to be garbage collected.
+/// All tensors are InnerBackend (no autodiff overhead).
+/// Used to compute metrics AFTER backward() when no autodiff tensors exist.
+struct RawMinibatchValues<B: Backend> {
+    // From policy computation (needed for approx_kl, clip_fraction)
+    log_ratio: Tensor<B, 1>,
+    ratio: Tensor<B, 1>,
+    entropy: Tensor<B, 1>,
+
+    // From forward pass (needed for value_error stats)
+    values: Tensor<B, 1>,
+
+    // Targets passed through (needed for value_error computation)
+    returns: Tensor<B, 1>,
+}
+
+/// Scalar metrics extracted from a single minibatch update
 #[derive(Debug, Clone, Copy, Default)]
 struct MinibatchMetrics {
     policy_loss: f32,
@@ -1170,6 +1183,193 @@ pub struct UpdateMetrics {
     pub value_error_mean: f32,
     pub value_error_std: f32,
     pub value_error_max: f32,
+}
+
+/// Compute PPO loss with minimal autodiff scope
+///
+/// All intermediate autodiff tensors are dropped when this function returns.
+/// Only `loss` escapes as autodiff for backward pass.
+///
+/// Returns:
+/// - `loss`: Autodiff tensor for backward pass (0-dim scalar)
+/// - `policy_loss_scalar`: Policy loss value for metrics
+/// - `value_loss_scalar`: Value loss value for metrics
+/// - `raw`: Inner tensors for computing remaining metrics after backward
+#[expect(
+    clippy::too_many_arguments,
+    reason = "minibatch data requires many inputs"
+)]
+fn compute_minibatch_loss<B: burn::tensor::backend::AutodiffBackend>(
+    model: &ActorCritic<B>,
+    mb_obs: Tensor<B::InnerBackend, 2>,
+    mb_actions: Tensor<B::InnerBackend, 1, Int>,
+    mb_old_log_probs: Tensor<B::InnerBackend, 1>,
+    mb_advantages_normalized: Tensor<B::InnerBackend, 1>,
+    mb_returns: Tensor<B::InnerBackend, 1>,
+    mb_old_values: Tensor<B::InnerBackend, 1>,
+    mb_acting_players: Tensor<B::InnerBackend, 1, Int>,
+    mb_action_masks: Option<Tensor<B::InnerBackend, 2>>,
+    config: &Config,
+    entropy_coef: f64,
+    num_players: usize,
+) -> (
+    Tensor<B, 1>,                        // loss (autodiff) - scalar as 1D tensor
+    f32,                                 // policy_loss_scalar
+    f32,                                 // value_loss_scalar
+    RawMinibatchValues<B::InnerBackend>, // raw values for metrics
+)
+where
+    B::FloatElem: Into<f32>,
+{
+    // Forward pass (creates autodiff tensors)
+    let (logits, all_values) = model.forward(Tensor::from_inner(mb_obs));
+
+    // Extract acting player values
+    let mb_size = logits.dims()[0];
+    let values: Tensor<B, 1> = if num_players == 1 {
+        all_values.slice([0..mb_size, 0..1]).flatten(0, 1)
+    } else {
+        let indices_2d = mb_acting_players.unsqueeze_dim(1);
+        all_values
+            .gather(1, Tensor::from_inner(indices_2d))
+            .squeeze_dims(&[1])
+    };
+
+    // IMMEDIATELY extract inner for metrics (before loss uses it)
+    let values_inner = values.clone().inner();
+
+    // Apply action mask
+    let masked_logits = if let Some(mask) = mb_action_masks {
+        let mask_additive = (mask - 1.0) * 1e9;
+        logits + Tensor::from_inner(mask_additive)
+    } else {
+        logits
+    };
+
+    // Policy computations - extract inner IMMEDIATELY after each
+    let new_log_probs = log_prob_categorical(masked_logits.clone(), Tensor::from_inner(mb_actions));
+
+    let entropy = entropy_categorical(masked_logits);
+    let entropy_inner = entropy.clone().inner();
+
+    let log_ratio = new_log_probs - Tensor::from_inner(mb_old_log_probs);
+    let log_ratio_inner = log_ratio.clone().inner();
+
+    let ratio = log_ratio.exp();
+    let ratio_inner = ratio.clone().inner();
+
+    // Policy loss (clipped surrogate)
+    let neg_advantages: Tensor<B, 1> = Tensor::from_inner(-mb_advantages_normalized);
+    let policy_loss_1 = neg_advantages.clone() * ratio.clone();
+    let policy_loss_2 =
+        neg_advantages * ratio.clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
+    let policy_loss: Tensor<B, 1> = policy_loss_1.max_pair(policy_loss_2);
+    let policy_loss_mean = policy_loss.mean();
+
+    // Extract scalar BEFORE combining into total loss
+    let policy_loss_scalar: f32 = policy_loss_mean.clone().inner().into_scalar().into();
+
+    // Value loss
+    let value_loss = if config.clip_value {
+        let old_values: Tensor<B, 1> = Tensor::from_inner(mb_old_values);
+        let values_clipped = old_values.clone()
+            + (values.clone() - old_values).clamp(-config.clip_epsilon, config.clip_epsilon);
+        let value_loss_1 = (values - Tensor::from_inner(mb_returns.clone())).powf_scalar(2.0);
+        let value_loss_2 =
+            (values_clipped - Tensor::from_inner(mb_returns.clone())).powf_scalar(2.0);
+        value_loss_1.max_pair(value_loss_2).mean() * 0.5
+    } else {
+        (values - Tensor::from_inner(mb_returns.clone()))
+            .powf_scalar(2.0)
+            .mean()
+            * 0.5
+    };
+
+    // Extract scalar BEFORE combining into total loss
+    let value_loss_scalar: f32 = value_loss.clone().inner().into_scalar().into();
+
+    // Entropy bonus and combined loss
+    let entropy_loss = -entropy.mean() * entropy_coef;
+    let loss = policy_loss_mean + value_loss * config.value_coef + entropy_loss;
+
+    // Package raw values for metrics (all InnerBackend)
+    let raw = RawMinibatchValues {
+        log_ratio: log_ratio_inner,
+        ratio: ratio_inner,
+        entropy: entropy_inner,
+        values: values_inner,
+        returns: mb_returns,
+    };
+
+    // All intermediate autodiff tensors are DROPPED when this function returns.
+    // Only `loss` escapes as autodiff.
+    (loss, policy_loss_scalar, value_loss_scalar, raw)
+}
+
+/// Compute metrics from raw inner tensors (no autodiff)
+///
+/// Called AFTER backward() when no autodiff tensors exist.
+fn compute_minibatch_metrics<B: Backend>(
+    raw: RawMinibatchValues<B>,
+    // Pre-extracted scalars from loss computation
+    policy_loss: f32,
+    value_loss: f32,
+    total_loss: f32,
+    // Advantage stats (computed before normalization)
+    adv_mean_raw: f32,
+    adv_std_raw: f32,
+    adv_min_raw: f32,
+    adv_max_raw: f32,
+    clip_epsilon: f32,
+) -> MinibatchMetrics
+where
+    B::FloatElem: Into<f32>,
+{
+    // Approx KL: E[(ratio - 1) - log_ratio]
+    let approx_kl: f32 = ((raw.ratio.clone() - 1.0) - raw.log_ratio)
+        .mean()
+        .into_scalar()
+        .into();
+
+    // Clip fraction: fraction of samples where ratio was clipped
+    let clip_fraction: f32 = (raw.ratio - 1.0)
+        .abs()
+        .greater_elem(clip_epsilon)
+        .float()
+        .mean()
+        .into_scalar()
+        .into();
+
+    // Value error stats: |V(s) - returns|
+    let value_errors = (raw.values.clone() - raw.returns.clone()).abs();
+    let value_error_mean: f32 = value_errors.clone().mean().into_scalar().into();
+    let value_error_std: f32 = value_errors.clone().var(0).sqrt().into_scalar().into();
+    let value_error_max: f32 = value_errors.max().into_scalar().into();
+
+    // Entropy mean
+    let entropy: f32 = raw.entropy.mean().into_scalar().into();
+
+    // Value and returns means
+    let value_mean: f32 = raw.values.mean().into_scalar().into();
+    let returns_mean: f32 = raw.returns.mean().into_scalar().into();
+
+    MinibatchMetrics {
+        policy_loss,
+        value_loss,
+        entropy,
+        approx_kl,
+        clip_fraction,
+        total_loss,
+        value_mean,
+        returns_mean,
+        adv_mean_raw,
+        adv_std_raw,
+        adv_min_raw,
+        adv_max_raw,
+        value_error_mean,
+        value_error_std,
+        value_error_max,
+    }
 }
 
 /// Perform PPO update on collected rollouts
@@ -1339,179 +1539,90 @@ where
                 .as_ref()
                 .map(|masks| masks.clone().select(0, mb_indices_inner));
 
-            // Convert to autodiff for THIS minibatch only (fresh independent graph)
-            // Each minibatch's graph is independent and can be fully freed at loop end
-            let mb_obs: Tensor<B, 2> = Tensor::from_inner(mb_obs_inner);
-            let mb_actions: Tensor<B, 1, Int> = Tensor::from_inner(mb_actions_inner);
-            let mb_old_log_probs: Tensor<B, 1> = Tensor::from_inner(mb_old_log_probs_inner);
-            let mb_advantages_raw: Tensor<B, 1> = Tensor::from_inner(mb_advantages_inner);
-            let mb_returns: Tensor<B, 1> = Tensor::from_inner(mb_returns_inner);
-            let mb_acting_players: Tensor<B, 1, Int> = Tensor::from_inner(mb_acting_players_inner);
-            let mb_old_values: Tensor<B, 1> = Tensor::from_inner(mb_old_values_inner);
-
-            // Capture raw advantage stats as f32 scalars immediately (no autodiff overhead)
-            // Using .inner() avoids creating detached autodiff nodes that could leak
-            let mb_advantages_raw_inner = mb_advantages_raw.clone().inner();
-            let adv_mean_raw: f32 = mb_advantages_raw_inner.clone().mean().into_scalar().into();
-            let adv_std_raw: f32 = mb_advantages_raw_inner
+            // Capture raw advantage stats as f32 scalars (InnerBackend - no autodiff overhead)
+            let adv_mean_raw: f32 = mb_advantages_inner.clone().mean().into_scalar().into();
+            let adv_std_raw: f32 = mb_advantages_inner
                 .clone()
                 .var(0)
                 .sqrt()
                 .into_scalar()
                 .into();
-            let adv_min_raw: f32 = mb_advantages_raw_inner.clone().min().into_scalar().into();
-            let adv_max_raw: f32 = mb_advantages_raw_inner.max().into_scalar().into();
+            let adv_min_raw: f32 = mb_advantages_inner.clone().min().into_scalar().into();
+            let adv_max_raw: f32 = mb_advantages_inner.clone().max().into_scalar().into();
 
-            // Normalize advantages at minibatch level (critical for stability)
-            let mb_advantages = normalize_advantages(mb_advantages_raw);
+            // Normalize advantages at minibatch level (InnerBackend - no autodiff)
+            let mb_advantages_normalized =
+                normalize_advantages::<B::InnerBackend>(mb_advantages_inner);
 
-            // Forward pass with GPU sync for accurate timing
-            #[expect(clippy::let_and_return, reason = "scoped for profiling")]
-            let (logits, all_values) = {
-                profile_scope!("minibatch_forward");
-                let result = model.forward(mb_obs);
-                gpu_sync!(result.0); // Force sync to get accurate forward timing
-                result
+            // ═══════════════════════════════════════════════════════════════════
+            // PHASE 1: Loss computation (autodiff scope isolated in function)
+            // All intermediate autodiff tensors are dropped when function returns.
+            // ═══════════════════════════════════════════════════════════════════
+            let (loss, policy_loss_scalar, value_loss_scalar, raw_values) = {
+                profile_scope!("loss_computation");
+                let out = compute_minibatch_loss(
+                    &model,
+                    mb_obs_inner,
+                    mb_actions_inner,
+                    mb_old_log_probs_inner,
+                    mb_advantages_normalized,
+                    mb_returns_inner,
+                    mb_old_values_inner,
+                    mb_acting_players_inner,
+                    mb_action_masks_inner,
+                    config,
+                    entropy_coef,
+                    num_players,
+                );
+                #[cfg(feature = "tracy")]
+                B::sync(&device);
+                out
             };
+            // All intermediate autodiff tensors dropped!
+            // Only `loss` is autodiff now.
 
-            // Extract acting player's value for each sample in minibatch
-            let mb_size = logits.dims()[0];
-            let values: Tensor<B, 1> = if num_players == 1 {
-                // Single-player: just extract player 0
-                all_values.slice([0..mb_size, 0..1]).flatten(0, 1)
-            } else {
-                // Multi-player: extract acting player's value using gather (maintains autodiff)
-                // gather(dim, indices) selects elements along dim using per-element indices
-                let indices_2d = mb_acting_players.unsqueeze_dim(1); // [mb_size] -> [mb_size, 1]
-                all_values.gather(1, indices_2d).squeeze_dims(&[1]) // [mb_size, num_players] -> [mb_size]
-            };
+            // Extract total loss scalar before backward
+            let total_loss_scalar: f32 = loss.clone().inner().into_scalar().into();
 
-            // Compute losses, backward pass, and extract metrics immediately
-            //
-            // CRITICAL: Extract metrics as scalars immediately after backward() to free
-            // the autodiff graph. Returning autodiff tensors would retain the entire
-            // computation graph until they're consumed, causing memory accumulation.
-            let (grads, metrics) = {
-                profile_scope!("loss_and_backward");
-
-                // Apply action mask to logits (if present) to match rollout distribution
-                // Mask is stored as f32: 1.0 = valid, 0.0 = invalid
-                // Convert to: valid -> 0.0, invalid -> -1e9 (then add to logits)
-                let masked_logits = if let Some(ref mask_inner) = mb_action_masks_inner {
-                    let mask: Tensor<B, 2> = Tensor::from_inner(mask_inner.clone());
-                    // Convert: 1.0 -> 0.0, 0.0 -> -1e9
-                    // Formula: (mask - 1.0) * 1e9 gives: 1.0 -> 0.0, 0.0 -> -1e9
-                    let mask_additive = (mask - 1.0) * 1e9;
-                    logits + mask_additive
-                } else {
-                    logits
-                };
-
-                let new_log_probs = log_prob_categorical(masked_logits.clone(), mb_actions);
-                let entropy = entropy_categorical(masked_logits);
-
-                // Policy loss (clipped surrogate objective)
-                let log_ratio = new_log_probs.clone() - mb_old_log_probs;
-                let ratio = log_ratio.clone().exp();
-
-                // Capture inner versions for metrics BEFORE further loss computation
-                // These don't participate in autodiff, so they won't retain the graph
-                let ratio_inner = ratio.clone().inner();
-                let log_ratio_inner = log_ratio.inner();
-
-                let policy_loss_1 = -mb_advantages.clone() * ratio.clone();
-                let policy_loss_2 = -mb_advantages
-                    * ratio.clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon);
-                let policy_loss: Tensor<B, 1> = policy_loss_1.max_pair(policy_loss_2);
-                let policy_loss_mean = policy_loss.mean();
-
-                // Value loss (optionally clipped)
-                // Data is already filtered to learner turns only
-                let value_loss = if config.clip_value {
-                    let values_clipped = mb_old_values.clone()
-                        + (values.clone() - mb_old_values)
-                            .clamp(-config.clip_epsilon, config.clip_epsilon);
-                    let value_loss_1 = (values.clone() - mb_returns.clone()).powf_scalar(2.0);
-                    let value_loss_2 = (values_clipped - mb_returns.clone()).powf_scalar(2.0);
-                    value_loss_1.max_pair(value_loss_2).mean() * 0.5
-                } else {
-                    (values.clone() - mb_returns.clone())
-                        .powf_scalar(2.0)
-                        .mean()
-                        * 0.5
-                };
-
-                // Entropy bonus
-                let entropy_loss = -entropy.clone().mean() * entropy_coef;
-
-                // Combined loss
-                let loss = policy_loss_mean.clone()
-                    + value_loss.clone() * config.value_coef
-                    + entropy_loss;
-
-                // Value prediction error: |V(s) - actual_return|
-                // Extract as f32 scalars via .inner() to avoid autodiff overhead
-                let value_errors_inner = (values.clone() - mb_returns.clone()).abs().inner();
-                let value_error_mean: f32 = value_errors_inner.clone().mean().into_scalar().into();
-                let value_error_std: f32 = value_errors_inner
-                    .clone()
-                    .var(0)
-                    .sqrt()
-                    .into_scalar()
-                    .into();
-                let value_error_max: f32 = value_errors_inner.max().into_scalar().into();
-
-                // Capture values for metrics as f32 scalars (no autodiff overhead)
-                let values_mean: f32 = values.clone().inner().mean().into_scalar().into();
-                let returns_mean: f32 = mb_returns.clone().inner().mean().into_scalar().into();
-
-                // Backward pass
+            // ═══════════════════════════════════════════════════════════════════
+            // PHASE 2: Backward pass (consumes loss)
+            // ═══════════════════════════════════════════════════════════════════
+            let grads = {
+                profile_scope!("backward");
                 let grads = loss.backward();
+                #[cfg(feature = "tracy")]
+                B::sync(&device);
+                grads
+            };
+            // Now ZERO autodiff tensors exist!
 
-                // Extract ALL metrics as scalars immediately (frees autodiff graph)
-                // Using .inner().into_data() avoids creating intermediate tensors
-                let metrics = MinibatchMetrics {
-                    policy_loss: (-policy_loss_mean).inner().into_scalar().into(),
-                    value_loss: value_loss.inner().into_scalar().into(),
-                    entropy: entropy.inner().mean().into_scalar().into(),
-                    approx_kl: ((ratio_inner.clone() - 1.0) - log_ratio_inner)
-                        .mean()
-                        .into_scalar()
-                        .into(),
-                    clip_fraction: (ratio_inner - 1.0)
-                        .abs()
-                        .greater_elem(config.clip_epsilon)
-                        .float()
-                        .mean()
-                        .into_scalar()
-                        .into(),
-                    total_loss: loss.inner().into_scalar().into(),
-                    // These are already f32 scalars extracted earlier
-                    value_mean: values_mean,
-                    returns_mean,
+            // ═══════════════════════════════════════════════════════════════════
+            // PHASE 3: Compute metrics from inner tensors
+            // ═══════════════════════════════════════════════════════════════════
+            let metrics = {
+                profile_scope!("compute_metrics");
+                compute_minibatch_metrics(
+                    raw_values,
+                    policy_loss_scalar,
+                    value_loss_scalar,
+                    total_loss_scalar,
                     adv_mean_raw,
                     adv_std_raw,
                     adv_min_raw,
                     adv_max_raw,
-                    value_error_mean,
-                    value_error_std,
-                    value_error_max,
-                };
-
-                (grads, metrics)
+                    config.clip_epsilon as f32,
+                )
             };
 
-            // Optimizer step with GPU sync for accurate timing
-            {
-                model = {
-                    profile_scope!("optimizer_step");
-                    let grads = GradientsParams::from_grads(grads, &model);
-                    let updated = optimizer.step(learning_rate, model, grads);
-                    #[cfg(feature = "tracy")]
-                    updated.sync_optimize(); // Force sync after weight update
-                    updated
-                };
-            }
+            // Optimizer step
+            model = {
+                profile_scope!("optimizer_step");
+                let grads = GradientsParams::from_grads(grads, &model);
+                let updated = optimizer.step(learning_rate, model, grads);
+                #[cfg(feature = "tracy")]
+                B::sync(&device);
+                updated
+            };
 
             // Accumulate metrics from struct (scalars already extracted in loss_and_backward)
             {
@@ -1596,6 +1707,10 @@ where
         value_error_std: total_value_error_std / num_updates as f32,
         value_error_max: total_value_error_max,
     };
+
+    // Cleanup memory in hopes of avoiding any leaks.
+    B::sync(&device);
+    B::memory_cleanup(&device);
 
     (model, metrics)
 }
