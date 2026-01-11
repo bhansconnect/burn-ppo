@@ -1126,8 +1126,8 @@ pub fn compute_explained_variance(values: &[f32], returns: &[f32]) -> f32 {
 
 /// Raw tensor values extracted during loss computation for metrics
 ///
-/// All tensors are InnerBackend (no autodiff overhead).
-/// Used to compute metrics AFTER backward() when no autodiff tensors exist.
+/// All tensors are `InnerBackend` (no autodiff overhead).
+/// Used to compute metrics AFTER `backward()` when no autodiff tensors exist.
 struct RawMinibatchValues<B: Backend> {
     // From policy computation (needed for approx_kl, clip_fraction)
     log_ratio: Tensor<B, 1>,
@@ -1308,7 +1308,7 @@ where
 
 /// Compute metrics from raw inner tensors (no autodiff)
 ///
-/// Called AFTER backward() when no autodiff tensors exist.
+/// Called AFTER `backward()` when no autodiff tensors exist.
 fn compute_minibatch_metrics<B: Backend>(
     raw: RawMinibatchValues<B>,
     // Pre-extracted scalars from loss computation
