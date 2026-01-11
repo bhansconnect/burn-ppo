@@ -7,7 +7,7 @@
 #[cfg(all(feature = "tracy", feature = "tracy-callstack"))]
 #[global_allocator]
 static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
-    tracy_client::ProfiledAllocator::new(std::alloc::System, 10);
+    tracy_client::ProfiledAllocator::new(std::alloc::System, 20);
 
 #[cfg(all(feature = "tracy", not(feature = "tracy-callstack")))]
 #[global_allocator]
