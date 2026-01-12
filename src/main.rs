@@ -788,14 +788,15 @@ where
         #[cfg(feature = "stats_alloc")]
         {
             let stats = GLOBAL.stats();
-            let net_bytes = stats.bytes_allocated as i64 + stats.bytes_reallocated as i64 - stats.bytes_deallocated as i64;
+            let net_bytes = stats.bytes_allocated as i64 + stats.bytes_reallocated as i64
+                - stats.bytes_deallocated as i64;
             let delta_bytes = net_bytes - last_net_bytes;
             let delta_mb = delta_bytes as f64 / (1024.0 * 1024.0);
             let net_mb = net_bytes as f64 / (1024.0 * 1024.0);
-            eprintln!(
+            progress.eprintln(&format!(
                 "[mem] update {}: {:.2} MB (delta: {:+.2} MB)",
                 update, net_mb, delta_mb
-            );
+            ));
             last_net_bytes = net_bytes;
         }
 
