@@ -11,6 +11,11 @@
 )]
 #![recursion_limit = "256"]
 
+// Memory allocation tracking (enabled with --features stats_alloc)
+#[cfg(feature = "stats_alloc")]
+#[global_allocator]
+static GLOBAL: &stats_alloc::StatsAlloc<std::alloc::System> = &stats_alloc::INSTRUMENTED_SYSTEM;
+
 mod backend;
 mod checkpoint;
 mod config;
@@ -548,6 +553,14 @@ where
         None
     };
 
+    // Memory tracking for stats_alloc feature
+    // Track net memory = allocated + reallocated - deallocated (actual heap usage)
+    #[cfg(feature = "stats_alloc")]
+    let mut last_net_bytes: i64 = {
+        let s = GLOBAL.stats();
+        s.bytes_allocated as i64 + s.bytes_reallocated as i64 - s.bytes_deallocated as i64
+    };
+
     // Training loop
     for update in 0..num_updates {
         profile::profile_scope!("training_update");
@@ -769,6 +782,22 @@ where
         update_time_acc += update_start.elapsed();
         model = updated_model;
         last_metrics = Some(metrics.clone());
+
+        // Log memory stats (when stats_alloc feature enabled)
+        // Net memory = allocated + reallocated - deallocated (actual heap usage)
+        #[cfg(feature = "stats_alloc")]
+        {
+            let stats = GLOBAL.stats();
+            let net_bytes = stats.bytes_allocated as i64 + stats.bytes_reallocated as i64 - stats.bytes_deallocated as i64;
+            let delta_bytes = net_bytes - last_net_bytes;
+            let delta_mb = delta_bytes as f64 / (1024.0 * 1024.0);
+            let net_mb = net_bytes as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "[mem] update {}: {:.2} MB (delta: {:+.2} MB)",
+                update, net_mb, delta_mb
+            );
+            last_net_bytes = net_bytes;
+        }
 
         // Record entropy for adaptive controller (used in next iteration)
         if let Some(ref mut controller) = entropy_controller {

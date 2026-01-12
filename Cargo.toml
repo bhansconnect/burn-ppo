@@ -11,6 +11,7 @@ metal = ["burn/metal"]
 wgpu = ["burn/wgpu"]
 tracy = ["tracy-client"]
 tracy-callstack = ["tracy"]
+stats_alloc = ["dep:stats_alloc"]
 
 [dependencies]
 # ML framework - base features, backend selected via features above
@@ -42,6 +43,9 @@ plotters = "0.3"
 
 # Profiling (Tracy integration, only our code - not dependencies)
 tracy-client = { version = "0.18", optional = true }
+
+# Memory allocation tracking
+stats_alloc = { version = "0.1", optional = true }
 itertools = "0.14.0"
 
 [dev-dependencies]
