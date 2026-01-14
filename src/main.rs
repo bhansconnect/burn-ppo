@@ -237,7 +237,14 @@ where
         )));
 
     // Initialize model and optimizer based on mode
-    let (mut model, mut optimizer, mut global_step, mut recent_returns, best_return) = match mode {
+    let (
+        mut model,
+        mut optimizer,
+        mut global_step,
+        mut recent_returns,
+        best_return,
+        initial_avg_return,
+    ) = match mode {
         TrainingMode::Fresh => {
             let model: ActorCritic<TB> = ActorCritic::new(
                 obs_dim,
@@ -251,7 +258,7 @@ where
             if !quiet {
                 println!("Created {} ActorCritic network", config.network_type);
             }
-            (model, optimizer, 0, Vec::new(), f32::NEG_INFINITY)
+            (model, optimizer, 0, Vec::new(), f32::NEG_INFINITY, None)
         }
         TrainingMode::Resume { checkpoint_dir, .. } | TrainingMode::Fork { checkpoint_dir } => {
             let metadata = resumed_metadata.expect("resumed_metadata required for Resume/Fork");
@@ -340,15 +347,20 @@ where
             let step = metadata.step;
             let recent_returns = metadata.recent_returns.clone();
             let best_return = metadata.best_avg_return.unwrap_or(f32::NEG_INFINITY);
+            let avg_return = metadata.avg_return;
 
             if !quiet {
-                println!(
-                    "Loaded checkpoint from step {} (avg return: {:.1})",
-                    step, metadata.avg_return
-                );
+                println!("Loaded checkpoint from step {step} (avg return: {avg_return:.1})");
             }
 
-            (model, optimizer, step, recent_returns, best_return)
+            (
+                model,
+                optimizer,
+                step,
+                recent_returns,
+                best_return,
+                Some(avg_return),
+            )
         }
     };
 
@@ -442,7 +454,11 @@ where
         num_players as usize,
         elapsed_offset,
         global_step as u64, // Start at resumed position to avoid flash to 0
+        initial_avg_return, // Pass checkpoint avg_return for immediate display on resume
     );
+
+    // Track initial step to detect if we actually trained (for completion logic)
+    let initial_global_step = global_step;
 
     // Timing for SPS calculation
     let training_start = std::time::Instant::now();
@@ -1485,10 +1501,11 @@ where
     }
 
     // Finish progress bar appropriately based on exit reason
+    let did_train = global_step > initial_global_step;
     if exited_for_reload {
         // Subprocess reload exit: finish quietly without completion messages
         progress.finish_quiet();
-    } else if running.load(Ordering::SeqCst) {
+    } else if running.load(Ordering::SeqCst) && did_train {
         // Natural completion: show full completion output
         progress.finish();
         println!("---");
@@ -1497,6 +1514,9 @@ where
             let avg_return: f32 = recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
             println!("Final average return (last 100 episodes): {avg_return:.1}");
         }
+    } else if running.load(Ordering::SeqCst) {
+        // Spawned at goal, didn't train - remove the bar completely to avoid stray lines
+        progress.finish_and_clear();
     } else {
         // User interrupt: show interrupted status
         progress.finish_interrupted();
