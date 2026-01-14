@@ -31,6 +31,7 @@ mod opponent_pool;
 mod ppo;
 mod profile;
 mod progress;
+mod supervisor;
 mod tournament;
 mod utils;
 
@@ -165,6 +166,8 @@ fn run_training<TB, E, F>(
     resumed_metadata: Option<&CheckpointMetadata>,
     device: &TB::Device,
     running: &Arc<AtomicBool>,
+    elapsed_time_offset_ms: u64,
+    max_checkpoints_this_run: usize,
     env_factory: F,
 ) -> Result<()>
 where
@@ -408,9 +411,13 @@ where
     }
     println!("---");
 
-    // Progress bar (with multiplayer support)
-    let progress =
-        TrainingProgress::new_with_players(config.total_timesteps as u64, num_players as usize);
+    // Progress bar (with multiplayer support and elapsed time offset for subprocess reloads)
+    let elapsed_offset = std::time::Duration::from_millis(elapsed_time_offset_ms);
+    let progress = TrainingProgress::new_with_offset(
+        config.total_timesteps as u64,
+        num_players as usize,
+        elapsed_offset,
+    );
 
     // Timing for SPS calculation
     let training_start = std::time::Instant::now();
@@ -434,6 +441,9 @@ where
 
     // Episode tracking for checkpoint selection (cleared on each checkpoint)
     let mut episodes_since_checkpoint: Vec<f32> = Vec::new();
+
+    // Checkpoint counter for subprocess reload mode (tracks saves in this process)
+    let mut checkpoints_saved_this_run: usize = 0;
 
     // Multiplayer tracking (only used when num_players > 1)
     let num_players_usize = num_players as usize;
@@ -1302,6 +1312,18 @@ where
 
             last_checkpoint_step = global_step;
             episodes_since_checkpoint.clear();
+
+            // Track checkpoints saved for subprocess reload mode
+            checkpoints_saved_this_run += 1;
+            if max_checkpoints_this_run > 0
+                && checkpoints_saved_this_run >= max_checkpoints_this_run
+            {
+                progress.println(&format!(
+                    "Reached checkpoint limit ({}) for this subprocess, exiting for reload",
+                    max_checkpoints_this_run
+                ));
+                break;
+            }
         }
 
         profile::profile_frame!();
@@ -1506,7 +1528,89 @@ fn main() -> Result<()> {
     }
 }
 
+/// Run training in supervisor mode, managing subprocess lifecycle
+///
+/// This is used when `--reload-every-n-checkpoints` is set to combat memory leaks
+/// by periodically restarting the training subprocess.
+fn run_as_supervisor(args: &CliArgs) -> Result<()> {
+    use crate::supervisor::TrainingSupervisor;
+
+    // Set up graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc_handler(r);
+
+    // Create supervisor based on mode (resume vs fresh)
+    let mut supervisor = if let Some(ref resume_path) = args.resume {
+        // Resume mode: use existing run directory
+        let run_dir = resume_path.clone();
+        let config_path = run_dir.join("config.toml");
+        let mut config = Config::load_from_path(&config_path)
+            .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+        config.apply_resume_overrides(args);
+
+        println!("burn-ppo v{} (supervisor mode)", env!("CARGO_PKG_VERSION"));
+        println!(
+            "Run: {}",
+            run_dir.file_name().unwrap_or_default().to_string_lossy()
+        );
+        println!(
+            "Reloading subprocess every {} checkpoints",
+            args.reload_every_n_checkpoints
+        );
+
+        TrainingSupervisor::new_resume(
+            run_dir,
+            args.reload_every_n_checkpoints,
+            config.total_timesteps,
+            args.total_timesteps,
+            args.max_training_time.clone(),
+            running,
+        )
+    } else {
+        // Fresh run: load config to get run name, but let child create the directory
+        let config = Config::load(args, None)?;
+        config.validate()?;
+
+        let run_dir = config.run_path();
+        let run_name = config
+            .run_name
+            .clone()
+            .expect("run_name should be set during Config::load()");
+
+        // Check if run directory already exists
+        if !check_run_exists_and_prompt(&run_dir)? {
+            return Ok(());
+        }
+
+        println!("burn-ppo v{} (supervisor mode)", env!("CARGO_PKG_VERSION"));
+        println!("Run: {}", run_name);
+        println!(
+            "Reloading subprocess every {} checkpoints",
+            args.reload_every_n_checkpoints
+        );
+
+        TrainingSupervisor::new_fresh(
+            run_dir,
+            args.reload_every_n_checkpoints,
+            config.total_timesteps,
+            args.total_timesteps,
+            args.max_training_time.clone(),
+            running,
+            args.config.clone(),
+            run_name,
+        )
+    };
+
+    supervisor.run()
+}
+
 fn run_training_cli(args: &CliArgs) -> Result<()> {
+    // If reload is requested and this is NOT already a subprocess, become supervisor
+    if args.reload_every_n_checkpoints > 0 && args.max_checkpoints_this_run == 0 {
+        return run_as_supervisor(args);
+    }
+
     // Determine training mode
     let mode = if let Some(resume_path) = &args.resume {
         // Resume mode: continue existing run
@@ -1654,6 +1758,8 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
 
     // Dispatch to backend and environment
     // Full static dispatch for both backend and environment types
+    let elapsed_time_offset_ms = args.elapsed_time_offset_ms;
+    let max_checkpoints_this_run = args.max_checkpoints_this_run;
     dispatch_backend!(backend_name, device, {
         let seed = config.seed;
         match config.env.as_str() {
@@ -1664,6 +1770,8 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                 resumed_metadata.as_ref(),
                 &device,
                 &running,
+                elapsed_time_offset_ms,
+                max_checkpoints_this_run,
                 move |i| CartPole::new(seed + i as u64),
             ),
             "connect_four" => run_training::<TB, ConnectFour, _>(
@@ -1673,6 +1781,8 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                 resumed_metadata.as_ref(),
                 &device,
                 &running,
+                elapsed_time_offset_ms,
+                max_checkpoints_this_run,
                 move |i| ConnectFour::new(seed + i as u64),
             ),
             "liars_dice" => {
@@ -1684,6 +1794,8 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                     resumed_metadata.as_ref(),
                     &device,
                     &running,
+                    elapsed_time_offset_ms,
+                    max_checkpoints_this_run,
                     move |i| LiarsDice::new_with_config(seed + i as u64, reward_shaping_coef),
                 )
             }

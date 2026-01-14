@@ -2,17 +2,28 @@
 ///
 /// Uses indicatif for progress display with ETA and metrics.
 use indicatif::{ProgressBar, ProgressStyle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Training progress display
 pub struct TrainingProgress {
     main_bar: ProgressBar,
     start_time: Instant,
+    /// Elapsed time offset from previous subprocess runs (for reload mode)
+    elapsed_offset: Duration,
 }
 
 impl TrainingProgress {
     /// Create progress display with player count for multiplayer games
+    #[cfg(test)]
     pub fn new_with_players(total_steps: u64, num_players: usize) -> Self {
+        Self::new_with_offset(total_steps, num_players, Duration::ZERO)
+    }
+
+    /// Create progress display with elapsed time offset from previous subprocess runs
+    ///
+    /// Used when training is restarted via `--reload-every-n-checkpoints` to maintain
+    /// accurate SPS calculations across subprocess boundaries.
+    pub fn new_with_offset(total_steps: u64, num_players: usize, elapsed_offset: Duration) -> Self {
         let main_bar = ProgressBar::new(total_steps);
 
         // Use slightly shorter bar for multiplayer to fit more info
@@ -32,15 +43,21 @@ impl TrainingProgress {
         Self {
             main_bar,
             start_time: Instant::now(),
+            elapsed_offset,
         }
+    }
+
+    /// Total elapsed time including offset from previous subprocess runs
+    fn total_elapsed(&self) -> Duration {
+        self.elapsed_offset + self.start_time.elapsed()
     }
 
     /// Update the main progress bar (single-player format)
     pub fn update(&self, step: u64, avg_return: f32) {
         self.main_bar.set_position(step);
 
-        // Calculate SPS
-        let elapsed = self.start_time.elapsed().as_secs_f32();
+        // Calculate SPS using total elapsed time (including offset from previous runs)
+        let elapsed = self.total_elapsed().as_secs_f32();
         let sps = if elapsed > 0.0 {
             step as f32 / elapsed
         } else {
@@ -64,7 +81,8 @@ impl TrainingProgress {
     ) {
         self.main_bar.set_position(step);
 
-        let elapsed = self.start_time.elapsed().as_secs_f32();
+        // Calculate SPS using total elapsed time (including offset from previous runs)
+        let elapsed = self.total_elapsed().as_secs_f32();
         let sps = if elapsed > 0.0 {
             step as f32 / elapsed
         } else {

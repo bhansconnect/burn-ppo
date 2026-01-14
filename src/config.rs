@@ -94,6 +94,21 @@ pub struct TrainArgs {
     #[arg(long)]
     pub max_training_time: Option<String>,
 
+    /// Reload subprocess every N checkpoint saves to combat memory leaks.
+    /// When set >0, training runs in a subprocess that restarts every N checkpoints.
+    #[arg(long, default_value = "10")]
+    pub reload_every_n_checkpoints: usize,
+
+    /// [Internal] Elapsed time offset in milliseconds from parent process.
+    /// Used for accurate progress bar ETA when running as reloaded subprocess.
+    #[arg(long, hide = true, default_value = "0")]
+    pub elapsed_time_offset_ms: u64,
+
+    /// [Internal] Max checkpoints to save before exiting (for reload mode).
+    /// When >0, training exits after saving this many checkpoints.
+    #[arg(long, hide = true, default_value = "0")]
+    pub max_checkpoints_this_run: usize,
+
     #[arg(long, help = "Random seed (default: 42)")]
     pub seed: Option<u64>,
 

@@ -1204,3 +1204,172 @@ opponent_pool_eval_games = 8
 // ============================================================================
 // Tournament Tests
 // ============================================================================
+
+// ============================================================================
+// Subprocess Reload Tests
+// ============================================================================
+
+#[test]
+fn test_reload_every_n_checkpoints() {
+    let dir = tempdir().unwrap();
+
+    // Create config for cartpole with small checkpoint_freq
+    let config_content = format!(
+        r#"
+env = "cartpole"
+num_envs = 2
+num_steps = 8
+total_timesteps = 128
+num_epochs = 1
+num_minibatches = 1
+hidden_size = 8
+num_hidden = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 32
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("reload_config.toml");
+    fs::write(&config_path, config_content).unwrap();
+
+    // Run with reload every 2 checkpoints
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--reload-every-n-checkpoints",
+            "2",
+        ])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "Training with reload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify checkpoints were created
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let checkpoints = run_dir.join("checkpoints");
+    assert!(checkpoints.exists(), "Checkpoints directory should exist");
+
+    // Verify latest symlink exists
+    let latest = checkpoints.join("latest");
+    assert!(latest.exists(), "Latest checkpoint symlink should exist");
+
+    // Verify supervisor messages appeared
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("supervisor mode") || stderr.contains("Supervisor:"),
+        "Should run in supervisor mode"
+    );
+}
+
+#[test]
+fn test_reload_resume_with_extended_timesteps() {
+    let dir = tempdir().unwrap();
+
+    // Phase 1: Initial training with reload
+    let config_content = format!(
+        r#"
+env = "cartpole"
+num_envs = 2
+num_steps = 8
+total_timesteps = 64
+num_epochs = 1
+num_minibatches = 1
+hidden_size = 8
+num_hidden = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 32
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("reload_resume_config.toml");
+    fs::write(&config_path, &config_content).unwrap();
+
+    // Run initial training with reload every 2 checkpoints
+    let output1 = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--reload-every-n-checkpoints",
+            "1",
+        ])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output1.status.success(),
+        "Initial training failed: {}",
+        String::from_utf8_lossy(&output1.stderr)
+    );
+
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let run_dir_str = run_dir.to_str().unwrap();
+
+    // Read initial checkpoint step
+    let latest_meta_path = run_dir.join("checkpoints/latest/metadata.json");
+    let initial_metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&latest_meta_path).unwrap()).unwrap();
+    let initial_step = initial_metadata["step"].as_u64().unwrap();
+
+    // Phase 2: Resume with extended timesteps (also using reload mode)
+    let output2 = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args([
+            "train",
+            "--resume",
+            run_dir_str,
+            "--total-timesteps",
+            "128",
+            "--reload-every-n-checkpoints",
+            "1",
+        ])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output2.status.success(),
+        "Resume with extended timesteps failed: {}",
+        String::from_utf8_lossy(&output2.stderr)
+    );
+
+    // Verify checkpoint step increased
+    let final_metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&latest_meta_path).unwrap()).unwrap();
+    let final_step = final_metadata["step"].as_u64().unwrap();
+
+    assert!(
+        final_step > initial_step,
+        "Final step ({}) should be greater than initial step ({})",
+        final_step,
+        initial_step
+    );
+}
