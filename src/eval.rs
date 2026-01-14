@@ -598,11 +598,12 @@ impl EvalStats {
             })
             .collect();
 
-        let ratings = plackett_luce::compute_ratings(
+        let rating_result = plackett_luce::compute_ratings(
             num_checkpoints,
             &pl_games,
             &PlackettLuceConfig::default(),
         );
+        let ratings = &rating_result.ratings;
 
         // Find strongest checkpoint
         let (strongest_idx, _) = ratings
@@ -614,6 +615,18 @@ impl EvalStats {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .unwrap_or((0, &ratings[0]));
+
+        // Display computation statistics
+        let stats = &rating_result.stats;
+        let converge_status = if stats.converged {
+            "converged"
+        } else {
+            "did not converge"
+        };
+        println!(
+            "\nRating computation: {} in {} iterations ({:.1}ms), final delta: {:.2e}",
+            converge_status, stats.iterations_used, stats.computation_time_ms, stats.final_delta
+        );
 
         plackett_luce::print_rating_guide();
         println!("\nRatings:");

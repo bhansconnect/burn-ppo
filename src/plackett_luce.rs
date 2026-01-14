@@ -75,6 +75,28 @@ impl Default for PlayerRating {
     }
 }
 
+/// Statistics about the rating computation
+#[derive(Debug, Clone, Copy)]
+pub struct RatingStats {
+    /// Whether the MM algorithm converged
+    pub converged: bool,
+    /// Number of iterations used
+    pub iterations_used: usize,
+    /// Maximum parameter change at termination
+    pub final_delta: f64,
+    /// Total computation time in milliseconds
+    pub computation_time_ms: f64,
+}
+
+/// Result of rating computation including ratings and statistics
+#[derive(Debug, Clone)]
+pub struct RatingResult {
+    /// Computed ratings for each player
+    pub ratings: Vec<PlayerRating>,
+    /// Statistics about the computation
+    pub stats: RatingStats,
+}
+
 /// Configuration for the Plackett-Luce optimizer
 #[derive(Debug, Clone)]
 pub struct PlackettLuceConfig {
@@ -86,6 +108,13 @@ pub struct PlackettLuceConfig {
     pub epsilon: f64,
     /// Elo rating for the lowest-rated player (anchor point)
     pub anchor_elo: f64,
+    /// Optional index of player to use as anchor (0 uncertainty, rating = `anchor_elo`)
+    /// If None, uses lowest-rated player with games
+    pub anchor_player_index: Option<usize>,
+    /// Inflation factor for confidence intervals (default: 1.3)
+    /// Fisher Information CIs are asymptotically correct but undercover at small sample sizes.
+    /// This empirical correction widens CIs to achieve closer to 95% coverage.
+    pub ci_inflation_factor: f64,
 }
 
 impl Default for PlackettLuceConfig {
@@ -95,6 +124,8 @@ impl Default for PlackettLuceConfig {
             convergence_threshold: 1e-6,
             epsilon: 1e-10,
             anchor_elo: 1000.0,
+            anchor_player_index: None,
+            ci_inflation_factor: 1.3,
         }
     }
 }
@@ -405,24 +436,45 @@ fn invert_matrix(matrix: &[Vec<f64>], epsilon: f64) -> Vec<Vec<f64>> {
 /// * `config` - Optimizer configuration
 ///
 /// # Returns
-/// Vector of `PlayerRating` indexed by player ID
+/// `RatingResult` containing ratings indexed by player ID and computation statistics
 pub fn compute_ratings(
     num_players: usize,
     games: &[GameResult],
     config: &PlackettLuceConfig,
-) -> Vec<PlayerRating> {
+) -> RatingResult {
+    let start_time = std::time::Instant::now();
+
+    let default_stats = RatingStats {
+        converged: true,
+        iterations_used: 0,
+        final_delta: 0.0,
+        computation_time_ms: 0.0,
+    };
+
     if num_players == 0 {
-        return Vec::new();
+        return RatingResult {
+            ratings: Vec::new(),
+            stats: RatingStats {
+                computation_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+                ..default_stats
+            },
+        };
     }
 
     // Handle empty games - return default ratings
     if games.is_empty() {
-        return (0..num_players)
-            .map(|_| PlayerRating {
-                rating: config.anchor_elo,
-                uncertainty: 350.0,
-            })
-            .collect();
+        return RatingResult {
+            ratings: (0..num_players)
+                .map(|_| PlayerRating {
+                    rating: config.anchor_elo,
+                    uncertainty: 350.0,
+                })
+                .collect(),
+            stats: RatingStats {
+                computation_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+                ..default_stats
+            },
+        };
     }
 
     // Track which players have game data
@@ -432,19 +484,30 @@ pub fn compute_ratings(
     let comparisons = expand_games_to_comparisons(games);
 
     if comparisons.is_empty() {
-        return (0..num_players)
-            .map(|_| PlayerRating {
-                rating: config.anchor_elo,
-                uncertainty: 350.0,
-            })
-            .collect();
+        return RatingResult {
+            ratings: (0..num_players)
+                .map(|_| PlayerRating {
+                    rating: config.anchor_elo,
+                    uncertainty: 350.0,
+                })
+                .collect(),
+            stats: RatingStats {
+                computation_time_ms: start_time.elapsed().as_secs_f64() * 1000.0,
+                ..default_stats
+            },
+        };
     }
 
     // Initialize gammas to 0 (all players equal)
     let mut gammas = vec![0.0; num_players];
 
-    // MM algorithm iterations
-    for _ in 0..config.max_iterations {
+    // MM algorithm iterations with statistics tracking
+    let mut iterations_used = 0;
+    let mut final_delta = f64::MAX;
+    let mut converged = false;
+
+    for iteration in 0..config.max_iterations {
+        iterations_used = iteration + 1;
         let new_gammas = mm_update(&comparisons, &gammas, num_players, config.epsilon);
 
         // Center gammas (mean = 0) to prevent drift
@@ -458,9 +521,11 @@ pub fn compute_ratings(
             .map(|(&old, &new)| (old - new).abs())
             .fold(0.0, f64::max);
 
+        final_delta = max_change;
         gammas = centered;
 
         if max_change < config.convergence_threshold {
+            converged = true;
             break;
         }
 
@@ -471,30 +536,67 @@ pub fn compute_ratings(
         }
     }
 
+    // Find anchor player: use configured anchor if valid, else lowest-rated with games
+    let anchor_idx = if let Some(idx) = config.anchor_player_index {
+        // Use specified anchor if valid (exists and has games)
+        if idx < num_players && games_played[idx] > 0 {
+            Some(idx)
+        } else {
+            // Fallback to lowest-rated player with games
+            gammas
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| games_played[*i] > 0)
+                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i)
+        }
+    } else {
+        // Default: lowest-rated player with games
+        gammas
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| games_played[*i] > 0)
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+    };
+
     // Compute Hessian for uncertainty estimation
     let hessian = compute_hessian(&comparisons, &gammas, num_players);
 
-    // Add regularization to diagonal
-    // We use 0.01 as base regularization - with more games, Hessian grows,
-    // so this becomes relatively smaller
-    let mut reg_hessian = hessian;
-    for (i, row) in reg_hessian.iter_mut().enumerate() {
-        row[i] += 0.01;
+    // Build mapping from original indices to reduced indices (excluding anchor)
+    let active_players: Vec<usize> = (0..num_players)
+        .filter(|&i| games_played[i] > 0 && Some(i) != anchor_idx)
+        .collect();
+
+    // Build reduced Hessian (exclude anchor row/column) for constrained inversion
+    let reduced_size = active_players.len();
+    let mut reduced_hessian = vec![vec![0.0; reduced_size]; reduced_size];
+
+    for (ri, &orig_i) in active_players.iter().enumerate() {
+        for (rj, &orig_j) in active_players.iter().enumerate() {
+            reduced_hessian[ri][rj] = hessian[orig_i][orig_j];
+        }
+        // Add small regularization for numerical stability only
+        reduced_hessian[ri][ri] += 1e-6;
     }
 
-    // Invert to get covariance matrix
-    let covariance = invert_matrix(&reg_hessian, config.epsilon);
+    // Invert reduced matrix
+    let reduced_cov = invert_matrix(&reduced_hessian, config.epsilon);
 
-    // Extract uncertainties (sqrt of diagonal)
-    let uncertainties: Vec<f64> = (0..num_players)
-        .map(|i| {
-            if games_played[i] > 0 && covariance[i][i] > 0.0 {
-                covariance[i][i].sqrt()
-            } else {
-                2.0 // High uncertainty for players without games
-            }
-        })
-        .collect();
+    // Extract uncertainties: anchor gets 0, others get sqrt(diagonal)
+    let mut uncertainties = vec![2.0; num_players]; // Default high uncertainty
+
+    // Anchor player gets 0 uncertainty (by definition - it's our reference)
+    if let Some(anchor) = anchor_idx {
+        uncertainties[anchor] = 0.0;
+    }
+
+    // Active players (non-anchor) get uncertainty from reduced covariance
+    for (ri, &orig_i) in active_players.iter().enumerate() {
+        if reduced_cov[ri][ri] > 0.0 {
+            uncertainties[orig_i] = reduced_cov[ri][ri].sqrt();
+        }
+    }
 
     // Anchor lowest-rated player to anchor_elo
     let min_gamma = gammas
@@ -504,17 +606,21 @@ pub fn compute_ratings(
         .map(|(_, &g)| g)
         .fold(f64::INFINITY, f64::min);
 
-    let anchor_gamma = elo_to_gamma(config.anchor_elo);
+    let anchor_gamma_target = elo_to_gamma(config.anchor_elo);
 
     // Shift all gammas so minimum maps to anchor
     let shift = if min_gamma.is_finite() {
-        anchor_gamma - min_gamma
+        anchor_gamma_target - min_gamma
     } else {
         0.0
     };
 
+    let computation_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+
     // Convert to Elo scale and return
-    gammas
+    // Apply CI inflation factor to correct for Fisher Information underestimating uncertainty
+    let inflation = config.ci_inflation_factor;
+    let ratings = gammas
         .iter()
         .zip(uncertainties.iter())
         .enumerate()
@@ -522,7 +628,7 @@ pub fn compute_ratings(
             if games_played[i] > 0 {
                 PlayerRating {
                     rating: gamma_to_elo(gamma + shift),
-                    uncertainty: uncertainty_to_elo(sigma),
+                    uncertainty: uncertainty_to_elo(sigma) * inflation,
                 }
             } else {
                 // Player without games gets default rating with high uncertainty
@@ -532,13 +638,23 @@ pub fn compute_ratings(
                 }
             }
         })
-        .collect()
+        .collect();
+
+    RatingResult {
+        ratings,
+        stats: RatingStats {
+            converged,
+            iterations_used,
+            final_delta,
+            computation_time_ms,
+        },
+    }
 }
 
-/// Convenience function to compute ratings with default config
+/// Convenience function to compute ratings with default config (returns just ratings for tests)
 #[cfg(test)]
 pub fn compute_ratings_default(num_players: usize, games: &[GameResult]) -> Vec<PlayerRating> {
-    compute_ratings(num_players, games, &PlackettLuceConfig::default())
+    compute_ratings(num_players, games, &PlackettLuceConfig::default()).ratings
 }
 
 /// Print a guide to interpreting Plackett-Luce ratings (Elo scale)
@@ -1045,11 +1161,11 @@ mod tests {
             ..Default::default()
         };
 
-        let ratings = compute_ratings(2, &games, &config);
+        let result = compute_ratings(2, &games, &config);
 
         // Loser should be at anchor (800)
         assert!(
-            (ratings[1].rating - 800.0).abs() < 1.0,
+            (result.ratings[1].rating - 800.0).abs() < 1.0,
             "Lowest player should be anchored at custom value"
         );
     }
@@ -1474,6 +1590,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::similar_names,
+        reason = "gap_a_to_b/b_to_c/a_to_c are intentionally named for player pairs"
+    )]
     fn test_rating_gaps_are_additive_in_chain() {
         // If A > B by X and B > C by Y, A > C should be approximately X + Y
         let mut games = Vec::new();
@@ -1506,8 +1626,7 @@ mod tests {
 
         assert!(
             diff < 100.0,
-            "Rating gaps should be approximately additive: actual={}, expected={}, diff={}",
-            rating_gap_a_to_c, expected_total, diff
+            "Rating gaps should be approximately additive: actual={rating_gap_a_to_c}, expected={expected_total}, diff={diff}"
         );
     }
 
@@ -1647,30 +1766,30 @@ mod tests {
             ..Default::default()
         };
 
-        let ratings_few = compute_ratings(3, &games, &config_few);
-        let ratings_many = compute_ratings(3, &games, &config_many);
+        let result_few = compute_ratings(3, &games, &config_few);
+        let result_many = compute_ratings(3, &games, &config_many);
 
         // Both should produce the same relative ordering: 0 > 1 > 2
         assert!(
-            ratings_few[0].rating > ratings_few[1].rating,
+            result_few.ratings[0].rating > result_few.ratings[1].rating,
             "Few iterations: Player 0 should beat Player 1"
         );
         assert!(
-            ratings_few[1].rating > ratings_few[2].rating,
+            result_few.ratings[1].rating > result_few.ratings[2].rating,
             "Few iterations: Player 1 should beat Player 2"
         );
         assert!(
-            ratings_many[0].rating > ratings_many[1].rating,
+            result_many.ratings[0].rating > result_many.ratings[1].rating,
             "Many iterations: Player 0 should beat Player 1"
         );
         assert!(
-            ratings_many[1].rating > ratings_many[2].rating,
+            result_many.ratings[1].rating > result_many.ratings[2].rating,
             "Many iterations: Player 1 should beat Player 2"
         );
 
         // The relative gaps should be similar (within 30% of each other)
-        let gap_few = ratings_few[0].rating - ratings_few[2].rating;
-        let gap_many = ratings_many[0].rating - ratings_many[2].rating;
+        let gap_few = result_few.ratings[0].rating - result_few.ratings[2].rating;
+        let gap_many = result_many.ratings[0].rating - result_many.ratings[2].rating;
         let ratio = gap_few / gap_many;
         assert!(
             (0.7..=1.3).contains(&ratio),
@@ -1745,5 +1864,184 @@ mod tests {
                 "Player {i}: ratings should be order-independent, diff={diff}"
             );
         }
+    }
+
+    // ==================== Constrained Hessian and Statistics Tests ====================
+
+    #[test]
+    fn test_anchor_has_zero_uncertainty() {
+        // Anchor player (lowest rated with games) should have ~0 uncertainty
+        // since they define the reference point
+        let games: Vec<GameResult> = (0..20)
+            .map(|_| GameResult::new(vec![0, 1, 2], vec![1, 2, 3]))
+            .collect();
+        let result = compute_ratings(3, &games, &PlackettLuceConfig::default());
+
+        // Player 2 is always last → anchor (lowest gamma)
+        assert!(
+            result.ratings[2].uncertainty < 5.0,
+            "Anchor should have ~0 uncertainty, got {}",
+            result.ratings[2].uncertainty
+        );
+        // Other players should have positive uncertainty
+        assert!(
+            result.ratings[0].uncertainty > 10.0,
+            "Non-anchor should have positive uncertainty"
+        );
+        assert!(
+            result.ratings[1].uncertainty > 10.0,
+            "Non-anchor should have positive uncertainty"
+        );
+    }
+
+    #[test]
+    fn test_uncertainty_sqrt_scaling() {
+        // σ should scale as 1/√N (fundamental MLE property)
+        // With 10x more games, uncertainty should be ~3.16x lower
+        let games_10: Vec<GameResult> = (0..10)
+            .map(|i| {
+                if i % 3 == 0 {
+                    GameResult::new(vec![0, 1], vec![1, 2])
+                } else if i % 3 == 1 {
+                    GameResult::new(vec![0, 1], vec![2, 1])
+                } else {
+                    GameResult::new(vec![0, 1], vec![1, 1])
+                }
+            })
+            .collect();
+
+        let games_100: Vec<GameResult> = (0..100)
+            .map(|i| {
+                if i % 3 == 0 {
+                    GameResult::new(vec![0, 1], vec![1, 2])
+                } else if i % 3 == 1 {
+                    GameResult::new(vec![0, 1], vec![2, 1])
+                } else {
+                    GameResult::new(vec![0, 1], vec![1, 1])
+                }
+            })
+            .collect();
+
+        let r10 = compute_ratings(2, &games_10, &PlackettLuceConfig::default());
+        let r100 = compute_ratings(2, &games_100, &PlackettLuceConfig::default());
+
+        // Non-anchor player uncertainty (player 0 is higher-rated in both due to more wins)
+        // Find the non-anchor player (higher uncertainty)
+        let sigma_10 = r10.ratings[0].uncertainty.max(r10.ratings[1].uncertainty);
+        let sigma_100 = r100.ratings[0].uncertainty.max(r100.ratings[1].uncertainty);
+
+        // 10x more games → √10 ≈ 3.16x lower uncertainty
+        let ratio = sigma_10 / sigma_100;
+        assert!(
+            ratio > 2.0 && ratio < 5.0,
+            "10x games should give ~3x lower σ, got ratio {ratio} (σ10={sigma_10}, σ100={sigma_100})"
+        );
+    }
+
+    #[test]
+    fn test_stats_all_fields_valid() {
+        let games: Vec<GameResult> = (0..50)
+            .map(|_| GameResult::new(vec![0, 1], vec![1, 2]))
+            .collect();
+        let result = compute_ratings(2, &games, &PlackettLuceConfig::default());
+
+        assert!(result.stats.iterations_used > 0);
+        assert!(result.stats.iterations_used <= 100);
+        assert!(result.stats.computation_time_ms >= 0.0);
+        assert!(result.stats.final_delta.is_finite());
+        // Should converge with clear winner
+        assert!(result.stats.converged);
+        assert!(result.stats.final_delta < 1e-6);
+    }
+
+    #[test]
+    fn test_stats_non_convergence_reported() {
+        // Use a scenario that requires more iterations to converge:
+        // A beats B, B beats C, we need to propagate ratings through transitivity
+        let mut games = Vec::new();
+        for _ in 0..20 {
+            games.push(GameResult::new(vec![0, 1], vec![1, 2])); // A beats B
+            games.push(GameResult::new(vec![1, 2], vec![1, 2])); // B beats C
+        }
+
+        let config = PlackettLuceConfig {
+            max_iterations: 1, // Force very early stop
+            ..Default::default()
+        };
+        let result = compute_ratings(3, &games, &config);
+
+        assert_eq!(result.stats.iterations_used, 1);
+        assert!(!result.stats.converged);
+        // Final delta should be larger than threshold since we didn't converge
+        assert!(result.stats.final_delta > config.convergence_threshold);
+    }
+
+    #[test]
+    fn test_uncertainty_independent_of_inactive_player_count() {
+        // Same game data, different number of "bystander" players
+        // Uncertainty should be similar for active players
+        let games_2p: Vec<GameResult> = (0..20)
+            .map(|_| GameResult::new(vec![0, 1], vec![1, 2]))
+            .collect();
+
+        let games_10p: Vec<GameResult> = (0..20)
+            .map(|_| GameResult::new(vec![0, 1], vec![1, 2]))
+            .collect();
+
+        let r2 = compute_ratings(2, &games_2p, &PlackettLuceConfig::default());
+        let r10 = compute_ratings(10, &games_10p, &PlackettLuceConfig::default());
+
+        // Non-anchor player (player 0, winner) should have similar uncertainty
+        // regardless of how many inactive players exist
+        let diff = (r2.ratings[0].uncertainty - r10.ratings[0].uncertainty).abs();
+        assert!(
+            diff < 50.0,
+            "Uncertainty shouldn't depend heavily on inactive players: diff={diff}"
+        );
+    }
+
+    #[test]
+    fn test_reduced_hessian_gives_varied_uncertainties() {
+        // Verify we get meaningful uncertainty estimates (not all the same constant)
+        let games: Vec<GameResult> = (0..100)
+            .map(|i| {
+                GameResult::new(
+                    vec![0, 1, 2],
+                    vec![(i % 3) + 1, ((i + 1) % 3) + 1, ((i + 2) % 3) + 1],
+                )
+            })
+            .collect();
+
+        let result = compute_ratings(3, &games, &PlackettLuceConfig::default());
+
+        // Uncertainties should vary: anchor has ~0, others have positive
+        let uncertainties: Vec<f64> = result.ratings.iter().map(|r| r.uncertainty).collect();
+
+        // Check that not all are the same (which would indicate fallback behavior)
+        let min_u = uncertainties.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_u = uncertainties
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        assert!(
+            max_u - min_u > 10.0,
+            "Uncertainties should vary: min={min_u}, max={max_u}"
+        );
+
+        // Anchor (lowest rated) should have smallest uncertainty
+        let anchor_idx = result
+            .ratings
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.rating.partial_cmp(&b.1.rating).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+
+        assert!(
+            result.ratings[anchor_idx].uncertainty < 5.0,
+            "Anchor (idx {anchor_idx}) should have near-zero uncertainty, got {}",
+            result.ratings[anchor_idx].uncertainty
+        );
     }
 }

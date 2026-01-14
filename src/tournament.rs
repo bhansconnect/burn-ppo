@@ -21,7 +21,9 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Serialize;
 
-use crate::plackett_luce::{self, GameResult as PlGameResult, PlackettLuceConfig, PlayerRating};
+use crate::plackett_luce::{
+    self, GameResult as PlGameResult, PlackettLuceConfig, PlayerRating, RatingResult,
+};
 
 use crate::checkpoint::{load_metadata, CheckpointMetadata};
 use crate::config::TournamentArgs;
@@ -1010,17 +1012,42 @@ fn update_stats_from_games(contestants: &mut [Contestant], matchup: &MatchupGame
     }
 }
 
+/// Find anchor player index: Random if present, else lowest step number, else None.
+/// This ensures consistent anchor selection across tournaments for valid CI comparison.
+fn find_anchor_index(contestants: &[Contestant]) -> Option<usize> {
+    // Priority 1: "Random" player (semantically meaningful baseline)
+    if let Some(idx) = contestants.iter().position(|c| c.name == "Random") {
+        return Some(idx);
+    }
+
+    // Priority 2: Lowest step number (step_00000000 < step_00000100)
+    contestants
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.name.starts_with("step_"))
+        .min_by_key(|(_, c)| c.name.as_str())
+        .map(|(idx, _)| idx)
+}
+
 /// Compute ratings from all tournament games using Plackett-Luce MLE.
-/// Returns a Vec of ratings indexed by contestant index.
+/// Returns a `RatingResult` containing ratings indexed by contestant index and statistics.
 /// Uses the `plackett_luce` module for transitive inference and uncertainty estimation.
-fn compute_ratings(num_contestants: usize, all_games: &[SingleGameResult]) -> Vec<PlayerRating> {
+fn compute_ratings(contestants: &[Contestant], all_games: &[SingleGameResult]) -> RatingResult {
     // Convert to plackett_luce format
     let pl_games: Vec<PlGameResult> = all_games
         .iter()
         .map(|g| PlGameResult::new(g.contestants.clone(), g.placements.clone()))
         .collect();
 
-    plackett_luce::compute_ratings(num_contestants, &pl_games, &PlackettLuceConfig::default())
+    // Determine anchor player for consistent cross-tournament comparison
+    let anchor_idx = find_anchor_index(contestants);
+
+    let config = PlackettLuceConfig {
+        anchor_player_index: anchor_idx,
+        ..PlackettLuceConfig::default()
+    };
+
+    plackett_luce::compute_ratings(contestants.len(), &pl_games, &config)
 }
 
 /// Print a quick guide to interpreting Plackett-Luce ratings (Elo scale)
@@ -2191,15 +2218,28 @@ fn run_tournament_env<B: Backend, E: Environment>(
     }
 
     // Compute final ratings using Plackett-Luce MLE
-    let ratings = compute_ratings(contestants.len(), &all_game_results);
+    let rating_result = compute_ratings(contestants, &all_game_results);
+    let ratings = &rating_result.ratings;
+    let stats = &rating_result.stats;
+
+    // Print rating statistics
+    let converge_status = if stats.converged {
+        "converged"
+    } else {
+        "did not converge"
+    };
+    println!(
+        "\nRating computation: {} in {} iterations ({:.1}ms), final delta: {:.2e}",
+        converge_status, stats.iterations_used, stats.computation_time_ms, stats.final_delta
+    );
 
     // Final summary
     print_rating_guide();
-    print_final_summary(contestants, &ratings, num_rounds, args.num_games);
+    print_final_summary(contestants, ratings, num_rounds, args.num_games);
 
     // Graph output if requested
     if args.graph {
-        if let Err(e) = generate_rating_graph(contestants, &ratings) {
+        if let Err(e) = generate_rating_graph(contestants, ratings) {
             eprintln!("Failed to generate rating graph: {e}");
         }
         if let Err(e) = generate_swiss_points_graph(contestants) {
@@ -2211,7 +2251,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
     if let Some(output_path) = &args.output {
         let results = build_results(
             contestants,
-            &ratings,
+            ratings,
             &all_pods,
             num_rounds,
             use_swiss,
@@ -2250,7 +2290,7 @@ mod tests {
             })
             .collect();
 
-        compute_ratings(contestants.len(), &games)
+        compute_ratings(contestants, &games).ratings
     }
 
     #[test]
