@@ -1271,10 +1271,10 @@ run_dir = "{}"
     let latest = checkpoints.join("latest");
     assert!(latest.exists(), "Latest checkpoint symlink should exist");
 
-    // Verify supervisor messages appeared
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Verify supervisor mode ran (header goes to stdout)
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stderr.contains("supervisor mode") || stderr.contains("Supervisor:"),
+        stdout.contains("supervisor mode"),
         "Should run in supervisor mode"
     );
 }
@@ -1368,8 +1368,6 @@ run_dir = "{}"
 
     assert!(
         final_step > initial_step,
-        "Final step ({}) should be greater than initial step ({})",
-        final_step,
-        initial_step
+        "Final step ({final_step}) should be greater than initial step ({initial_step})"
     );
 }

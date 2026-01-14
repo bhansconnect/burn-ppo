@@ -123,6 +123,12 @@ impl TrainingProgress {
     pub fn finish_interrupted(&self) {
         self.main_bar.abandon_with_message("Interrupted");
     }
+
+    /// Finish progress bar quietly (for subprocess reload exit)
+    /// Uses `abandon()` to leave the bar in place - the next subprocess's bar will overwrite it
+    pub fn finish_quiet(&self) {
+        self.main_bar.abandon();
+    }
 }
 
 #[cfg(test)]

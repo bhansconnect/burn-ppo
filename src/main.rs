@@ -176,6 +176,9 @@ where
     E: Environment,
     F: Fn(usize) -> E,
 {
+    // Quiet mode: suppress verbose output when running as subprocess
+    let quiet = max_checkpoints_this_run > 0;
+
     // Initialize RNG
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
 
@@ -187,15 +190,17 @@ where
     let obs_shape = E::OBSERVATION_SHAPE;
     let action_count = E::ACTION_COUNT;
     let num_players = E::NUM_PLAYERS as u8;
-    println!(
-        "Created {} {} environments (obs_dim={}, obs_shape={:?}, actions={}, players={})",
-        num_envs,
-        E::NAME,
-        obs_dim,
-        obs_shape,
-        action_count,
-        num_players
-    );
+    if !quiet {
+        println!(
+            "Created {} {} environments (obs_dim={}, obs_shape={:?}, actions={}, players={})",
+            num_envs,
+            E::NAME,
+            obs_dim,
+            obs_shape,
+            action_count,
+            num_players
+        );
+    }
 
     // Warning for conflicting entropy config
     if config.adaptive_entropy && config.entropy_anneal {
@@ -243,7 +248,9 @@ where
                 device,
             );
             let optimizer = optimizer_config.init();
-            println!("Created {} ActorCritic network", config.network_type);
+            if !quiet {
+                println!("Created {} ActorCritic network", config.network_type);
+            }
             (model, optimizer, 0, Vec::new(), f32::NEG_INFINITY)
         }
         TrainingMode::Resume { checkpoint_dir, .. } | TrainingMode::Fork { checkpoint_dir } => {
@@ -283,7 +290,9 @@ where
                 match load_normalizer(checkpoint_dir) {
                     Ok(Some(loaded_norm)) => {
                         obs_normalizer = Some(loaded_norm);
-                        println!("Loaded observation normalizer from checkpoint");
+                        if !quiet {
+                            println!("Loaded observation normalizer from checkpoint");
+                        }
                     }
                     Ok(None) => {
                         // No normalizer saved, keep the fresh one
@@ -299,7 +308,9 @@ where
                 match load_return_normalizer(checkpoint_dir) {
                     Ok(Some(loaded_norm)) => {
                         return_normalizer = Some(loaded_norm);
-                        println!("Loaded return normalizer from checkpoint");
+                        if !quiet {
+                            println!("Loaded return normalizer from checkpoint");
+                        }
                     }
                     Ok(None) => {
                         // No return normalizer saved (old checkpoint), keep the fresh one
@@ -314,7 +325,9 @@ where
             match load_rng_state(checkpoint_dir) {
                 Ok(Some(loaded_rng)) => {
                     rng = loaded_rng;
-                    println!("Loaded RNG state from checkpoint");
+                    if !quiet {
+                        println!("Loaded RNG state from checkpoint");
+                    }
                 }
                 Ok(None) => {
                     // No RNG state saved, keep the fresh one
@@ -328,10 +341,12 @@ where
             let recent_returns = metadata.recent_returns.clone();
             let best_return = metadata.best_avg_return.unwrap_or(f32::NEG_INFINITY);
 
-            println!(
-                "Loaded checkpoint from step {} (avg return: {:.1})",
-                step, metadata.avg_return
-            );
+            if !quiet {
+                println!(
+                    "Loaded checkpoint from step {} (avg return: {:.1})",
+                    step, metadata.avg_return
+                );
+            }
 
             (model, optimizer, step, recent_returns, best_return)
         }
@@ -398,20 +413,26 @@ where
     // Parse time limit (fail fast if invalid)
     let time_limit = config.max_training_duration()?;
 
-    if let Some(ref limit_str) = config.max_training_time {
-        println!(
-            "Training for {} timesteps ({} updates) or {}, whichever comes first",
-            config.total_timesteps, num_updates, limit_str
-        );
-    } else {
-        println!(
-            "Training for {} timesteps ({} updates of {} steps each)",
-            config.total_timesteps, num_updates, steps_per_update
-        );
+    if !quiet {
+        if let Some(ref limit_str) = config.max_training_time {
+            println!(
+                "Training for {} timesteps ({} updates) or {}, whichever comes first",
+                config.total_timesteps, num_updates, limit_str
+            );
+        } else {
+            println!(
+                "Training for {} timesteps ({} updates of {} steps each)",
+                config.total_timesteps, num_updates, steps_per_update
+            );
+        }
+        println!("---");
     }
-    println!("---");
 
     // Progress bar (with multiplayer support and elapsed time offset for subprocess reloads)
+    // In subprocess mode, clear the line first to remove the abandoned progress bar from previous subprocess
+    if quiet {
+        eprint!("\x1b[2K\r");
+    }
     let elapsed_offset = std::time::Duration::from_millis(elapsed_time_offset_ms);
     let progress = TrainingProgress::new_with_offset(
         config.total_timesteps as u64,
@@ -444,6 +465,8 @@ where
 
     // Checkpoint counter for subprocess reload mode (tracks saves in this process)
     let mut checkpoints_saved_this_run: usize = 0;
+    // Track if we exited due to checkpoint limit (vs natural completion)
+    let mut exited_for_reload = false;
 
     // Multiplayer tracking (only used when num_players > 1)
     let num_players_usize = num_players as usize;
@@ -1318,10 +1341,7 @@ where
             if max_checkpoints_this_run > 0
                 && checkpoints_saved_this_run >= max_checkpoints_this_run
             {
-                progress.println(&format!(
-                    "Reached checkpoint limit ({}) for this subprocess, exiting for reload",
-                    max_checkpoints_this_run
-                ));
+                exited_for_reload = true;
                 break;
             }
         }
@@ -1460,18 +1480,22 @@ where
         progress.println(&checkpoint_msg);
     }
 
-    // Finish progress bar appropriately based on whether we were interrupted
-    if running.load(Ordering::SeqCst) {
+    // Finish progress bar appropriately based on exit reason
+    if exited_for_reload {
+        // Subprocess reload exit: finish quietly without completion messages
+        progress.finish_quiet();
+    } else if running.load(Ordering::SeqCst) {
+        // Natural completion: show full completion output
         progress.finish();
         println!("---");
         println!("Training complete!");
+        if !recent_returns.is_empty() {
+            let avg_return: f32 = recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
+            println!("Final average return (last 100 episodes): {avg_return:.1}");
+        }
     } else {
+        // User interrupt: show interrupted status
         progress.finish_interrupted();
-    }
-
-    if !recent_returns.is_empty() {
-        let avg_return: f32 = recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
-        println!("Final average return (last 100 episodes): {avg_return:.1}");
     }
 
     Ok(())
@@ -1544,6 +1568,16 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
     let mut supervisor = if let Some(ref resume_path) = args.resume {
         // Resume mode: use existing run directory
         let run_dir = resume_path.clone();
+
+        // Validate checkpoint exists
+        let checkpoint_dir = run_dir.join("checkpoints/latest");
+        if !checkpoint_dir.exists() {
+            bail!(
+                "No checkpoint found at {}. Cannot resume.",
+                checkpoint_dir.display()
+            );
+        }
+
         let config_path = run_dir.join("config.toml");
         let mut config = Config::load_from_path(&config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
@@ -1584,7 +1618,7 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
         }
 
         println!("burn-ppo v{} (supervisor mode)", env!("CARGO_PKG_VERSION"));
-        println!("Run: {}", run_name);
+        println!("Run: {run_name}");
         println!(
             "Reloading subprocess every {} checkpoints",
             args.reload_every_n_checkpoints
@@ -1599,6 +1633,7 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
             running,
             args.config.clone(),
             run_name,
+            args.seed,
         )
     };
 
@@ -1607,7 +1642,11 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
 
 fn run_training_cli(args: &CliArgs) -> Result<()> {
     // If reload is requested and this is NOT already a subprocess, become supervisor
-    if args.reload_every_n_checkpoints > 0 && args.max_checkpoints_this_run == 0 {
+    // Skip supervisor mode for --fork since it's a one-time operation
+    if args.reload_every_n_checkpoints > 0
+        && args.max_checkpoints_this_run == 0
+        && args.fork.is_none()
+    {
         return run_as_supervisor(args);
     }
 
@@ -1698,28 +1737,33 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
 
     config.validate()?;
 
-    println!("burn-ppo v{}", env!("CARGO_PKG_VERSION"));
-    match &mode {
-        TrainingMode::Fresh => println!("Mode: Fresh training"),
-        TrainingMode::Resume { .. } => println!("Mode: Resuming from checkpoint"),
-        TrainingMode::Fork { checkpoint_dir } => {
-            println!("Mode: Forking from {}", checkpoint_dir.display());
+    // Subprocess mode: suppress header output (supervisor already printed it)
+    let is_subprocess = args.max_checkpoints_this_run > 0;
+
+    if !is_subprocess {
+        println!("burn-ppo v{}", env!("CARGO_PKG_VERSION"));
+        match &mode {
+            TrainingMode::Fresh => println!("Mode: Fresh training"),
+            TrainingMode::Resume { .. } => println!("Mode: Resuming from checkpoint"),
+            TrainingMode::Fork { checkpoint_dir } => {
+                println!("Mode: Forking from {}", checkpoint_dir.display());
+            }
         }
+        println!("Environment: {}", config.env);
+        println!(
+            "Num envs: {} (resolved: {})",
+            match &config.num_envs {
+                config::NumEnvs::Auto(_) => "auto".to_string(),
+                config::NumEnvs::Explicit(n) => n.to_string(),
+            },
+            config.num_envs()
+        );
+        println!("Seed: {}", config.seed);
+        println!(
+            "Run: {}",
+            config.run_name.as_ref().expect("run_name is set")
+        );
     }
-    println!("Environment: {}", config.env);
-    println!(
-        "Num envs: {} (resolved: {})",
-        match &config.num_envs {
-            config::NumEnvs::Auto(_) => "auto".to_string(),
-            config::NumEnvs::Explicit(n) => n.to_string(),
-        },
-        config.num_envs()
-    );
-    println!("Seed: {}", config.seed);
-    println!(
-        "Run: {}",
-        config.run_name.as_ref().expect("run_name is set")
-    );
 
     // Set up graceful shutdown
     let running = Arc::new(AtomicBool::new(true));
@@ -1731,15 +1775,17 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
         .backend
         .as_deref()
         .unwrap_or_else(|| backend::default_backend());
-    println!(
-        "Backend: {} ({})",
-        backend::get_backend_display_name(backend_name),
-        backend_name
-    );
-    backend::warn_if_better_backend_available(backend_name);
+    if !is_subprocess {
+        println!(
+            "Backend: {} ({})",
+            backend::get_backend_display_name(backend_name),
+            backend_name
+        );
+        backend::warn_if_better_backend_available(backend_name);
 
-    // Print rating guide for understanding Openskill ratings
-    print_rating_guide();
+        // Print rating guide for understanding Openskill ratings
+        print_rating_guide();
+    }
 
     // Create or validate run directory
     match &mode {

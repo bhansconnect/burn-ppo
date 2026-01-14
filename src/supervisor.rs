@@ -23,7 +23,7 @@ pub struct TrainingSupervisor {
     reload_every_n: usize,
     /// Total timesteps target (for completion check)
     total_timesteps: usize,
-    /// Optional override for total_timesteps to pass to child
+    /// Optional override for `total_timesteps` to pass to child
     total_timesteps_override: Option<usize>,
     /// Optional max training time to pass to child
     max_training_time_override: Option<String>,
@@ -35,6 +35,8 @@ pub struct TrainingSupervisor {
     config_path: Option<PathBuf>,
     /// Run name for fresh runs
     run_name: Option<String>,
+    /// Seed override (pass through to subprocess)
+    seed_override: Option<u64>,
 }
 
 impl TrainingSupervisor {
@@ -57,6 +59,7 @@ impl TrainingSupervisor {
             is_fresh_run: false,
             config_path: None,
             run_name: None,
+            seed_override: None, // Seed not overridable for resume
         }
     }
 
@@ -70,6 +73,7 @@ impl TrainingSupervisor {
         running: Arc<AtomicBool>,
         config_path: PathBuf,
         run_name: String,
+        seed_override: Option<u64>,
     ) -> Self {
         Self {
             run_dir,
@@ -81,6 +85,7 @@ impl TrainingSupervisor {
             is_fresh_run: true,
             config_path: Some(config_path),
             run_name: Some(run_name),
+            seed_override,
         }
     }
 
@@ -99,28 +104,14 @@ impl TrainingSupervisor {
             }
 
             // Check if training is complete before spawning (skip on first fresh run)
-            if !is_first_iteration || !self.is_fresh_run {
-                if self.is_training_complete()? {
-                    eprintln!("Supervisor: training complete");
-                    break;
-                }
+            if (!is_first_iteration || !self.is_fresh_run) && self.is_training_complete()? {
+                eprintln!("Supervisor: training complete");
+                break;
             }
 
             let checkpoint_baseline = count_checkpoints(&self.run_dir);
 
             // Spawn child process
-            let mode_str = if is_first_iteration && self.is_fresh_run {
-                "fresh"
-            } else {
-                "resume"
-            };
-            eprintln!(
-                "Supervisor: spawning subprocess ({}, elapsed: {:.1}s, checkpoints: {})",
-                mode_str,
-                total_elapsed.as_secs_f32(),
-                checkpoint_baseline
-            );
-
             let start = Instant::now();
             let status = self.spawn_and_wait(total_elapsed, is_first_iteration)?;
             total_elapsed += start.elapsed();
@@ -148,14 +139,8 @@ impl TrainingSupervisor {
             // If subprocess saved 0 checkpoints and exited successfully, training is likely complete
             // (either it reached the end, or the step count is close enough that no more updates fit)
             if checkpoints_saved == 0 || self.is_training_complete()? {
-                eprintln!("Supervisor: training complete");
                 break;
             }
-
-            eprintln!(
-                "Supervisor: subprocess exited after {} checkpoints, reloading...",
-                checkpoints_saved
-            );
         }
 
         Ok(())
@@ -211,6 +196,10 @@ impl TrainingSupervisor {
             args.push("--max-training-time".to_string());
             args.push(time.clone());
         }
+        if let Some(seed) = self.seed_override {
+            args.push("--seed".to_string());
+            args.push(seed.to_string());
+        }
 
         let mut child = Command::new(exe)
             .args(&args)
@@ -222,20 +211,20 @@ impl TrainingSupervisor {
 
         // Wait for child, checking for interrupts
         loop {
-            match child.try_wait()? {
-                Some(status) => return Ok(status),
-                None => {
-                    // Check for Ctrl+C
-                    if !self.running.load(Ordering::SeqCst) {
-                        // Kill the child process - it will handle cleanup via its own Ctrl+C handler
-                        // since stdin/stdout/stderr are inherited
-                        let _ = child.kill();
-                        return child.wait().context("Failed to wait for child after interrupt");
-                    }
-                    // Sleep briefly before next poll
-                    std::thread::sleep(Duration::from_millis(100));
-                }
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
             }
+            // Check for Ctrl+C
+            if !self.running.load(Ordering::SeqCst) {
+                // Kill the child process - it will handle cleanup via its own Ctrl+C handler
+                // since stdin/stdout/stderr are inherited
+                let _ = child.kill();
+                return child
+                    .wait()
+                    .context("Failed to wait for child after interrupt");
+            }
+            // Sleep briefly before next poll
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
