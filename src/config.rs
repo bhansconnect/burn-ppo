@@ -258,7 +258,7 @@ pub struct TrainArgs {
     #[arg(long, help = "Fraction of envs for opponent games (default: 0.25)")]
     pub opponent_pool_fraction: Option<f32>,
 
-    #[arg(long, help = "Steps between opponent rotation (default: 2000)")]
+    #[arg(long, help = "Steps between opponent rotation (default: 512)")]
     pub opponent_pool_rotation_steps: Option<usize>,
 
     #[arg(
@@ -287,7 +287,7 @@ pub struct TrainArgs {
 
     #[arg(
         long,
-        help = "Max opponents in active pool for training/eval (default: 10)"
+        help = "Max opponents in active pool for training/eval (default: 32)"
     )]
     pub opponent_pool_size_limit: Option<usize>,
 
@@ -810,7 +810,7 @@ const fn default_opponent_pool_eval_games() -> usize {
     128
 }
 const fn default_opponent_pool_size_limit() -> usize {
-    10
+    32
 }
 
 impl Default for Config {
