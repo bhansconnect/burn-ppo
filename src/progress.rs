@@ -1,7 +1,7 @@
 /// Progress bar for training visualization
 ///
 /// Uses indicatif for progress display with ETA and metrics.
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::time::{Duration, Instant};
 
 /// Training progress display
@@ -16,15 +16,22 @@ impl TrainingProgress {
     /// Create progress display with player count for multiplayer games
     #[cfg(test)]
     pub fn new_with_players(total_steps: u64, num_players: usize) -> Self {
-        Self::new_with_offset(total_steps, num_players, Duration::ZERO)
+        Self::new_with_offset_and_position(total_steps, num_players, Duration::ZERO, 0)
     }
 
-    /// Create progress display with elapsed time offset from previous subprocess runs
+    /// Create progress display with offset and initial position
     ///
-    /// Used when training is restarted via `--reload-every-n-checkpoints` to maintain
-    /// accurate SPS calculations across subprocess boundaries.
-    pub fn new_with_offset(total_steps: u64, num_players: usize, elapsed_offset: Duration) -> Self {
-        let main_bar = ProgressBar::new(total_steps);
+    /// This variant sets the initial position immediately to avoid flashing from 0.
+    /// Used when resuming training in subprocess reload mode.
+    pub fn new_with_offset_and_position(
+        total_steps: u64,
+        num_players: usize,
+        elapsed_offset: Duration,
+        initial_position: u64,
+    ) -> Self {
+        // Use draw target that won't add blank lines
+        let main_bar =
+            ProgressBar::with_draw_target(Some(total_steps), ProgressDrawTarget::stderr());
 
         // Use slightly shorter bar for multiplayer to fit more info
         let template = if num_players > 1 {
@@ -38,7 +45,14 @@ impl TrainingProgress {
                 .expect("valid template")
                 .progress_chars("##-"),
         );
-        main_bar.set_message("Starting...");
+
+        // Set position immediately before first draw to avoid flash to 0
+        if initial_position > 0 {
+            main_bar.set_position(initial_position);
+            main_bar.set_message("Resuming...");
+        } else {
+            main_bar.set_message("Starting...");
+        }
 
         Self {
             main_bar,

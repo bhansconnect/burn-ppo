@@ -429,15 +429,19 @@ where
     }
 
     // Progress bar (with multiplayer support and elapsed time offset for subprocess reloads)
-    // In subprocess mode, clear the line first to remove the abandoned progress bar from previous subprocess
+    // In subprocess mode, move cursor up and clear line to overwrite the abandoned progress bar
     if quiet {
-        eprint!("\x1b[2K\r");
+        use std::io::Write;
+        // Move cursor up one line (where old bar is), clear it, move to start
+        let _ = std::io::stderr().write_all(b"\x1b[A\x1b[2K\r");
+        let _ = std::io::stderr().flush();
     }
     let elapsed_offset = std::time::Duration::from_millis(elapsed_time_offset_ms);
-    let progress = TrainingProgress::new_with_offset(
+    let progress = TrainingProgress::new_with_offset_and_position(
         config.total_timesteps as u64,
         num_players as usize,
         elapsed_offset,
+        global_step as u64, // Start at resumed position to avoid flash to 0
     );
 
     // Timing for SPS calculation
