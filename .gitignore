@@ -16,3 +16,6 @@ scripts/.aim/
 __pycache__/
 *.pyc
 uv.lock
+
+# Max
+.DS_Store
