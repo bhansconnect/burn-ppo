@@ -410,11 +410,14 @@ impl<B: Backend> OpponentPool<B> {
         }
 
         // New opponent gets max of existing qi scores (or 0.0 if empty)
-        let max_qi = self
-            .available
-            .iter()
-            .map(|(_, q)| q.qi)
-            .fold(0.0_f64, f64::max);
+        let max_qi = if self.available.is_empty() {
+            0.0
+        } else {
+            self.available
+                .iter()
+                .map(|(_, q)| q.qi)
+                .fold(f64::MIN, f64::max)
+        };
 
         let qi = OpponentQi::new(name, step, max_qi);
         self.available.push((checkpoint_path, qi));
