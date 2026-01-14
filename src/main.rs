@@ -32,6 +32,7 @@ mod plackett_luce;
 mod ppo;
 mod profile;
 mod progress;
+mod rating_history;
 mod supervisor;
 mod tournament;
 mod utils;
@@ -55,7 +56,6 @@ use crate::checkpoint::{
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_avg_points, Environment, GameOutcome, VecEnv};
 use crate::envs::{CartPole, ConnectFour, LiarsDice};
-use crate::eval::run_pool_eval;
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
 use crate::normalization::{ObsNormalizer, ReturnNormalizer};
@@ -65,6 +65,7 @@ use crate::ppo::{
     ppo_update, RolloutBuffer,
 };
 use crate::progress::TrainingProgress;
+use crate::rating_history::RatingHistory;
 use crate::tournament::print_rating_guide;
 use std::collections::VecDeque;
 
@@ -472,10 +473,6 @@ where
     let mut gae_time_acc = std::time::Duration::ZERO;
     let mut update_time_acc = std::time::Duration::ZERO;
 
-    // Pool eval timing tracking (cumulative, not reset)
-    let mut total_pool_eval_time = std::time::Duration::ZERO;
-    let mut pool_eval_warning_shown = false;
-
     // Last training metrics for checkpoint display
     let mut last_metrics: Option<ppo::UpdateMetrics> = None;
 
@@ -501,8 +498,8 @@ where
     // Per-player episode data for logging (cleared on each log)
     let mut episodes_since_log_mp: Vec<(Vec<f32>, Option<GameOutcome>)> = Vec::new();
 
-    // Opponent pool initialization (if training or evaluation uses it)
-    let needs_opponent_pool = config.opponent_pool_enabled || config.opponent_pool_eval_enabled;
+    // Opponent pool initialization (if enabled for multiplayer training)
+    let needs_opponent_pool = config.opponent_pool_enabled;
     let mut opponent_pool: Option<OpponentPool<TB::InnerBackend>> =
         if needs_opponent_pool && num_players > 1 {
             let checkpoints_dir = run_dir.join("checkpoints");
@@ -531,6 +528,28 @@ where
         } else {
             None
         };
+
+    // Initialize rating history for opponent pool training
+    let mut rating_history: Option<RatingHistory> = if opponent_pool.is_some() {
+        match RatingHistory::load(run_dir) {
+            Ok(history) => {
+                if history.num_games() > 0 {
+                    progress.println(&format!(
+                        "Loaded rating history: {} games, {} checkpoints",
+                        history.num_games(),
+                        history.num_checkpoints()
+                    ));
+                }
+                Some(history)
+            }
+            Err(e) => {
+                progress.eprintln(&format!("Warning: Failed to load rating history: {e}"));
+                Some(RatingHistory::new(run_dir))
+            }
+        }
+    } else {
+        None
+    };
 
     // Calculate number of opponent envs (only when training with opponents is enabled)
     #[expect(
@@ -575,13 +594,9 @@ where
     // Track steps since last opponent rotation
     let mut steps_since_rotation: usize = 0;
 
-    // Track steps since last pool evaluation
-    let mut last_pool_eval_step: usize = 0;
-
     // Determine how "best" checkpoint should be selected
     // - Single-player: use avg_return (auto_update_best = true)
-    // - Multiplayer + pool_eval disabled: skip best tracking (auto_update_best = false)
-    // - Multiplayer + pool_eval enabled: manual update (auto_update_best = false)
+    // - Multiplayer: best is updated via rating system (auto_update_best = false)
     let use_avg_return_for_best = num_players == 1;
 
     // Adaptive entropy controller (if enabled)
@@ -684,7 +699,7 @@ where
                 global_step,
             );
 
-            // Queue opponent completions for batched qi updates
+            // Queue opponent completions for batched qi updates and record for rating
             for completion in opponent_completions {
                 if !completion.placements.is_empty() {
                     let env_state = &env_states[completion.env_idx];
@@ -694,6 +709,34 @@ where
                         env_state,
                         global_step,
                     );
+
+                    // Record game for rating history
+                    if let Some(ref mut history) = rating_history {
+                        // Get current checkpoint name (fallback to "latest" if not yet set)
+                        let current_name = history
+                            .current_checkpoint()
+                            .map_or_else(|| "step_00000000".to_string(), String::from);
+
+                        // Get opponent checkpoint names
+                        let opponent_names: Vec<String> = completion
+                            .opponent_pool_indices
+                            .iter()
+                            .map(|&idx| pool.get_checkpoint_name(idx))
+                            .collect();
+
+                        // Rearrange placements: [learner_placement, opponent_placements...]
+                        // completion.placements is indexed by position
+                        let mut rating_placements =
+                            vec![completion.placements[env_state.learner_position]];
+                        // Get opponent positions from position_to_opponent mapping
+                        for (pos, slot) in env_state.position_to_opponent.iter().enumerate() {
+                            if slot.is_some() {
+                                rating_placements.push(completion.placements[pos]);
+                            }
+                        }
+
+                        history.record_game(&current_name, &opponent_names, rating_placements);
+                    }
                 }
             }
 
@@ -710,11 +753,6 @@ where
 
                 // Re-sample active subset (provides variety + includes new checkpoints)
                 pool.refresh_active_subset();
-
-                // Queue new opponents for all env states (graceful rotation)
-                for state in &mut env_states {
-                    state.pending_opponents = Some(pool.sample_all_slots());
-                }
 
                 // Debug output for opponent selection (to stderr for debug output)
                 if config.debug_opponents {
@@ -1059,152 +1097,6 @@ where
             logger.flush()?;
         }
 
-        // Pool evaluation (separate from checkpointing, at its own interval)
-        let should_run_pool_eval = config.opponent_pool_eval_enabled
-            && num_players > 1
-            && global_step - last_pool_eval_step >= config.pool_eval_interval();
-
-        if should_run_pool_eval {
-            if let Some(pool) = opponent_pool.as_mut() {
-                if pool.has_opponents() {
-                    // Run pool evaluation with inference backend (no autodiff)
-                    let eval_model = model.valid();
-                    match run_pool_eval::<TB::InnerBackend, E>(
-                        &eval_model,
-                        obs_normalizer.as_ref(),
-                        pool,
-                        config.opponent_pool_eval_games,
-                        config,
-                        device,
-                        config.seed.wrapping_add(global_step as u64),
-                        global_step,
-                        config.pool_eval_temp,
-                        config.pool_eval_temp_final,
-                        config.pool_eval_temp_cutoff,
-                        config.pool_eval_temp_decay,
-                    ) {
-                        Ok(result) => {
-                            // Log pool eval metrics
-                            logger.log_scalar(
-                                "pool_eval/avg_points",
-                                result.current_avg_points as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "pool_eval/vs_best_margin",
-                                result.vs_best_margin as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "pool_eval/draw_rate",
-                                result.draw_rate as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "pool_eval/games_played",
-                                result.games_played as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "pool_eval/num_opponents",
-                                result.num_opponents as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "pool_eval/eval_time_ms",
-                                result.elapsed_ms as f32,
-                                global_step,
-                            )?;
-
-                            // Accumulate pool eval time and log percentage
-                            total_pool_eval_time +=
-                                std::time::Duration::from_millis(result.elapsed_ms);
-                            let total_elapsed = training_start.elapsed().as_secs_f64();
-                            if total_elapsed > 0.0 {
-                                let pool_eval_pct =
-                                    total_pool_eval_time.as_secs_f64() / total_elapsed * 100.0;
-                                logger.log_scalar(
-                                    "pool_eval/time_pct",
-                                    pool_eval_pct as f32,
-                                    global_step,
-                                )?;
-
-                                // One-time warning if pool eval is >5% of total execution time
-                                if !pool_eval_warning_shown && pool_eval_pct > 5.0 {
-                                    progress.eprintln(&format!(
-                                        "Warning: Pool evaluation is taking {pool_eval_pct:.1}% of total \
-                                         execution time. Consider increasing \
-                                         opponent_pool_eval_interval or decreasing \
-                                         opponent_pool_eval_games."
-                                    ));
-                                    pool_eval_warning_shown = true;
-                                }
-                            }
-
-                            logger.flush()?;
-
-                            // Print pool eval status line
-                            let status = format!(
-                                "[Pool Eval] vs Best: {:+.2} | Points: {:.2}",
-                                result.vs_best_margin, result.current_avg_points
-                            );
-                            progress.println(&status);
-
-                            // Save updated qi scores
-                            if let Err(e) = pool.save_qi_scores() {
-                                progress.eprintln(&format!(
-                                    "Warning: Failed to save qi scores after eval: {e}"
-                                ));
-                            }
-
-                            // Update "best" checkpoint based on vs_best_margin if threshold is set
-                            if let Some(win_rate_threshold) = config.pool_eval_best_margin {
-                                // Convert win rate to raw Swiss point margin
-                                // User specifies win rate (0.5 = 50%, 0.55 = 55%, 1.0 = 100%)
-                                // Margin = 2 * win_rate - 1 (e.g., 0.55 -> 0.10)
-                                // For N players, scale by max Swiss points (N - 1)
-                                let max_swiss = f64::from(num_players - 1);
-                                let raw_threshold =
-                                    (2.0 * f64::from(win_rate_threshold) - 1.0) * max_swiss;
-
-                                if result.vs_best_margin >= raw_threshold {
-                                    // Resolve "latest" symlink to get actual checkpoint name
-                                    let latest_path = run_dir.join("checkpoints/latest");
-                                    let checkpoint_name = if latest_path.is_symlink() {
-                                        std::fs::read_link(&latest_path).ok().and_then(|p| {
-                                            p.file_name().map(|n| n.to_string_lossy().into_owned())
-                                        })
-                                    } else {
-                                        None
-                                    };
-
-                                    if let Some(name) = checkpoint_name {
-                                        if let Err(e) =
-                                            checkpoint_manager.set_best_checkpoint(&name)
-                                        {
-                                            progress.eprintln(&format!(
-                                                "Warning: Failed to update best checkpoint: {e}"
-                                            ));
-                                        } else {
-                                            progress.println(&format!(
-                                                "[Pool Eval] Updated 'best' -> {name} (margin {:.2} >= {:.2})",
-                                                result.vs_best_margin, raw_threshold
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            progress.eprintln(&format!("Warning: Pool evaluation failed: {e}"));
-                        }
-                    }
-                }
-            }
-
-            last_pool_eval_step = global_step;
-        }
-
         // Checkpointing
         if global_step - last_checkpoint_step >= config.checkpoint_freq {
             // Use episodes since last checkpoint for best selection
@@ -1281,6 +1173,69 @@ where
                 // Save qi scores periodically
                 if let Err(e) = pool.save_qi_scores() {
                     progress.eprintln(&format!("Warning: Failed to save qi scores: {e}"));
+                }
+            }
+
+            // Update rating history and compute ratings
+            let checkpoint_name = checkpoint_path
+                .file_name()
+                .expect("checkpoint has filename")
+                .to_string_lossy()
+                .to_string();
+
+            if let Some(ref mut history) = rating_history {
+                // Register this checkpoint and set it as current
+                history.on_checkpoint_saved(&checkpoint_name, global_step);
+
+                // Compute ratings and log metrics (with timing)
+                let elo_start = std::time::Instant::now();
+                let result = history.compute_ratings();
+                let elo_compute_ms = elo_start.elapsed().as_secs_f64() * 1000.0;
+
+                logger.log_scalar(
+                    "training/elo_compute_ms",
+                    elo_compute_ms as f32,
+                    global_step,
+                )?;
+                logger.log_scalar(
+                    "training/current_elo",
+                    result.current_elo as f32,
+                    global_step,
+                )?;
+                logger.log_scalar("training/best_elo", result.best_elo as f32, global_step)?;
+                logger.log_scalar("training/best_step", result.best_step as f32, global_step)?;
+                logger.log_scalar(
+                    "training/rating_games",
+                    result.total_games as f32,
+                    global_step,
+                )?;
+
+                // Print rating status
+                progress.println(&format!(
+                    "[Rating] Elo: {:.0} | Best: {:.0} @ step {} | Games: {}",
+                    result.current_elo, result.best_elo, result.best_step, result.total_games
+                ));
+
+                // Update "best" symlink to currently highest-rated checkpoint
+                let best_name = format!("step_{:08}", result.best_step);
+                if let Err(e) = checkpoint_manager.set_best_checkpoint(&best_name) {
+                    progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
+                }
+
+                // Generate Elo graph in checkpoint directory
+                let graph_path = checkpoint_path.join("elo_graph.png");
+                if let Err(e) = history.generate_graph(&graph_path) {
+                    progress.eprintln(&format!("Warning: Failed to generate Elo graph: {e}"));
+                }
+
+                // Update root symlink to point to latest checkpoint's graph
+                let root_graph = run_dir.join("checkpoints/elo_graph.png");
+                let relative_target = format!("{checkpoint_name}/elo_graph.png");
+                // Remove existing symlink if present
+                let _ = std::fs::remove_file(&root_graph);
+                #[cfg(unix)]
+                if let Err(e) = std::os::unix::fs::symlink(&relative_target, &root_graph) {
+                    progress.eprintln(&format!("Warning: Failed to create Elo graph symlink: {e}"));
                 }
             }
 
@@ -1443,6 +1398,69 @@ where
                 if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
                     progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
                 }
+            }
+        }
+
+        // Update rating history and compute ratings (final checkpoint)
+        let checkpoint_name = checkpoint_path
+            .file_name()
+            .expect("checkpoint has filename")
+            .to_string_lossy()
+            .to_string();
+
+        if let Some(ref mut history) = rating_history {
+            // Register this checkpoint and set it as current
+            history.on_checkpoint_saved(&checkpoint_name, global_step);
+
+            // Compute ratings and log metrics (with timing)
+            let elo_start = std::time::Instant::now();
+            let result = history.compute_ratings();
+            let elo_compute_ms = elo_start.elapsed().as_secs_f64() * 1000.0;
+
+            logger.log_scalar(
+                "training/elo_compute_ms",
+                elo_compute_ms as f32,
+                global_step,
+            )?;
+            logger.log_scalar(
+                "training/current_elo",
+                result.current_elo as f32,
+                global_step,
+            )?;
+            logger.log_scalar("training/best_elo", result.best_elo as f32, global_step)?;
+            logger.log_scalar("training/best_step", result.best_step as f32, global_step)?;
+            logger.log_scalar(
+                "training/rating_games",
+                result.total_games as f32,
+                global_step,
+            )?;
+
+            // Print rating status
+            progress.println(&format!(
+                "[Rating] Elo: {:.0} | Best: {:.0} @ step {} | Games: {}",
+                result.current_elo, result.best_elo, result.best_step, result.total_games
+            ));
+
+            // Update "best" symlink to currently highest-rated checkpoint
+            let best_name = format!("step_{:08}", result.best_step);
+            if let Err(e) = checkpoint_manager.set_best_checkpoint(&best_name) {
+                progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
+            }
+
+            // Generate Elo graph in checkpoint directory
+            let graph_path = checkpoint_path.join("elo_graph.png");
+            if let Err(e) = history.generate_graph(&graph_path) {
+                progress.eprintln(&format!("Warning: Failed to generate Elo graph: {e}"));
+            }
+
+            // Update root symlink to point to latest checkpoint's graph
+            let root_graph = run_dir.join("checkpoints/elo_graph.png");
+            let relative_target = format!("{checkpoint_name}/elo_graph.png");
+            // Remove existing symlink if present
+            let _ = std::fs::remove_file(&root_graph);
+            #[cfg(unix)]
+            if let Err(e) = std::os::unix::fs::symlink(&relative_target, &root_graph) {
+                progress.eprintln(&format!("Warning: Failed to create Elo graph symlink: {e}"));
             }
         }
 

@@ -77,11 +77,9 @@ pub struct EnvState {
     /// Maps position (seat) to pool index. None means learner sits there.
     /// `position_to_opponent[seat] = Some(pool_idx)` for opponents
     pub position_to_opponent: Vec<Option<usize>>,
-    /// Pool indices of assigned opponents (constant until rotation)
+    /// Pool indices of assigned opponents (resampled after each game)
     /// Length = `num_players` - 1
     pub assigned_opponents: Vec<usize>,
-    /// New opponents waiting for episode end (graceful rotation)
-    pub pending_opponents: Option<Vec<usize>>,
 }
 
 impl EnvState {
@@ -91,7 +89,6 @@ impl EnvState {
             learner_position: 0,
             position_to_opponent: vec![None; num_players],
             assigned_opponents,
-            pending_opponents: None,
         };
         state.shuffle_positions(num_players, rng);
         state
@@ -113,24 +110,6 @@ impl EnvState {
         for (i, &seat) in other_seats.iter().enumerate() {
             self.position_to_opponent[seat] = Some(self.assigned_opponents[i]);
         }
-    }
-
-    /// Apply pending rotation (call at episode end)
-    ///
-    /// Returns true if rotation was applied
-    pub fn apply_pending_rotation(&mut self) -> bool {
-        if let Some(new_opponents) = self.pending_opponents.take() {
-            self.assigned_opponents = new_opponents;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Check if this env has a pending rotation
-    #[cfg(test)]
-    pub fn has_pending_rotation(&self) -> bool {
-        self.pending_opponents.is_some()
     }
 }
 
@@ -562,6 +541,22 @@ impl<B: Backend> OpponentPool<B> {
         assigned
     }
 
+    /// Sample opponents for all slots WITH REPLACEMENT
+    /// Same opponent can appear in multiple slots
+    pub fn sample_all_slots_with_replacement(&mut self) -> Vec<usize> {
+        (0..self.num_opponent_slots)
+            .filter_map(|_| self.sample_opponent_from_active(&[])) // Empty exclude = with replacement
+            .collect()
+    }
+
+    /// Get checkpoint name for a pool index
+    pub fn get_checkpoint_name(&self, pool_index: usize) -> String {
+        self.available.get(pool_index).map_or_else(
+            || format!("unknown_{pool_index}"),
+            |(_, qi)| qi.checkpoint_name.clone(),
+        )
+    }
+
     /// Get or load a model by pool index
     #[expect(
         dead_code,
@@ -829,15 +824,11 @@ impl<B: Backend> OpponentPool<B> {
         self.active_indices.clone()
     }
 
-    /// Get available opponent paths and qi data for evaluation
-    pub fn get_opponents_for_eval(&self, indices: &[usize]) -> Vec<(PathBuf, OpponentQi)> {
-        indices
-            .iter()
-            .filter_map(|&idx| self.available.get(idx).cloned())
-            .collect()
-    }
-
     /// Get the checkpoints directory path
+    #[expect(
+        dead_code,
+        reason = "pool eval removed but keeping for potential future use"
+    )]
     pub fn checkpoints_dir(&self) -> &PathBuf {
         &self.checkpoints_dir
     }
@@ -1098,24 +1089,6 @@ impl<B: Backend> OpponentPool<B> {
     }
 }
 
-/// Result of periodic pool evaluation
-#[derive(Debug)]
-pub struct PoolEvalResult {
-    /// Current network's average Swiss points across all eval games
-    pub current_avg_points: f64,
-    /// Average point margin vs best opponent (`current_points` - `best_points` per game)
-    /// Positive means outperforming best, negative means underperforming
-    pub vs_best_margin: f64,
-    /// Draw rate across all games
-    pub draw_rate: f64,
-    /// Number of games played
-    pub games_played: usize,
-    /// Number of unique opponents faced
-    pub num_opponents: usize,
-    /// Evaluation time in milliseconds
-    pub elapsed_ms: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1159,25 +1132,6 @@ mod tests {
         }
         // With 4 positions and 10 shuffles, very likely to change
         assert!(changed, "Position should change after shuffles");
-    }
-
-    #[test]
-    fn test_env_state_pending_rotation() {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
-        let mut state = EnvState::new(4, vec![0, 1, 2], &mut rng);
-
-        // No pending rotation initially
-        assert!(!state.has_pending_rotation());
-        assert!(!state.apply_pending_rotation());
-
-        // Set pending rotation
-        state.pending_opponents = Some(vec![3, 4, 5]);
-        assert!(state.has_pending_rotation());
-
-        // Apply it
-        assert!(state.apply_pending_rotation());
-        assert_eq!(state.assigned_opponents, vec![3, 4, 5]);
-        assert!(!state.has_pending_rotation());
     }
 
     #[test]

@@ -737,11 +737,12 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                     });
                 }
 
-                // Shuffle positions for next episode (same opponents until rotation)
-                env_states[env_idx].shuffle_positions(num_players, rng);
+                // Resample opponents for next game (with replacement, QI-weighted)
+                env_states[env_idx].assigned_opponents =
+                    opponent_pool.sample_all_slots_with_replacement();
 
-                // Apply pending rotation if any
-                env_states[env_idx].apply_pending_rotation();
+                // Shuffle positions for next episode with new opponents
+                env_states[env_idx].shuffle_positions(num_players, rng);
             }
         }
         all_completed.extend(completed);

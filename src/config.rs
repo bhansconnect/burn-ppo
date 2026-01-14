@@ -273,47 +273,11 @@ pub struct TrainArgs {
     #[arg(long, help = "Print selected opponents during training and evaluation")]
     pub debug_opponents: bool,
 
-    #[arg(long, action = clap::ArgAction::Set, help = "Enable periodic pool evaluation (default: true)")]
-    pub opponent_pool_eval_enabled: Option<bool>,
-
-    #[arg(
-        long,
-        help = "Steps between pool evaluations (default: checkpoint_freq)"
-    )]
-    pub opponent_pool_eval_interval: Option<usize>,
-
-    #[arg(long, help = "Games per pool evaluation (default: 128)")]
-    pub opponent_pool_eval_games: Option<usize>,
-
     #[arg(
         long,
         help = "Max opponents in active pool for training/eval (default: 32)"
     )]
     pub opponent_pool_size_limit: Option<usize>,
-
-    #[arg(
-        long,
-        help = "Initial softmax temp for pool eval (default: env default)"
-    )]
-    pub pool_eval_temp: Option<f32>,
-
-    #[arg(long, help = "Final temp after cutoff for pool eval (default: 0.0)")]
-    pub pool_eval_temp_final: Option<f32>,
-
-    #[arg(long, help = "Move number to switch temperature (default: disabled)")]
-    pub pool_eval_temp_cutoff: Option<usize>,
-
-    #[arg(
-        long,
-        help = "Gradually decay pool eval temp over cutoff (default: false)"
-    )]
-    pub pool_eval_temp_decay: bool,
-
-    #[arg(
-        long,
-        help = "Win rate threshold for best checkpoint (default: use rating)"
-    )]
-    pub pool_eval_best_margin: Option<f32>,
 }
 
 /// Arguments for evaluation
@@ -647,38 +611,9 @@ pub struct Config {
     /// Print selected opponents during training and evaluation
     #[serde(default)]
     pub debug_opponents: bool,
-    /// Enable periodic pool evaluation
-    #[serde(default = "default_true")]
-    pub opponent_pool_eval_enabled: bool,
-    /// Steps between pool evaluations (None = use `checkpoint_freq`)
-    #[serde(default)]
-    pub opponent_pool_eval_interval: Option<usize>,
-    /// Number of games per pool evaluation
-    #[serde(default = "default_opponent_pool_eval_games")]
-    pub opponent_pool_eval_games: usize,
-    /// Maximum opponents in active pool (for both training and evaluation)
-    #[serde(
-        default = "default_opponent_pool_size_limit",
-        alias = "opponent_pool_eval_opponents"
-    )]
+    /// Maximum opponents in active pool for training
+    #[serde(default = "default_opponent_pool_size_limit")]
     pub opponent_pool_size_limit: usize,
-    /// Initial softmax temperature for pool evaluation (None = use environment default)
-    #[serde(default)]
-    pub pool_eval_temp: Option<f32>,
-    /// Final temperature after cutoff moves (default 0.0, requires `pool_eval_temp_cutoff`)
-    #[serde(default)]
-    pub pool_eval_temp_final: f32,
-    /// Move number to switch from initial to final temperature (None = disabled)
-    #[serde(default)]
-    pub pool_eval_temp_cutoff: Option<usize>,
-    /// Gradually decay temperature over cutoff moves (requires `pool_eval_temp_cutoff`)
-    #[serde(default)]
-    pub pool_eval_temp_decay: bool,
-    /// Win rate threshold for updating "best" checkpoint from pool eval.
-    /// 0.5 = match best, 0.55 = 55% win rate (recommended), 1.0 = always win.
-    /// Valid range: 0.5 to 1.0. None = use training rating for multiplayer.
-    #[serde(default)]
-    pub pool_eval_best_margin: Option<f32>,
 
     // Experiment
     #[serde(default = "default_seed")]
@@ -806,9 +741,6 @@ const fn default_opponent_pool_rotation_steps() -> usize {
 const fn default_qi_eta() -> f64 {
     0.01 // OpenAI Five default
 }
-const fn default_opponent_pool_eval_games() -> usize {
-    128
-}
 const fn default_opponent_pool_size_limit() -> usize {
     32
 }
@@ -869,15 +801,7 @@ impl Default for Config {
             qi_eta: default_qi_eta(),
             debug_qi: false,
             debug_opponents: false,
-            opponent_pool_eval_enabled: true,
-            opponent_pool_eval_interval: None, // Defaults to checkpoint_freq
-            opponent_pool_eval_games: default_opponent_pool_eval_games(),
             opponent_pool_size_limit: default_opponent_pool_size_limit(),
-            pool_eval_temp: None, // Use environment default
-            pool_eval_temp_final: 0.0,
-            pool_eval_temp_cutoff: None, // Disabled by default
-            pool_eval_temp_decay: false,
-            pool_eval_best_margin: None, // Use avg_return for single-player, skip for multiplayer
             seed: default_seed(),
             run_name: None,
             forked_from: None,
@@ -886,12 +810,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Get pool eval interval (defaults to `checkpoint_freq` if not set)
-    pub fn pool_eval_interval(&self) -> usize {
-        self.opponent_pool_eval_interval
-            .unwrap_or(self.checkpoint_freq)
-    }
-
     /// Load config from TOML file, apply CLI overrides
     ///
     /// The `forked_from` parameter is set when forking from another run
@@ -1094,32 +1012,8 @@ impl Config {
         if args.debug_opponents {
             self.debug_opponents = true;
         }
-        if let Some(v) = args.opponent_pool_eval_enabled {
-            self.opponent_pool_eval_enabled = v;
-        }
-        if let Some(v) = args.opponent_pool_eval_interval {
-            self.opponent_pool_eval_interval = Some(v);
-        }
-        if let Some(v) = args.opponent_pool_eval_games {
-            self.opponent_pool_eval_games = v;
-        }
         if let Some(v) = args.opponent_pool_size_limit {
             self.opponent_pool_size_limit = v;
-        }
-        if let Some(v) = args.pool_eval_temp {
-            self.pool_eval_temp = Some(v);
-        }
-        if let Some(v) = args.pool_eval_temp_final {
-            self.pool_eval_temp_final = v;
-        }
-        if let Some(v) = args.pool_eval_temp_cutoff {
-            self.pool_eval_temp_cutoff = Some(v);
-        }
-        if args.pool_eval_temp_decay {
-            self.pool_eval_temp_decay = true;
-        }
-        if let Some(v) = args.pool_eval_best_margin {
-            self.pool_eval_best_margin = Some(v);
         }
 
         // Experiment
@@ -1275,15 +1169,6 @@ impl Config {
         if args.qi_eta.is_some() {
             ignored.push("--qi-eta");
         }
-        if args.opponent_pool_eval_enabled.is_some() {
-            ignored.push("--opponent-pool-eval-enabled");
-        }
-        if args.opponent_pool_eval_interval.is_some() {
-            ignored.push("--opponent-pool-eval-interval");
-        }
-        if args.opponent_pool_eval_games.is_some() {
-            ignored.push("--opponent-pool-eval-games");
-        }
         if args.opponent_pool_size_limit.is_some() {
             ignored.push("--opponent-pool-size-limit");
         }
@@ -1429,20 +1314,8 @@ impl Config {
             if self.qi_eta <= 0.0 {
                 bail!("qi_eta must be > 0");
             }
-            if self.opponent_pool_eval_games == 0 {
-                bail!("opponent_pool_eval_games must be > 0");
-            }
             if self.opponent_pool_size_limit == 0 {
                 bail!("opponent_pool_size_limit must be > 0");
-            }
-        }
-
-        // Validate pool_eval_best_margin (win rate, so valid range is [0.5, 1.0])
-        if let Some(win_rate) = self.pool_eval_best_margin {
-            if !(0.5..=1.0).contains(&win_rate) {
-                bail!(
-                    "pool_eval_best_margin must be between 0.5 and 1.0 (0.5 = match best, 0.55 = 55% win rate, 1.0 = always win)"
-                );
             }
         }
 
@@ -1674,14 +1547,5 @@ mod tests {
         };
         let name = generate_run_name(&config, Some("cartpole_003"));
         assert_eq!(name, "cartpole_003_child_001");
-    }
-
-    #[test]
-    fn test_pool_eval_temp_defaults() {
-        let config = Config::default();
-        assert!(config.pool_eval_temp.is_none()); // Use env default
-        assert!((config.pool_eval_temp_final - 0.0).abs() < f32::EPSILON);
-        assert!(config.pool_eval_temp_cutoff.is_none()); // Disabled
-        assert!(!config.pool_eval_temp_decay);
     }
 }
