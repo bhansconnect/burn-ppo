@@ -1336,6 +1336,11 @@ where
                         for line in histogram.lines() {
                             progress.eprintln(line);
                         }
+
+                        // Save probability graph to checkpoint directory
+                        if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
+                            progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
+                        }
                     }
                 }
             }

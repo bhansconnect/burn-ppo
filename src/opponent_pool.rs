@@ -14,10 +14,12 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
+use plotters::backend::BitMapBackend;
+use plotters::prelude::*;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -1005,6 +1007,94 @@ impl<B: Backend> OpponentPool<B> {
             .map(|&idx| format!("{}", idx_to_relative.get(&idx).copied().unwrap_or(0)))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// Save qi probability distribution graph to the checkpoint directory.
+    /// Also creates a symlink at the run root pointing to `checkpoints/latest/qi_probability.png`.
+    pub fn save_qi_probability_graph(&self, checkpoint_path: &Path) -> Result<()> {
+        if self.available.is_empty() {
+            return Ok(());
+        }
+
+        let probs = self.compute_all_selection_probabilities();
+
+        // Sort by step descending to get checkpoint-relative positions
+        let mut sorted_by_step: Vec<(usize, usize)> = self
+            .available
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, qi))| (idx, qi.checkpoint_step))
+            .collect();
+        sorted_by_step.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Build data points: (checkpoint_relative_position, probability)
+        let data: Vec<(i32, f64)> = sorted_by_step
+            .iter()
+            .enumerate()
+            .map(|(rel_pos, (pool_idx, _))| {
+                let pos_i32 = i32::try_from(rel_pos + 1).unwrap_or(i32::MAX);
+                (-pos_i32, probs[*pool_idx])
+            })
+            .collect();
+
+        // Find max probability for Y-axis scaling
+        let max_prob = data.iter().map(|d| d.1).fold(0.0, f64::max);
+        let y_max = (max_prob * 1.1).max(0.01);
+
+        // X-axis: from -n to 0 (oldest to newest)
+        let x_min = data.iter().map(|d| d.0).min().unwrap_or(-1) - 1;
+        let x_max = 0;
+
+        let graph_path = checkpoint_path.join("qi_probability.png");
+
+        let root = BitMapBackend::new(&graph_path, (800, 400)).into_drawing_area();
+        root.fill(&WHITE).context("Failed to fill background")?;
+
+        let mut chart = ChartBuilder::on(&root)
+            .caption("qi Selection Probability by Checkpoint", ("sans-serif", 20))
+            .margin(10)
+            .x_label_area_size(40)
+            .y_label_area_size(50)
+            .build_cartesian_2d(x_min..x_max, 0.0..y_max)
+            .context("Failed to build chart")?;
+
+        chart
+            .configure_mesh()
+            .x_desc("Checkpoint (relative)")
+            .y_desc("Probability")
+            .draw()
+            .context("Failed to draw mesh")?;
+
+        // Draw bars
+        chart
+            .draw_series(data.iter().map(|(x, y)| {
+                let x0 = *x;
+                let x1 = x + 1;
+                Rectangle::new([(x0, 0.0), (x1, *y)], BLUE.mix(0.7).filled())
+            }))
+            .context("Failed to draw bars")?;
+
+        root.present().context("Failed to present chart")?;
+
+        // Create symlink at run root pointing to checkpoints/latest/qi_probability.png (once)
+        // checkpoint_path is like: run_dir/checkpoints/step_XXXX
+        // We want: run_dir/qi_probability.png -> checkpoints/latest/qi_probability.png
+        if let Some(checkpoints_dir) = checkpoint_path.parent() {
+            if let Some(run_dir) = checkpoints_dir.parent() {
+                let symlink_path = run_dir.join("qi_probability.png");
+                if !symlink_path.exists() && !symlink_path.is_symlink() {
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(
+                            "checkpoints/latest/qi_probability.png",
+                            &symlink_path,
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
