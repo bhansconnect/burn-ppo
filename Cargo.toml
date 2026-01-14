@@ -35,9 +35,6 @@ ctrlc = "3"
 # Parallelization
 rayon = "1.10"
 
-# Skill rating (Weng-Lin/OpenSkill for tournaments)
-skillratings = "0.28"
-
 # Plotting (for tournament graphs)
 plotters = "0.3"
 

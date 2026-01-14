@@ -4,7 +4,7 @@
 //! - Watch mode: visualize games with ASCII rendering
 //! - Stats mode: parallel game execution with win/loss/draw statistics
 //! - Temperature-based sampling with schedule support
-//! - Weng-Lin (`OpenSkill`) rating for skill comparison (in tournaments)
+//! - Plackett-Luce rating for skill comparison (in tournaments)
 
 // Evaluation uses unwrap/expect for:
 // - Tensor data extraction (cannot fail with correct shapes)
@@ -15,20 +15,12 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::plackett_luce::{self, GameResult as PlGameResult, PlackettLuceConfig};
 use anyhow::{Context, Result};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use skillratings::weng_lin::{weng_lin_multi_team, WengLinConfig, WengLinRating};
-use skillratings::MultiTeamOutcome;
-
-// weng_lin and Outcomes are only used in tests
-#[cfg(test)]
-use skillratings::weng_lin::weng_lin;
-#[cfg(test)]
-use skillratings::Outcomes;
 
 use crate::checkpoint::{load_normalizer, CheckpointManager, CheckpointMetadata};
 use crate::config::{Config, EvalArgs};
@@ -38,7 +30,7 @@ use crate::human::{prompt_human_action, random_valid_action};
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
 use crate::profile::profile_function;
-use crate::tournament::{calculate_swiss_points, compute_display_names, print_rating_guide};
+use crate::tournament::{calculate_swiss_points, compute_display_names};
 
 /// Source of actions for a player slot.
 ///
@@ -595,39 +587,22 @@ impl EvalStats {
             );
         }
 
-        // Compute Weng-Lin ratings using per-game outcomes (N-player compatible)
+        // Compute Plackett-Luce ratings using all game outcomes
         // Ratings are NOT merged - computed per slot
-        let wl_config = WengLinConfig::new();
-        let mut ratings: Vec<WengLinRating> = (0..num_checkpoints)
-            .map(|_| WengLinRating {
-                rating: 25.0,
-                uncertainty: 25.0 / 3.0,
+        let pl_games: Vec<PlGameResult> = self
+            .game_outcomes
+            .iter()
+            .map(|outcome| {
+                let players: Vec<usize> = (0..outcome.0.len()).collect();
+                PlGameResult::new(players, outcome.0.clone())
             })
             .collect();
 
-        // Shuffle games to avoid completion-order bias
-        let mut outcomes = self.game_outcomes.clone();
-        let seed = outcomes.len() as u64;
-        let mut rng = StdRng::seed_from_u64(seed);
-        outcomes.shuffle(&mut rng);
-
-        // Process each game outcome with weng_lin_multi_team
-        for outcome in &outcomes {
-            let rating_arrs: Vec<[WengLinRating; 1]> = ratings.iter().map(|r| [*r]).collect();
-
-            let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_arrs
-                .iter()
-                .enumerate()
-                .map(|(i, arr)| (arr.as_slice(), MultiTeamOutcome::new(outcome.0[i])))
-                .collect();
-
-            let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
-            for (i, new_rating) in new_ratings.iter().enumerate() {
-                if !new_rating.is_empty() {
-                    ratings[i] = new_rating[0];
-                }
-            }
-        }
+        let ratings = plackett_luce::compute_ratings(
+            num_checkpoints,
+            &pl_games,
+            &PlackettLuceConfig::default(),
+        );
 
         // Find strongest checkpoint
         let (strongest_idx, _) = ratings
@@ -640,7 +615,7 @@ impl EvalStats {
             })
             .unwrap_or((0, &ratings[0]));
 
-        print_rating_guide();
+        plackett_luce::print_rating_guide();
         println!("\nRatings:");
         for (i, (name, rating)) in checkpoint_names.iter().zip(ratings.iter()).enumerate() {
             let marker = if i == strongest_idx {
@@ -649,7 +624,7 @@ impl EvalStats {
                 ""
             };
             println!(
-                "  {}: {:.1}±{:.1}{marker}",
+                "  {}: {:.0}±{:.0}{marker}",
                 name, rating.rating, rating.uncertainty
             );
         }
@@ -2519,145 +2494,6 @@ mod tests {
     fn test_player_source_display_name_random() {
         let random = PlayerSource::Random;
         assert_eq!(random.display_name(), "Random");
-    }
-
-    #[test]
-    fn test_weng_lin_rating_win_increases() {
-        // A single win should increase the winner's rating
-        let wl_config = WengLinConfig::new();
-        let p0 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-        let p1 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-
-        let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
-
-        // Winner's rating should increase, loser's should decrease
-        assert!(new_p0.rating > p0.rating);
-        assert!(new_p1.rating < p1.rating);
-    }
-
-    #[test]
-    fn test_weng_lin_rating_loss_decreases() {
-        // A single loss should decrease the loser's rating
-        let wl_config = WengLinConfig::new();
-        let p0 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-        let p1 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-
-        let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
-
-        // Loser's rating should decrease, winner's should increase
-        assert!(new_p0.rating < p0.rating);
-        assert!(new_p1.rating > p1.rating);
-    }
-
-    #[test]
-    fn test_weng_lin_rating_draw_minimal_change() {
-        // A draw between equal players should result in minimal rating change
-        let wl_config = WengLinConfig::new();
-        let p0 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-        let p1 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-
-        let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::DRAW, &wl_config);
-
-        // Ratings should stay close to original
-        assert!((new_p0.rating - p0.rating).abs() < 0.5);
-        assert!((new_p1.rating - p1.rating).abs() < 0.5);
-    }
-
-    #[test]
-    fn test_weng_lin_uncertainty_decreases() {
-        // Uncertainty should decrease as more games are played
-        let wl_config = WengLinConfig::new();
-        let initial_uncertainty = 25.0 / 3.0;
-        let mut p0 = WengLinRating {
-            rating: 0.0,
-            uncertainty: initial_uncertainty,
-        };
-        let mut p1 = WengLinRating {
-            rating: 0.0,
-            uncertainty: initial_uncertainty,
-        };
-
-        // Play 100 games
-        for _ in 0..50 {
-            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
-            p0 = new_p0;
-            p1 = new_p1;
-        }
-        for _ in 0..50 {
-            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
-            p0 = new_p0;
-            p1 = new_p1;
-        }
-
-        // Uncertainty should have decreased
-        assert!(p0.uncertainty < initial_uncertainty);
-        assert!(p1.uncertainty < initial_uncertainty);
-    }
-
-    #[test]
-    fn test_weng_lin_perfect_win_rate() {
-        // 100% win rate should give high positive rating
-        let wl_config = WengLinConfig::new();
-        let mut p0 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-        let mut p1 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-
-        // P0 wins all 100 games
-        for _ in 0..100 {
-            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::WIN, &wl_config);
-            p0 = new_p0;
-            p1 = new_p1;
-        }
-
-        assert!(p0.rating > 10.0); // Should have significant positive rating
-        assert!(p1.rating < -10.0); // P1 should have significant negative rating
-    }
-
-    #[test]
-    fn test_weng_lin_zero_win_rate() {
-        // 0% win rate should give low negative rating
-        let wl_config = WengLinConfig::new();
-        let mut p0 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-        let mut p1 = WengLinRating {
-            rating: 0.0,
-            uncertainty: 25.0 / 3.0,
-        };
-
-        // P0 loses all 100 games
-        for _ in 0..100 {
-            let (new_p0, new_p1) = weng_lin(&p0, &p1, &Outcomes::LOSS, &wl_config);
-            p0 = new_p0;
-            p1 = new_p1;
-        }
-
-        assert!(p0.rating < -10.0); // Should have significant negative rating
-        assert!(p1.rating > 10.0); // P1 should have significant positive rating
     }
 
     #[test]

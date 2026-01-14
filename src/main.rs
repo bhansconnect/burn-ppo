@@ -28,6 +28,7 @@ mod metrics;
 mod network;
 mod normalization;
 mod opponent_pool;
+mod plackett_luce;
 mod ppo;
 mod profile;
 mod progress;

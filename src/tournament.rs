@@ -3,7 +3,7 @@
 //! Features:
 //! - Swiss-style tournaments for efficient skill estimation (>50 matchups)
 //! - Round-robin for complete coverage (<=50 matchups)
-//! - Weng-Lin (`OpenSkill`) rating system with uncertainty tracking
+//! - Plackett-Luce rating system with uncertainty tracking (transitive inference)
 //! - Progress bars and intermediate standings
 
 use std::collections::{HashMap, HashSet};
@@ -20,8 +20,8 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use serde::Serialize;
-use skillratings::weng_lin::{weng_lin_multi_team, WengLinConfig, WengLinRating};
-use skillratings::MultiTeamOutcome;
+
+use crate::plackett_luce::{self, GameResult as PlGameResult, PlackettLuceConfig, PlayerRating};
 
 use crate::checkpoint::{load_metadata, CheckpointMetadata};
 use crate::config::TournamentArgs;
@@ -1010,68 +1010,28 @@ fn update_stats_from_games(contestants: &mut [Contestant], matchup: &MatchupGame
     }
 }
 
-/// Compute ratings from all tournament games in a shuffled order.
+/// Compute ratings from all tournament games using Plackett-Luce MLE.
 /// Returns a Vec of ratings indexed by contestant index.
-/// This is called at the end of the tournament to ensure unbiased sampling.
-fn compute_ratings(
-    num_contestants: usize,
-    all_games: &[SingleGameResult],
-    config: &WengLinConfig,
-    rng: &mut StdRng,
-) -> Vec<WengLinRating> {
-    // Initialize all ratings to default (25.0 mu, 8.333 sigma)
-    let mut ratings: Vec<WengLinRating> =
-        (0..num_contestants).map(|_| WengLinRating::new()).collect();
+/// Uses the `plackett_luce` module for transitive inference and uncertainty estimation.
+fn compute_ratings(num_contestants: usize, all_games: &[SingleGameResult]) -> Vec<PlayerRating> {
+    // Convert to plackett_luce format
+    let pl_games: Vec<PlGameResult> = all_games
+        .iter()
+        .map(|g| PlGameResult::new(g.contestants.clone(), g.placements.clone()))
+        .collect();
 
-    if all_games.is_empty() {
-        return ratings;
-    }
-
-    // Shuffle all games for unbiased rating updates
-    let mut games = all_games.to_vec();
-    games.shuffle(rng);
-
-    for game in &games {
-        // Build rating groups for weng_lin_multi_team
-        // Each "team" is a single player
-        let game_ratings: Vec<WengLinRating> =
-            game.contestants.iter().map(|&idx| ratings[idx]).collect();
-
-        let rating_refs: Vec<[WengLinRating; 1]> = game_ratings.iter().map(|r| [*r]).collect();
-
-        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_refs
-            .iter()
-            .enumerate()
-            .map(|(i, rating_arr)| {
-                let placement = game.placements[i];
-                (rating_arr.as_slice(), MultiTeamOutcome::new(placement))
-            })
-            .collect();
-
-        let new_ratings = weng_lin_multi_team(&rating_groups, config);
-
-        // Update ratings
-        for (i, &contestant_idx) in game.contestants.iter().enumerate() {
-            ratings[contestant_idx] = new_ratings[i][0];
-        }
-    }
-
-    ratings
+    plackett_luce::compute_ratings(num_contestants, &pl_games, &PlackettLuceConfig::default())
 }
 
-/// Print a quick guide to interpreting Openskill ratings
+/// Print a quick guide to interpreting Plackett-Luce ratings (Elo scale)
 pub fn print_rating_guide() {
-    println!();
-    println!("Rating Guide (Openskill):");
-    println!("  Win probability: +4 pts → 67% | +8 → 82% | +12 → 90% | +16 → 95%");
-    println!("  Uncertainty (σ): high = few games, may shift. Low = stable rating.");
-    println!("  Comparing: if 95% CIs (±2σ) overlap, difference may not be significant.");
+    plackett_luce::print_rating_guide();
 }
 
 /// Print current standings
 /// If ratings is None, shows standings without ratings (used during tournament)
 /// If ratings is Some, includes final ratings (used after tournament)
-fn print_standings(contestants: &[Contestant], header: &str, ratings: Option<&[WengLinRating]>) {
+fn print_standings(contestants: &[Contestant], header: &str, ratings: Option<&[PlayerRating]>) {
     println!("\n{header}");
 
     // Sort by Swiss points (descending), initial_seed as tiebreaker
@@ -1106,7 +1066,7 @@ fn print_standings(contestants: &[Contestant], header: &str, ratings: Option<&[W
 /// Print final tournament summary
 fn print_final_summary(
     contestants: &[Contestant],
-    ratings: &[WengLinRating],
+    ratings: &[PlayerRating],
     num_rounds: usize,
     num_games: usize,
 ) {
@@ -1281,7 +1241,7 @@ fn assign_run_colors(run_names: &[String]) -> Vec<(String, RGBColor)> {
 }
 
 /// Generate and display a rating graph for tournament contestants
-fn generate_rating_graph(contestants: &[Contestant], ratings: &[WengLinRating]) -> Result<()> {
+fn generate_rating_graph(contestants: &[Contestant], ratings: &[PlayerRating]) -> Result<()> {
     // Helper for x-axis label formatting (must be defined before use)
     #[expect(
         clippy::cast_sign_loss,
@@ -1693,7 +1653,7 @@ fn generate_swiss_points_graph(contestants: &[Contestant]) -> Result<()> {
 /// Build tournament results for JSON export
 fn build_results(
     contestants: &[Contestant],
-    ratings: &[WengLinRating],
+    ratings: &[PlayerRating],
     pods: &[(usize, MatchupGames)], // (round, result)
     num_rounds: usize,
     use_swiss: bool,
@@ -2049,9 +2009,6 @@ fn run_tournament_env<B: Backend, E: Environment>(
     let seed = args.seed.unwrap_or_else(rand::random);
     let mut rng = StdRng::seed_from_u64(seed);
 
-    // Weng-Lin config
-    let wl_config = WengLinConfig::new();
-
     // Track all pod results for JSON output
     let mut all_pods: Vec<(usize, MatchupGames)> = Vec::new();
 
@@ -2233,8 +2190,8 @@ fn run_tournament_env<B: Backend, E: Environment>(
         pb.finish_and_clear();
     }
 
-    // Compute final ratings from all games with shuffled order for unbiased sampling
-    let ratings = compute_ratings(contestants.len(), &all_game_results, &wl_config, &mut rng);
+    // Compute final ratings using Plackett-Luce MLE
+    let ratings = compute_ratings(contestants.len(), &all_game_results);
 
     // Final summary
     print_rating_guide();
@@ -2279,8 +2236,7 @@ mod tests {
     fn update_stats_and_ratings(
         contestants: &mut [Contestant],
         matchup: &MatchupGames,
-        config: &WengLinConfig,
-    ) -> Vec<WengLinRating> {
+    ) -> Vec<PlayerRating> {
         // Update stats
         update_stats_from_games(contestants, matchup);
 
@@ -2294,8 +2250,7 @@ mod tests {
             })
             .collect();
 
-        let mut rng = StdRng::seed_from_u64(42);
-        compute_ratings(contestants.len(), &games, config, &mut rng)
+        compute_ratings(contestants.len(), &games)
     }
 
     #[test]
@@ -2541,13 +2496,10 @@ mod tests {
 
     #[test]
     fn test_update_ratings_win() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
-
-        let initial_rating = 25.0; // Default WengLin rating
 
         // Player A wins (1st place), Player B loses (2nd place)
         let matchup = MatchupGames {
@@ -2557,12 +2509,12 @@ mod tests {
             }],
         };
 
-        let ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        let ratings = update_stats_and_ratings(&mut contestants, &matchup);
 
-        // Winner's rating should increase
-        assert!(ratings[0].rating > initial_rating);
-        // Loser's rating should decrease
-        assert!(ratings[1].rating < initial_rating);
+        // Winner's rating should be higher than loser's
+        assert!(ratings[0].rating > ratings[1].rating);
+        // Loser anchored at 1000
+        assert!((ratings[1].rating - 1000.0).abs() < 1.0);
         // Stats updated
         assert_eq!(contestants[0].wins(), 1);
         assert_eq!(contestants[0].losses(), 0);
@@ -2572,7 +2524,6 @@ mod tests {
 
     #[test]
     fn test_update_ratings_loss() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -2586,7 +2537,7 @@ mod tests {
             }],
         };
 
-        let _ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        let _ratings = update_stats_and_ratings(&mut contestants, &matchup);
 
         assert_eq!(contestants[0].losses(), 1);
         assert_eq!(contestants[1].wins(), 1);
@@ -2594,13 +2545,10 @@ mod tests {
 
     #[test]
     fn test_update_ratings_draw() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
-
-        let initial_rating = 25.0; // Default WengLin rating
 
         // Draw: both players get same placement
         let matchup = MatchupGames {
@@ -2610,18 +2558,16 @@ mod tests {
             }],
         };
 
-        let ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        let ratings = update_stats_and_ratings(&mut contestants, &matchup);
 
-        // Ratings should stay approximately the same for equal-rated players
-        assert!((ratings[0].rating - initial_rating).abs() < 1.0);
-        assert!((ratings[1].rating - initial_rating).abs() < 1.0);
+        // Ratings should be approximately equal for a draw
+        assert!((ratings[0].rating - ratings[1].rating).abs() < 50.0);
         assert_eq!(contestants[0].draws(), 1);
         assert_eq!(contestants[1].draws(), 1);
     }
 
     #[test]
     fn test_update_ratings_tracks_opponents() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -2634,7 +2580,7 @@ mod tests {
             }],
         };
 
-        let _ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        let _ratings = update_stats_and_ratings(&mut contestants, &matchup);
 
         assert!(contestants[0].opponents_faced.contains(&1));
         assert!(contestants[1].opponents_faced.contains(&0));
@@ -2642,7 +2588,6 @@ mod tests {
 
     #[test]
     fn test_update_ratings_multiple_games() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -2670,7 +2615,7 @@ mod tests {
             ],
         };
 
-        let ratings = update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        let ratings = update_stats_and_ratings(&mut contestants, &matchup);
 
         // A won more, should have higher rating
         assert!(ratings[0].rating > ratings[1].rating);
@@ -2959,15 +2904,15 @@ mod tests {
         contestants[1].placement_counts = vec![0, 3]; // 0 wins, 3 losses
         contestants[1].games_played = 3;
 
-        // Create mock ratings for the test
+        // Create mock ratings for the test (Elo scale)
         let ratings = vec![
-            WengLinRating {
-                rating: 28.0,
-                uncertainty: 8.0,
+            PlayerRating {
+                rating: 1400.0,
+                uncertainty: 100.0,
             },
-            WengLinRating {
-                rating: 22.0,
-                uncertainty: 8.0,
+            PlayerRating {
+                rating: 1000.0,
+                uncertainty: 100.0,
             },
         ];
 
@@ -3035,7 +2980,7 @@ mod tests {
             .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random, f64::from(i)))
             .collect();
 
-        let ratings: Vec<WengLinRating> = (0..4).map(|_| WengLinRating::new()).collect();
+        let ratings: Vec<PlayerRating> = (0..4).map(|_| PlayerRating::default()).collect();
 
         let args = TournamentArgs {
             sources: vec![],
@@ -3070,7 +3015,7 @@ mod tests {
             .map(|i| Contestant::new(format!("Player{i}"), PlayerSource::Random, f64::from(i)))
             .collect();
 
-        let ratings: Vec<WengLinRating> = (0..10).map(|_| WengLinRating::new()).collect();
+        let ratings: Vec<PlayerRating> = (0..10).map(|_| PlayerRating::default()).collect();
 
         let args = TournamentArgs {
             sources: vec![],
@@ -3541,7 +3486,7 @@ mod tests {
         contestants[0].draw_count = 1;
         contestants[0].games_played = 8;
 
-        let ratings = vec![WengLinRating::new()];
+        let ratings = vec![PlayerRating::default()];
 
         let args = TournamentArgs {
             sources: vec![],
@@ -3602,7 +3547,7 @@ mod tests {
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
-        let ratings: Vec<WengLinRating> = (0..2).map(|_| WengLinRating::new()).collect();
+        let ratings: Vec<PlayerRating> = (0..2).map(|_| PlayerRating::default()).collect();
 
         // Just verify it doesn't panic
         print_final_summary(&contestants, &ratings, 3, 10);
@@ -3617,7 +3562,7 @@ mod tests {
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
         ];
 
-        let ratings: Vec<WengLinRating> = (0..2).map(|_| WengLinRating::new()).collect();
+        let ratings: Vec<PlayerRating> = (0..2).map(|_| PlayerRating::default()).collect();
 
         let pods = vec![
             (
@@ -3858,7 +3803,6 @@ mod tests {
 
     #[test]
     fn test_update_ratings_awards_swiss_points() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -3875,7 +3819,7 @@ mod tests {
             }],
         };
 
-        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup);
 
         // Winner gets 1 point, loser gets 0
         assert!((contestants[0].swiss_points - 1.0).abs() < 0.001);
@@ -3884,7 +3828,6 @@ mod tests {
 
     #[test]
     fn test_update_ratings_awards_swiss_points_multiple_games() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -3910,7 +3853,7 @@ mod tests {
             ],
         };
 
-        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup);
 
         // With match-level scoring:
         // A has more raw points (2.5 vs 1.5) → 1st place → 1.0 Swiss points
@@ -4147,7 +4090,6 @@ mod tests {
 
     #[test]
     fn test_match_level_scoring_tie() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -4172,7 +4114,7 @@ mod tests {
             ],
         };
 
-        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup);
 
         // Both have equal raw points (2 each), so they tie for 1st place
         // With fractional ranking: both get 0.5 Swiss points (share positions 1&2)
@@ -4182,7 +4124,6 @@ mod tests {
 
     #[test]
     fn test_match_level_scoring_4player() {
-        let wl_config = WengLinConfig::new();
         let mut contestants = vec![
             Contestant::new("A".to_string(), PlayerSource::Random, 0.0),
             Contestant::new("B".to_string(), PlayerSource::Random, 0.0),
@@ -4209,7 +4150,7 @@ mod tests {
             ],
         };
 
-        update_stats_and_ratings(&mut contestants, &matchup, &wl_config);
+        update_stats_and_ratings(&mut contestants, &matchup);
 
         // A should be 1st, D should be last
         // A: 4*3 = 12 raw points → 1st → 3.0 Swiss points

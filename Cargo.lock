@@ -780,7 +780,6 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "skillratings",
  "stats_alloc",
  "tempfile",
  "toml 0.8.23",
@@ -5542,12 +5541,6 @@ checksum = "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6"
 dependencies = [
  "quote",
 ]
-
-[[package]]
-name = "skillratings"
-version = "0.28.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a6ee7559737c1adcd9184f168a04dc360c84878907c3ecc5c33c2320be1d47a"
 
 [[package]]
 name = "slab"
