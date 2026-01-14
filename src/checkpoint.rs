@@ -77,21 +77,6 @@ pub struct CheckpointMetadata {
     pub obs_shape: Option<(usize, usize, usize)>,
     /// Environment name for dispatching at eval time
     pub env_name: String,
-    /// Training skill rating (Weng-Lin mu) for pool evaluation
-    /// Rating accumulates across promotions
-    #[serde(default = "default_rating")]
-    pub training_rating: f64,
-    /// Training skill uncertainty (Weng-Lin sigma)
-    #[serde(default = "default_uncertainty")]
-    pub training_uncertainty: f64,
-}
-
-fn default_rating() -> f64 {
-    25.0
-}
-
-fn default_uncertainty() -> f64 {
-    25.0 / 3.0 // ~8.333, standard Weng-Lin sigma
 }
 
 fn default_network_type() -> String {
@@ -508,8 +493,6 @@ mod tests {
             cnn_num_fc_layers: 1,
             obs_shape: None,
             env_name: "cartpole".to_string(),
-            training_rating: 0.0,
-            training_uncertainty: 25.0 / 3.0,
         };
 
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
@@ -566,8 +549,6 @@ mod tests {
                     cnn_num_fc_layers: 1,
                     obs_shape: None,
                     env_name: "cartpole".to_string(),
-                    training_rating: 0.0,
-                    training_uncertainty: 25.0 / 3.0,
                 },
                 true,
             )
@@ -599,8 +580,6 @@ mod tests {
                     cnn_num_fc_layers: 1,
                     obs_shape: None,
                     env_name: "cartpole".to_string(),
-                    training_rating: 0.0,
-                    training_uncertainty: 25.0 / 3.0,
                 },
                 true,
             )
@@ -632,8 +611,6 @@ mod tests {
                     cnn_num_fc_layers: 1,
                     obs_shape: None,
                     env_name: "cartpole".to_string(),
-                    training_rating: 0.0,
-                    training_uncertainty: 25.0 / 3.0,
                 },
                 true,
             )
@@ -720,8 +697,6 @@ mod tests {
             cnn_num_fc_layers: 1,
             obs_shape: Some((6, 7, 2)),
             env_name: "connect_four".to_string(),
-            training_rating: 150.5,
-            training_uncertainty: 5.0,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
@@ -733,8 +708,6 @@ mod tests {
         assert!(loaded.split_networks);
         assert_eq!(loaded.env_name, "connect_four");
         assert_eq!(loaded.forked_from, Some("parent_run".to_string()));
-        assert!((loaded.training_rating - 150.5).abs() < f64::EPSILON);
-        assert!((loaded.training_uncertainty - 5.0).abs() < f64::EPSILON);
     }
 
     // =========================================
@@ -867,8 +840,6 @@ mod tests {
             cnn_num_fc_layers: 1,
             obs_shape: None,
             env_name: "test".to_string(),
-            training_rating: 25.0,
-            training_uncertainty: 25.0 / 3.0,
         };
 
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
@@ -929,8 +900,6 @@ mod tests {
             cnn_num_fc_layers: 1,
             obs_shape: None,
             env_name: "test".to_string(),
-            training_rating: 25.0,
-            training_uncertainty: 25.0 / 3.0,
         };
 
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
@@ -996,8 +965,6 @@ mod tests {
             cnn_num_fc_layers: 1,
             obs_shape: None,
             env_name: "test".to_string(),
-            training_rating: 25.0,
-            training_uncertainty: 25.0 / 3.0,
         };
         let split_path = manager.save(&split_model, &split_metadata, false).unwrap();
 
@@ -1028,8 +995,6 @@ mod tests {
             cnn_num_fc_layers: 1,
             obs_shape: None,
             env_name: "test".to_string(),
-            training_rating: 25.0,
-            training_uncertainty: 25.0 / 3.0,
         };
         let shared_path = manager
             .save(&shared_model, &shared_metadata, false)

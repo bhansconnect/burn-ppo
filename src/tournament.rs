@@ -341,20 +341,39 @@ fn get_best_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
         }
     }
 
-    // Fallback: scan for highest training_rating (with warning)
-    eprintln!(
-        "Warning: No 'best' symlink in {}, falling back to highest training_rating",
-        checkpoints_dir.display()
-    );
-
+    // Fallback: use latest checkpoint for multiplayer, highest avg_return for single-player
     let checkpoints = enumerate_checkpoints(checkpoints_dir).ok()?;
-    checkpoints.into_iter().max_by(|a, b| {
-        let rating_a = load_metadata(a).map(|m| m.training_rating).unwrap_or(0.0);
-        let rating_b = load_metadata(b).map(|m| m.training_rating).unwrap_or(0.0);
-        rating_a
-            .partial_cmp(&rating_b)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
+    if checkpoints.is_empty() {
+        return None;
+    }
+
+    // Check if this is a multiplayer run (sample first checkpoint's metadata)
+    let is_multiplayer = checkpoints
+        .first()
+        .and_then(|p| load_metadata(p).ok())
+        .is_some_and(|m| m.num_players > 1);
+
+    if is_multiplayer {
+        // For multiplayer, use latest checkpoint (avg_return is meaningless)
+        eprintln!(
+            "Warning: No 'best' symlink in {}, falling back to latest checkpoint",
+            checkpoints_dir.display()
+        );
+        checkpoints.last().cloned()
+    } else {
+        // For single-player, use highest avg_return
+        eprintln!(
+            "Warning: No 'best' symlink in {}, falling back to highest avg_return",
+            checkpoints_dir.display()
+        );
+        checkpoints.into_iter().max_by(|a, b| {
+            let return_a = load_metadata(a).map(|m| m.avg_return).unwrap_or(0.0);
+            let return_b = load_metadata(b).map(|m| m.avg_return).unwrap_or(0.0);
+            return_a
+                .partial_cmp(&return_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
 }
 
 /// Select checkpoints with priority: best, latest, then evenly distributed.
@@ -582,10 +601,11 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
 
     for path in resolved_sources {
         if is_checkpoint_dir(&path) {
-            // Single checkpoint - load training_rating from metadata
+            // Single checkpoint - use default seed for tournament
             let initial_seed = if single_training_run {
+                // Use avg_return as a proxy for skill level
                 load_metadata(&path)
-                    .map(|m| m.training_rating)
+                    .map(|m| f64::from(m.avg_return))
                     .unwrap_or(25.0)
             } else {
                 0.0 // Will be shuffled later
@@ -604,10 +624,10 @@ fn discover_contestants(args: &TournamentArgs) -> Result<Vec<Contestant>> {
             };
 
             for ckpt in selected {
-                // Load training_rating from checkpoint metadata
+                // Use avg_return as a proxy for skill level
                 let initial_seed = if single_training_run {
                     load_metadata(&ckpt)
-                        .map(|m| m.training_rating)
+                        .map(|m| f64::from(m.avg_return))
                         .unwrap_or(25.0)
                 } else {
                     0.0 // Will be shuffled later
@@ -3278,7 +3298,7 @@ mod tests {
             let ckpt_dir = temp.path().join(format!("step_{step}"));
             std::fs::create_dir(&ckpt_dir).unwrap();
             let metadata = format!(
-                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#
+                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#
             );
             std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
         }
@@ -3292,22 +3312,22 @@ mod tests {
     }
 
     #[test]
-    fn test_get_best_checkpoint_fallback_to_rating() {
+    fn test_get_best_checkpoint_fallback_to_avg_return() {
         let temp = TempDir::new().unwrap();
 
-        // Create checkpoints with metadata files containing different training_ratings
-        // No "best" symlink - should fall back to highest rating
-        for (step, rating) in [(100, 10.0), (200, 30.0), (300, 20.0)] {
+        // Create checkpoints with metadata files containing different avg_returns
+        // No "best" symlink - should fall back to highest avg_return
+        for (step, avg_return) in [(100, 10.0), (200, 30.0), (300, 20.0)] {
             let ckpt_dir = temp.path().join(format!("step_{step}"));
             std::fs::create_dir(&ckpt_dir).unwrap();
             let metadata = format!(
-                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":{rating},"training_uncertainty":8.333}}"#
+                r#"{{"step":{step},"avg_return":{avg_return},"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#
             );
             std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
         }
 
         let best = get_best_checkpoint(temp.path()).unwrap();
-        // Should fall back to highest training_rating (step_200 with rating 30.0)
+        // Should fall back to highest avg_return (step_200 with avg_return 30.0)
         assert!(best.ends_with("step_200"));
     }
 
@@ -3319,8 +3339,8 @@ mod tests {
         std::fs::create_dir(temp.path().join("step_100")).unwrap();
         std::fs::create_dir(temp.path().join("step_200")).unwrap();
 
-        // Should fall back to highest training_rating (which defaults to 0.0)
-        // With equal ratings, max_by picks last evaluated, which is step_200
+        // Should fall back to highest avg_return (which defaults to 0.0)
+        // With equal returns, max_by picks last evaluated, which is step_200
         let best = get_best_checkpoint(temp.path()).unwrap();
         assert!(best.ends_with("step_200"));
     }
@@ -3340,7 +3360,7 @@ mod tests {
             std::fs::create_dir(&ckpt2).unwrap();
             let step = i * 100;
             let metadata = format!(
-                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#
+                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#
             );
             std::fs::write(ckpt1.join("metadata.json"), &metadata).unwrap();
             std::fs::write(ckpt2.join("metadata.json"), &metadata).unwrap();
@@ -3382,26 +3402,27 @@ mod tests {
         let temp2 = TempDir::new().unwrap();
 
         // Create checkpoints with metadata - different best in each folder
-        for (step, rating) in [(100, 10.0), (200, 30.0), (300, 20.0)] {
+        // Using avg_return for fallback selection
+        for (step, avg_return) in [(100, 10.0), (200, 30.0), (300, 20.0)] {
             let ckpt_dir = temp1.path().join(format!("step_{step}"));
             std::fs::create_dir(&ckpt_dir).unwrap();
             let metadata = format!(
-                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":{rating},"training_uncertainty":8.333}}"#
+                r#"{{"step":{step},"avg_return":{avg_return},"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#
             );
             std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
         }
 
-        for (step, rating) in [(100, 5.0), (200, 15.0), (300, 25.0)] {
+        for (step, avg_return) in [(100, 5.0), (200, 15.0), (300, 25.0)] {
             let ckpt_dir = temp2.path().join(format!("step_{step}"));
             std::fs::create_dir(&ckpt_dir).unwrap();
             let metadata = format!(
-                r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":{rating},"training_uncertainty":8.333}}"#
+                r#"{{"step":{step},"avg_return":{avg_return},"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#
             );
             std::fs::write(ckpt_dir.join("metadata.json"), metadata).unwrap();
         }
 
         // Verify get_best_checkpoint works for each folder independently
-        // (no "best" symlink, so falls back to training_rating)
+        // (no "best" symlink, so falls back to avg_return)
         let best1 = get_best_checkpoint(temp1.path()).unwrap();
         let best2 = get_best_checkpoint(temp2.path()).unwrap();
         assert!(
@@ -4289,7 +4310,7 @@ mod tests {
             std::fs::create_dir(&ckpt_dir).unwrap();
             std::fs::write(
                 ckpt_dir.join("metadata.json"),
-                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#),
             ).unwrap();
         }
 
@@ -4313,7 +4334,7 @@ mod tests {
             std::fs::create_dir(&ckpt_dir).unwrap();
             std::fs::write(
                 ckpt_dir.join("metadata.json"),
-                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#),
             ).unwrap();
         }
 
@@ -4339,7 +4360,7 @@ mod tests {
             std::fs::create_dir(&ckpt_dir).unwrap();
             std::fs::write(
                 ckpt_dir.join("metadata.json"),
-                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#),
             ).unwrap();
         }
 
@@ -4366,7 +4387,7 @@ mod tests {
             std::fs::create_dir(&ckpt_dir).unwrap();
             std::fs::write(
                 ckpt_dir.join("metadata.json"),
-                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#),
             ).unwrap();
         }
 
@@ -4398,7 +4419,7 @@ mod tests {
             std::fs::create_dir(&ckpt_dir).unwrap();
             std::fs::write(
                 ckpt_dir.join("metadata.json"),
-                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test","training_rating":10.0,"training_uncertainty":8.333}}"#),
+                format!(r#"{{"step":{step},"avg_return":0.0,"rng_seed":42,"obs_dim":4,"action_count":2,"num_players":1,"hidden_size":64,"num_hidden":2,"split_networks":false,"activation":"tanh","env_name":"test"}}"#),
             ).unwrap();
         }
 

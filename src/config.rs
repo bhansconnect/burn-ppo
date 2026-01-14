@@ -263,12 +263,15 @@ pub struct TrainArgs {
 
     #[arg(
         long,
-        help = "Softmax temperature for opponent sampling (default: 1.0)"
+        help = "qi score learning rate for opponent sampling (default: 0.01)"
     )]
-    pub opponent_pool_sample_temperature: Option<f32>,
+    pub qi_eta: Option<f64>,
 
-    #[arg(long, action = clap::ArgAction::Set, help = "Use uniform random sampling (default: false)")]
-    pub opponent_pool_uniform_sampling: Option<bool>,
+    #[arg(long, help = "Enable qi debug graphs at each checkpoint")]
+    pub debug_qi: bool,
+
+    #[arg(long, help = "Print selected opponents during training and evaluation")]
+    pub debug_opponents: bool,
 
     #[arg(long, action = clap::ArgAction::Set, help = "Enable periodic pool evaluation (default: true)")]
     pub opponent_pool_eval_enabled: Option<bool>,
@@ -635,12 +638,15 @@ pub struct Config {
     /// Steps between opponent rotation triggers
     #[serde(default = "default_opponent_pool_rotation_steps")]
     pub opponent_pool_rotation_steps: usize,
-    /// Softmax temperature for opponent sampling (higher = more uniform)
-    #[serde(default = "default_opponent_pool_sample_temperature")]
-    pub opponent_pool_sample_temperature: f32,
-    /// Use uniform random sampling for opponents (ignores temperature/ratings)
+    /// qi score learning rate for opponent sampling
+    #[serde(default = "default_qi_eta")]
+    pub qi_eta: f64,
+    /// Enable qi debug graphs at each checkpoint
     #[serde(default)]
-    pub opponent_pool_uniform_sampling: bool,
+    pub debug_qi: bool,
+    /// Print selected opponents during training and evaluation
+    #[serde(default)]
+    pub debug_opponents: bool,
     /// Enable periodic pool evaluation
     #[serde(default = "default_true")]
     pub opponent_pool_eval_enabled: bool,
@@ -797,8 +803,8 @@ const fn default_opponent_pool_fraction() -> f32 {
 const fn default_opponent_pool_rotation_steps() -> usize {
     2000
 }
-const fn default_opponent_pool_sample_temperature() -> f32 {
-    1.0
+const fn default_qi_eta() -> f64 {
+    0.01 // OpenAI Five default
 }
 const fn default_opponent_pool_eval_games() -> usize {
     128
@@ -860,8 +866,9 @@ impl Default for Config {
             opponent_pool_enabled: true,
             opponent_pool_fraction: default_opponent_pool_fraction(),
             opponent_pool_rotation_steps: default_opponent_pool_rotation_steps(),
-            opponent_pool_sample_temperature: default_opponent_pool_sample_temperature(),
-            opponent_pool_uniform_sampling: false,
+            qi_eta: default_qi_eta(),
+            debug_qi: false,
+            debug_opponents: false,
             opponent_pool_eval_enabled: true,
             opponent_pool_eval_interval: None, // Defaults to checkpoint_freq
             opponent_pool_eval_games: default_opponent_pool_eval_games(),
@@ -1078,11 +1085,14 @@ impl Config {
         if let Some(v) = args.opponent_pool_rotation_steps {
             self.opponent_pool_rotation_steps = v;
         }
-        if let Some(v) = args.opponent_pool_sample_temperature {
-            self.opponent_pool_sample_temperature = v;
+        if let Some(v) = args.qi_eta {
+            self.qi_eta = v;
         }
-        if let Some(v) = args.opponent_pool_uniform_sampling {
-            self.opponent_pool_uniform_sampling = v;
+        if args.debug_qi {
+            self.debug_qi = true;
+        }
+        if args.debug_opponents {
+            self.debug_opponents = true;
         }
         if let Some(v) = args.opponent_pool_eval_enabled {
             self.opponent_pool_eval_enabled = v;
@@ -1262,8 +1272,8 @@ impl Config {
         if args.opponent_pool_rotation_steps.is_some() {
             ignored.push("--opponent-pool-rotation-steps");
         }
-        if args.opponent_pool_sample_temperature.is_some() {
-            ignored.push("--opponent-pool-sample-temperature");
+        if args.qi_eta.is_some() {
+            ignored.push("--qi-eta");
         }
         if args.opponent_pool_eval_enabled.is_some() {
             ignored.push("--opponent-pool-eval-enabled");
@@ -1416,8 +1426,8 @@ impl Config {
             if self.opponent_pool_rotation_steps == 0 {
                 bail!("opponent_pool_rotation_steps must be > 0");
             }
-            if self.opponent_pool_sample_temperature <= 0.0 {
-                bail!("opponent_pool_sample_temperature must be > 0");
+            if self.qi_eta <= 0.0 {
+                bail!("qi_eta must be > 0");
             }
             if self.opponent_pool_eval_games == 0 {
                 bail!("opponent_pool_eval_games must be > 0");

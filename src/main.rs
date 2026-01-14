@@ -406,8 +406,6 @@ where
             cnn_num_fc_layers: config.cnn_num_fc_layers,
             obs_shape,
             env_name: E::NAME.to_string(),
-            training_rating: 25.0,
-            training_uncertainty: 25.0 / 3.0,
         };
 
         checkpoint_manager.save(&model, &metadata, true)?;
@@ -499,27 +497,19 @@ where
     // Per-player episode data for logging (cleared on each log)
     let mut episodes_since_log_mp: Vec<(Vec<f32>, Option<GameOutcome>)> = Vec::new();
 
-    // Opponent pool initialization (if enabled)
+    // Opponent pool initialization (if training or evaluation uses it)
+    let needs_opponent_pool = config.opponent_pool_enabled || config.opponent_pool_eval_enabled;
     let mut opponent_pool: Option<OpponentPool<TB::InnerBackend>> =
-        if config.opponent_pool_enabled && num_players > 1 {
+        if needs_opponent_pool && num_players > 1 {
             let checkpoints_dir = run_dir.join("checkpoints");
-
-            // Get initial learner rating from parent checkpoint if forked
-            let initial_learner_rating = config.forked_from.as_ref().and_then(|parent_path| {
-                checkpoint::load_metadata(std::path::Path::new(parent_path))
-                    .ok()
-                    .map(|meta| (meta.training_rating, meta.training_uncertainty))
-            });
 
             match OpponentPool::new(
                 checkpoints_dir,
                 num_players_usize,
-                config.opponent_pool_sample_temperature,
-                config.opponent_pool_uniform_sampling,
+                config.qi_eta,
                 config.clone(),
                 device.clone(),
                 config.seed,
-                initial_learner_rating,
                 config.opponent_pool_size_limit,
             ) {
                 Ok(pool) => {
@@ -538,12 +528,12 @@ where
             None
         };
 
-    // Calculate number of opponent envs
+    // Calculate number of opponent envs (only when training with opponents is enabled)
     #[expect(
         clippy::cast_sign_loss,
         reason = "opponent_pool_fraction is always positive"
     )]
-    let num_opponent_envs = if opponent_pool.is_some() {
+    let num_opponent_envs = if config.opponent_pool_enabled && opponent_pool.is_some() {
         let raw = num_envs as f32 * config.opponent_pool_fraction;
         if raw > 0.0 && raw < 1.0 {
             progress.eprintln(&format!(
@@ -561,18 +551,19 @@ where
         0
     };
 
-    // Initialize env states for opponent pool training
-    let mut env_states: Vec<EnvState> = if let Some(ref mut pool) = opponent_pool {
-        if pool.has_opponents() {
-            (0..num_opponent_envs)
-                .map(|_| {
-                    let opponents = pool.sample_all_slots();
-                    EnvState::new(num_players_usize, opponents, pool.rng_mut())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
+    // Initialize env states for opponent pool training (only when training is enabled)
+    let mut env_states: Vec<EnvState> = if config.opponent_pool_enabled
+        && opponent_pool
+            .as_ref()
+            .is_some_and(opponent_pool::OpponentPool::has_opponents)
+    {
+        let pool = opponent_pool.as_mut().expect("checked above");
+        (0..num_opponent_envs)
+            .map(|_| {
+                let opponents = pool.sample_all_slots();
+                EnvState::new(num_players_usize, opponents, pool.rng_mut())
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -582,12 +573,6 @@ where
 
     // Track steps since last pool evaluation
     let mut last_pool_eval_step: usize = 0;
-
-    // Track best training rating for pool-eval-based best selection
-    // (used when pool_eval is enabled but pool_eval_best_margin is not set)
-    let mut best_training_rating: f64 = opponent_pool
-        .as_ref()
-        .map_or(25.0, |p| p.learner_rating().rating);
 
     // Determine how "best" checkpoint should be selected
     // - Single-player: use avg_return (auto_update_best = true)
@@ -695,11 +680,11 @@ where
                 global_step,
             );
 
-            // Queue opponent completions for batched rating updates
+            // Queue opponent completions for batched qi updates
             for completion in opponent_completions {
                 if !completion.placements.is_empty() {
                     let env_state = &env_states[completion.env_idx];
-                    pool.queue_game_for_rating(
+                    pool.queue_game_for_qi_update(
                         &completion.placements,
                         env_state.learner_position,
                         env_state,
@@ -713,8 +698,8 @@ where
             if steps_since_rotation >= config.opponent_pool_rotation_steps {
                 steps_since_rotation = 0;
 
-                // Apply pending ratings in shuffled order (avoids completion-order bias)
-                pool.apply_pending_ratings();
+                // Apply pending qi updates
+                pool.apply_pending_qi_updates();
 
                 // Refresh pool (scan for new checkpoints)
                 let _ = pool.scan_checkpoints();
@@ -725,6 +710,16 @@ where
                 // Queue new opponents for all env states (graceful rotation)
                 for state in &mut env_states {
                     state.pending_opponents = Some(pool.sample_all_slots());
+                }
+
+                // Debug output for opponent selection (to stderr for debug output)
+                if config.debug_opponents {
+                    let mut active = pool.sample_eval_opponents();
+                    active.sort_by(|a, b| b.cmp(a));
+                    let formatted = pool.format_selected_opponents(&active);
+                    progress.eprintln(&format!(
+                        "[debug-opponents] Rotation at step {global_step}: active pool [{formatted}]"
+                    ));
                 }
 
                 // Unload unused opponents
@@ -1087,16 +1082,6 @@ where
                         Ok(result) => {
                             // Log pool eval metrics
                             logger.log_scalar(
-                                "pool_eval/current_rating",
-                                result.current_rating as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
-                                "pool_eval/current_uncertainty",
-                                result.current_uncertainty as f32,
-                                global_step,
-                            )?;
-                            logger.log_scalar(
                                 "pool_eval/avg_points",
                                 result.current_avg_points as f32,
                                 global_step,
@@ -1156,18 +1141,15 @@ where
 
                             // Print pool eval status line
                             let status = format!(
-                                "[Pool Eval] Rating: {:.0} (\u{00b1}{:.0}) | vs Best: {:+.2} | Points: {:.2}",
-                                result.current_rating,
-                                result.current_uncertainty,
-                                result.vs_best_margin,
-                                result.current_avg_points
+                                "[Pool Eval] vs Best: {:+.2} | Points: {:.2}",
+                                result.vs_best_margin, result.current_avg_points
                             );
                             progress.println(&status);
 
-                            // Save updated pool ratings
-                            if let Err(e) = pool.save_ratings() {
+                            // Save updated qi scores
+                            if let Err(e) = pool.save_qi_scores() {
                                 progress.eprintln(&format!(
-                                    "Warning: Failed to save pool ratings after eval: {e}"
+                                    "Warning: Failed to save qi scores after eval: {e}"
                                 ));
                             }
 
@@ -1256,10 +1238,6 @@ where
                 cnn_num_fc_layers: config.cnn_num_fc_layers,
                 obs_shape,
                 env_name: E::NAME.to_string(),
-                training_rating: opponent_pool
-                    .as_ref()
-                    .map_or(25.0, |p| p.learner_rating().rating),
-                training_uncertainty: 25.0 / 3.0,
             };
 
             // Determine whether to auto-update "best" symlink
@@ -1295,26 +1273,10 @@ where
 
             // Add checkpoint to opponent pool
             if let Some(ref mut pool) = opponent_pool {
-                pool.add_checkpoint(checkpoint_path.clone(), &metadata);
-                // Save pool ratings periodically
-                if let Err(e) = pool.save_ratings() {
-                    progress.eprintln(&format!("Warning: Failed to save pool ratings: {e}"));
-                }
-            }
-
-            // For multiplayer with pool_eval but no margin threshold: update best based on training_rating
-            if num_players > 1
-                && config.opponent_pool_eval_enabled
-                && config.pool_eval_best_margin.is_none()
-                && metadata.training_rating > best_training_rating
-            {
-                best_training_rating = metadata.training_rating;
-                let checkpoint_name = checkpoint_path
-                    .file_name()
-                    .expect("checkpoint has filename")
-                    .to_string_lossy();
-                if let Err(e) = checkpoint_manager.set_best_checkpoint(&checkpoint_name) {
-                    progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
+                pool.add_checkpoint(checkpoint_path.clone(), metadata.step);
+                // Save qi scores periodically
+                if let Err(e) = pool.save_qi_scores() {
+                    progress.eprintln(&format!("Warning: Failed to save qi scores: {e}"));
                 }
             }
 
@@ -1352,6 +1314,30 @@ where
                 }
             };
             progress.println(&checkpoint_msg);
+
+            // Print qi histogram and log percentile metrics if debug_qi is enabled
+            if config.debug_qi {
+                if let Some(ref pool) = opponent_pool {
+                    if pool.has_opponents() {
+                        // Log percentile metrics
+                        let percentiles = pool.compute_qi_percentiles();
+                        for (i, &pos) in percentiles.iter().enumerate() {
+                            let pct = (i + 1) * 10;
+                            logger.log_scalar(
+                                &format!("qi/percentile_p{pct}"),
+                                pos as f32,
+                                global_step,
+                            )?;
+                        }
+
+                        // Print histogram to stderr
+                        let histogram = pool.generate_qi_histogram();
+                        for line in histogram.lines() {
+                            progress.eprintln(line);
+                        }
+                    }
+                }
+            }
 
             last_checkpoint_step = global_step;
             episodes_since_checkpoint.clear();
@@ -1405,10 +1391,6 @@ where
             cnn_num_fc_layers: config.cnn_num_fc_layers,
             obs_shape,
             env_name: E::NAME.to_string(),
-            training_rating: opponent_pool
-                .as_ref()
-                .map_or(25.0, |p| p.learner_rating().rating),
-            training_uncertainty: 25.0 / 3.0,
         };
 
         // Determine whether to auto-update "best" symlink (same logic as regular checkpoints)
@@ -1442,26 +1424,10 @@ where
 
         // Add checkpoint to opponent pool
         if let Some(ref mut pool) = opponent_pool {
-            pool.add_checkpoint(checkpoint_path.clone(), &metadata);
-            // Save pool ratings
-            if let Err(e) = pool.save_ratings() {
-                progress.eprintln(&format!("Warning: Failed to save pool ratings: {e}"));
-            }
-        }
-
-        // For multiplayer with pool_eval but no margin threshold: update best based on training_rating
-        if num_players > 1
-            && config.opponent_pool_eval_enabled
-            && config.pool_eval_best_margin.is_none()
-            && metadata.training_rating > best_training_rating
-        {
-            // best_training_rating = metadata.training_rating; // Not needed, training ending
-            let checkpoint_name = checkpoint_path
-                .file_name()
-                .expect("checkpoint has filename")
-                .to_string_lossy();
-            if let Err(e) = checkpoint_manager.set_best_checkpoint(&checkpoint_name) {
-                progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
+            pool.add_checkpoint(checkpoint_path.clone(), metadata.step);
+            // Save qi scores
+            if let Err(e) = pool.save_qi_scores() {
+                progress.eprintln(&format!("Warning: Failed to save qi scores: {e}"));
             }
         }
 
@@ -1624,6 +1590,8 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
             args.total_timesteps,
             args.max_training_time.clone(),
             running,
+            args.debug_qi,
+            args.debug_opponents,
         )
     } else {
         // Fresh run: load config to get run name, but let child create the directory
@@ -1658,6 +1626,8 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
             args.config.clone(),
             run_name,
             args.seed,
+            args.debug_qi,
+            args.debug_opponents,
         )
     };
 

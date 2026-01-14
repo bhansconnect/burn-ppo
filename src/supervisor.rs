@@ -37,6 +37,10 @@ pub struct TrainingSupervisor {
     run_name: Option<String>,
     /// Seed override (pass through to subprocess)
     seed_override: Option<u64>,
+    /// Enable qi debug output (pass through to subprocess)
+    debug_qi: bool,
+    /// Enable opponent debug output (pass through to subprocess)
+    debug_opponents: bool,
 }
 
 impl TrainingSupervisor {
@@ -48,6 +52,8 @@ impl TrainingSupervisor {
         total_timesteps_override: Option<usize>,
         max_training_time_override: Option<String>,
         running: Arc<AtomicBool>,
+        debug_qi: bool,
+        debug_opponents: bool,
     ) -> Self {
         Self {
             run_dir,
@@ -60,6 +66,8 @@ impl TrainingSupervisor {
             config_path: None,
             run_name: None,
             seed_override: None, // Seed not overridable for resume
+            debug_qi,
+            debug_opponents,
         }
     }
 
@@ -74,6 +82,8 @@ impl TrainingSupervisor {
         config_path: PathBuf,
         run_name: String,
         seed_override: Option<u64>,
+        debug_qi: bool,
+        debug_opponents: bool,
     ) -> Self {
         Self {
             run_dir,
@@ -86,6 +96,8 @@ impl TrainingSupervisor {
             config_path: Some(config_path),
             run_name: Some(run_name),
             seed_override,
+            debug_qi,
+            debug_opponents,
         }
     }
 
@@ -199,6 +211,14 @@ impl TrainingSupervisor {
         if let Some(seed) = self.seed_override {
             args.push("--seed".to_string());
             args.push(seed.to_string());
+        }
+
+        // Pass through debug flags
+        if self.debug_qi {
+            args.push("--debug-qi".to_string());
+        }
+        if self.debug_opponents {
+            args.push("--debug-opponents".to_string());
         }
 
         let mut child = Command::new(exe)

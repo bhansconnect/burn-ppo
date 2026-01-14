@@ -1371,3 +1371,310 @@ run_dir = "{}"
         "Final step ({final_step}) should be greater than initial step ({initial_step})"
     );
 }
+
+// ============================================================================
+// qi Score System Tests
+// ============================================================================
+
+#[test]
+fn test_connect_four_training_with_debug_qi() {
+    let dir = tempdir().unwrap();
+
+    // Create config for connect four with opponent pool and debug-qi enabled
+    // Use small checkpoint_freq to create multiple checkpoints for qi tracking
+    // Note: qi_eta is set in config because supervisor mode doesn't pass through all CLI args
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 4
+num_steps = 8
+total_timesteps = 256
+num_epochs = 1
+num_minibatches = 1
+hidden_size = 16
+num_hidden = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 32
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+opponent_pool_enabled = true
+opponent_pool_eval_enabled = true
+opponent_pool_eval_interval = 64
+opponent_pool_eval_games = 8
+qi_eta = 0.02
+debug_qi = true
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("c4_qi_config.toml");
+    fs::write(&config_path, config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "Connect Four training with debug-qi failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify run directory was created
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let checkpoints_dir = run_dir.join("checkpoints");
+    assert!(
+        checkpoints_dir.exists(),
+        "Checkpoints directory should exist"
+    );
+
+    // Verify qi_scores.json was saved
+    let qi_scores_path = checkpoints_dir.join("qi_scores.json");
+    assert!(
+        qi_scores_path.exists(),
+        "qi_scores.json should be saved when opponent pool is enabled"
+    );
+
+    // Verify qi_scores.json has valid content
+    let qi_scores_content = fs::read_to_string(&qi_scores_path).unwrap();
+    let qi_scores: serde_json::Value = serde_json::from_str(&qi_scores_content).unwrap();
+
+    assert!(
+        qi_scores.get("qi_eta").is_some(),
+        "qi_scores.json should have qi_eta field"
+    );
+    assert!(
+        qi_scores.get("opponents").is_some(),
+        "qi_scores.json should have opponents field"
+    );
+
+    // Verify the eta value was applied
+    let eta = qi_scores["qi_eta"].as_f64().unwrap();
+    assert!(
+        (eta - 0.02).abs() < 0.001,
+        "qi_eta should be 0.02, got {eta}"
+    );
+
+    // Count checkpoints (should have multiple due to checkpoint_freq=32 and total_timesteps=256)
+    let step_dirs: Vec<_> = fs::read_dir(&checkpoints_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("step_"))
+        })
+        .collect();
+
+    assert!(
+        step_dirs.len() >= 2,
+        "Should have at least 2 checkpoints for qi tracking, got {}",
+        step_dirs.len()
+    );
+
+    // Verify opponents were tracked in qi_scores.json
+    let opponents = qi_scores["opponents"].as_array().unwrap();
+    assert!(
+        !opponents.is_empty(),
+        "qi_scores.json should have tracked opponents"
+    );
+
+    // Verify each opponent has required fields
+    for opp in opponents {
+        assert!(
+            opp.get("checkpoint_name").is_some(),
+            "opponent should have checkpoint_name"
+        );
+        assert!(
+            opp.get("checkpoint_step").is_some(),
+            "opponent should have checkpoint_step"
+        );
+        assert!(opp.get("qi").is_some(), "opponent should have qi score");
+    }
+
+    // Check that debug-qi output was printed (goes to stderr)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The histogram output should appear after the first checkpoint is saved
+    // and when there's at least one opponent in the pool
+    // Look for key histogram elements:
+    assert!(
+        stderr.contains("qi Distribution") || stderr.contains("No opponents in pool"),
+        "debug_qi should print qi Distribution header or 'No opponents in pool' message.\nstderr: {stderr}"
+    );
+
+    // If there are opponents, we should see histogram content
+    if stderr.contains("qi Distribution") {
+        assert!(
+            stderr.contains("qi stats:"),
+            "debug_qi histogram should contain 'qi stats:' line.\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("Ckpt"),
+            "debug_qi histogram should contain 'Ckpt' column header.\nstderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_connect_four_training_with_debug_opponents() {
+    let dir = tempdir().unwrap();
+
+    // Create config for connect four with opponent pool and debug-opponents enabled
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 4
+num_steps = 8
+total_timesteps = 256
+num_epochs = 1
+num_minibatches = 1
+hidden_size = 16
+num_hidden = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 32
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+opponent_pool_enabled = true
+opponent_pool_rotation_steps = 32
+debug_opponents = true
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("c4_debug_opponents_config.toml");
+    fs::write(&config_path, config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "Connect Four training with debug-opponents failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Check that debug-opponents output was printed (goes to stderr)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // The debug output should contain opponent selection info when --debug-opponents is enabled
+    // After the first checkpoint and rotation, we should see opponent selection debug output
+    assert!(
+        stderr.contains("[debug-opponents]"),
+        "debug_opponents should print '[debug-opponents]' prefix.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Rotation at step"),
+        "debug_opponents should print 'Rotation at step' message.\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_pool_eval_includes_best_checkpoint() {
+    let dir = tempdir().unwrap();
+
+    // Create config that will generate best checkpoint via pool eval
+    // Use more timesteps and eval games to ensure best gets set
+    let config_content = format!(
+        r#"
+env = "connect_four"
+num_envs = 4
+num_steps = 8
+total_timesteps = 512
+num_epochs = 1
+num_minibatches = 1
+hidden_size = 16
+num_hidden = 1
+activation = "relu"
+learning_rate = 0.001
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.2
+entropy_coef = 0.01
+value_coef = 0.5
+max_grad_norm = 0.5
+adam_epsilon = 1e-5
+checkpoint_freq = 64
+log_freq = 1000
+seed = 42
+run_dir = "{}"
+opponent_pool_enabled = true
+opponent_pool_eval_enabled = true
+opponent_pool_eval_interval = 64
+opponent_pool_eval_games = 16
+pool_eval_best_margin = 0.5
+"#,
+        dir.path().display()
+    );
+
+    let config_path = dir.path().join("c4_pool_eval_best_config.toml");
+    fs::write(&config_path, config_content).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
+        .args(["train", "--config", config_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute");
+
+    assert!(
+        output.status.success(),
+        "Connect Four training with pool eval failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify run directory and best symlink were created
+    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
+    let checkpoints_dir = run_dir.join("checkpoints");
+    let best_path = checkpoints_dir.join("best");
+
+    // The best symlink should be created when model passes pool_eval_best_margin
+    // With pool_eval_best_margin = 0.5 (just need to match best), first eval should pass
+    assert!(
+        best_path.exists(),
+        "best symlink should be created after pool eval passes margin"
+    );
+
+    // Check metrics.jsonl for vs_best_margin entries
+    let metrics_path = run_dir.join("metrics.jsonl");
+    let metrics_content = fs::read_to_string(&metrics_path).unwrap();
+
+    // After best is set, subsequent pool evals should report vs_best_margin
+    // The metric is logged as pool_eval_vs_best_margin
+    let has_vs_best = metrics_content
+        .lines()
+        .any(|line| line.contains("pool_eval_vs_best_margin"));
+
+    // Note: vs_best_margin may not be present in the first few evals
+    // It requires best to exist first, then a subsequent eval
+    // With our config, we should get at least one
+    if !has_vs_best {
+        // This is acceptable if we didn't have enough evals after best was set
+        // The key thing is that best was created
+        // Pool eval messages go to stdout (via progress.println)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Pool Eval"),
+            "Should have run at least one pool eval.\nstdout: {stdout}"
+        );
+    }
+}

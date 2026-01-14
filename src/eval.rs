@@ -4,7 +4,7 @@
 //! - Watch mode: visualize games with ASCII rendering
 //! - Stats mode: parallel game execution with win/loss/draw statistics
 //! - Temperature-based sampling with schedule support
-//! - Weng-Lin (`OpenSkill`) rating for skill comparison
+//! - Weng-Lin (`OpenSkill`) rating for skill comparison (in tournaments)
 
 // Evaluation uses unwrap/expect for:
 // - Tensor data extraction (cannot fail with correct shapes)
@@ -783,7 +783,7 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
     config: &Config,
     device: &B::Device,
     seed: u64,
-    current_step: usize,
+    _current_step: usize,
     // Temperature parameters for pool evaluation
     temp: Option<f32>, // None = use E::EVAL_TEMP
     temp_final: f32,
@@ -801,8 +801,6 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
         return Ok(PoolEvalResult {
             current_avg_points: 0.0,
             vs_best_margin: 0.0,
-            current_rating: 25.0,
-            current_uncertainty: 25.0 / 3.0,
             draw_rate: 0.0,
             games_played: 0,
             num_opponents: 0,
@@ -810,53 +808,84 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
         });
     }
 
-    // Get active opponents for evaluation (limited by pool_size_limit)
+    // Try to load the "best" checkpoint from symlink for vs_best_margin calculation
+    let best_checkpoint_path = opponent_pool.checkpoints_dir().join("best");
+    let (best_model, best_normalizer, has_best) = if best_checkpoint_path.exists() {
+        match CheckpointManager::load::<B>(&best_checkpoint_path, config, device) {
+            Ok((model, _)) => {
+                let normalizer = load_normalizer(&best_checkpoint_path).ok().flatten();
+                (Some(model), normalizer, true)
+            }
+            Err(_) => (None, None, false),
+        }
+    } else {
+        (None, None, false)
+    };
+
+    // Get qi-sampled opponents for evaluation
     let sampled_indices = opponent_pool.sample_eval_opponents();
-    let num_sampled = sampled_indices.len();
-
-    // Track which index is the "best" (highest-rated) for vs_best metrics
-    let best_idx = opponent_pool.highest_rated();
-
-    // Get opponent data (paths and ratings)
     let opponent_data = opponent_pool.get_opponents_for_eval(&sampled_indices);
 
-    // Load opponent models
-    let mut opponent_models: Vec<ActorCritic<B>> = Vec::with_capacity(num_sampled);
-    let mut opponent_normalizers: Vec<Option<ObsNormalizer>> = Vec::with_capacity(num_sampled);
+    // Load qi-sampled opponent models
+    let mut qi_opponent_models: Vec<ActorCritic<B>> = Vec::new();
+    let mut qi_opponent_normalizers: Vec<Option<ObsNormalizer>> = Vec::new();
 
     for (path, _rating) in &opponent_data {
         let (model, _) = CheckpointManager::load::<B>(path, config, device)
             .with_context(|| format!("Failed to load opponent from {}", path.display()))?;
         let normalizer = load_normalizer(path)?;
-        opponent_models.push(model);
-        opponent_normalizers.push(normalizer);
+        qi_opponent_models.push(model);
+        qi_opponent_normalizers.push(normalizer);
     }
 
-    // For each game, we need (num_players - 1) opponents
-    // We'll cycle through sampled opponents to fill slots
-    // Setup: current model is checkpoint 0, opponents are checkpoints 1..num_sampled+1
-    // But run_stats_mode_env expects checkpoint_to_model mapping
-
-    // Build models array: [current_model, opp0, opp1, ...]
+    // Build models array: [current, best (if exists), qi-sampled opponents...]
+    // Model indices: 0 = current, 1 = best (if exists), 2+ = qi-sampled
     let mut models: Vec<Option<ActorCritic<B>>> = vec![Some(current_model.clone())];
-    for opp_model in opponent_models {
+    let mut normalizers: Vec<Option<ObsNormalizer>> = vec![current_normalizer.cloned()];
+
+    let _best_model_idx: Option<usize> = if has_best {
+        models.push(best_model);
+        normalizers.push(best_normalizer);
+        Some(1) // Best is at model index 1
+    } else {
+        None
+    };
+
+    for opp_model in qi_opponent_models {
         models.push(Some(opp_model));
     }
-
-    let mut normalizers: Vec<Option<ObsNormalizer>> = vec![current_normalizer.cloned()];
-    for opp_norm in opponent_normalizers {
+    for opp_norm in qi_opponent_normalizers {
         normalizers.push(opp_norm);
     }
 
-    // checkpoint_to_model: player 0 = current (model 0), players 1..N = opponents (cycle through)
-    // For a 4-player game with 3 opponents: [0, 1, 2, 3] or cycle if fewer
+    // Total opponents = best (optional) + qi-sampled
+    let num_qi_sampled = opponent_data.len();
+    let num_total_opponents = if has_best {
+        1 + num_qi_sampled
+    } else {
+        num_qi_sampled
+    };
+
+    // checkpoint_to_model mapping:
+    // Player 0 = current (model 0)
+    // Player 1 = best (model 1) if exists, else first qi-sampled (model 1)
+    // Players 2+ = cycle through remaining opponents
     let checkpoint_to_model: Vec<usize> = (0..num_players)
         .map(|i| {
             if i == 0 {
                 0 // Current model
+            } else if has_best && i == 1 {
+                1 // Best model
             } else {
-                // Cycle through opponents: 1, 2, 3, 1, 2, 3, ...
-                ((i - 1) % num_sampled) + 1
+                // Cycle through qi-sampled opponents
+                let qi_offset = if has_best { 2 } else { 1 }; // qi-sampled models start after best
+                let slot = if has_best { i - 2 } else { i - 1 }; // Slot index for qi-sampled
+                if num_qi_sampled > 0 {
+                    qi_offset + (slot % num_qi_sampled)
+                } else {
+                    // No qi-sampled opponents, only best (or empty)
+                    1
+                }
             }
         })
         .collect();
@@ -865,8 +894,15 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
         .map(|i| {
             if i == 0 {
                 "current".to_string()
+            } else if has_best && i == 1 {
+                "best".to_string()
             } else {
-                let opp_idx = (i - 1) % num_sampled;
+                let qi_offset = if has_best { i - 2 } else { i - 1 };
+                let opp_idx = if num_qi_sampled > 0 {
+                    qi_offset % num_qi_sampled
+                } else {
+                    0
+                };
                 opponent_data.get(opp_idx).map_or_else(
                     || format!("opp{opp_idx}"),
                     |(_, r)| r.checkpoint_name.clone(),
@@ -909,20 +945,12 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
     let mut vs_best_margin_total = 0.0;
     let mut draw_count = 0usize;
 
-    // Determine which player position has the best opponent
-    // Since sample_eval_opponents always puts best first, and player 1 uses model 1 (sampled[0]),
-    // player 1 is always the best opponent
-    let best_player_position: Option<usize> = best_idx.and_then(|bi| {
-        if sampled_indices.first() == Some(&bi) {
-            Some(1) // Player 1 uses model 1 = sampled[0] = best
-        } else {
-            None
-        }
-    });
+    // Best opponent is always at player position 1 (if it exists)
+    let best_player_position: Option<usize> = if has_best { Some(1) } else { None };
 
-    // Track per-opponent results for rating updates
+    // Track per-opponent results (for qi-sampled opponents, not including best)
     // opponent_results[opp_idx] = (games, points_for_current, points_for_opponent)
-    let mut opponent_results: Vec<(usize, f64, f64)> = vec![(0, 0.0, 0.0); num_sampled];
+    let mut opponent_results: Vec<(usize, f64, f64)> = vec![(0, 0.0, 0.0); num_qi_sampled];
 
     for outcome in &stats.game_outcomes {
         let points = calculate_swiss_points(&outcome.0);
@@ -933,18 +961,18 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
             vs_best_margin_total += points[0] - points[best_pos];
         }
 
-        // Track results per opponent (for rating updates)
+        // Track results per qi-sampled opponent (for stats, not including best)
         // Iterate over all opponent player positions (1 to num_players-1)
         for player in 1..num_players {
             // Get which model this player position is using
             let model_idx = checkpoint_to_model.get(player).copied().unwrap_or(1);
-            if model_idx > 0 && model_idx <= num_sampled {
-                let actual_opp = model_idx - 1;
-                if actual_opp < opponent_results.len() {
-                    opponent_results[actual_opp].0 += 1;
-                    opponent_results[actual_opp].1 += points[0]; // Current's points
-                    opponent_results[actual_opp].2 += points[player]; // Opponent's points
-                }
+            // qi-sampled models start at index 2 if best exists, else index 1
+            let qi_start = if has_best { 2 } else { 1 };
+            if model_idx >= qi_start && (model_idx - qi_start) < num_qi_sampled {
+                let actual_opp = model_idx - qi_start;
+                opponent_results[actual_opp].0 += 1;
+                opponent_results[actual_opp].1 += points[0]; // Current's points
+                opponent_results[actual_opp].2 += points[player]; // Opponent's points
             }
         }
 
@@ -964,95 +992,17 @@ pub fn run_pool_eval<B: Backend, E: Environment>(
         (0.0, 0.0, 0.0)
     };
 
-    // Compute current network's rating using Weng-Lin
-    let wl_config = WengLinConfig::new();
-
-    // Start with learner's current rating from pool (persisted across evaluations)
-    let mut current = *opponent_pool.learner_rating();
-
-    // Create opponent ratings map for updates
-    let mut opp_ratings: Vec<WengLinRating> = opponent_data
-        .iter()
-        .map(|(_, r)| WengLinRating {
-            rating: r.rating_mu,
-            uncertainty: r.rating_sigma,
-        })
-        .collect();
-
-    // Shuffle outcomes to avoid completion-order bias
-    let mut outcomes = stats.game_outcomes.clone();
-    outcomes.shuffle(&mut rng);
-
-    // Process each game
-    for outcome in &outcomes {
-        // Build rating groups for weng_lin_multi_team
-        let current_arr = [current];
-
-        // Build opponent rating arrays based on checkpoint_to_model mapping
-        let opp_arrs: Vec<[WengLinRating; 1]> = (1..num_players)
-            .map(|p| {
-                let model_idx = checkpoint_to_model[p];
-                if model_idx > 0 && model_idx <= num_sampled {
-                    [opp_ratings[model_idx - 1]]
-                } else {
-                    [current] // Fallback
-                }
-            })
-            .collect();
-
-        let mut rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> =
-            vec![(&current_arr[..], MultiTeamOutcome::new(outcome.0[0]))];
-
-        for (i, opp_arr) in opp_arrs.iter().enumerate() {
-            rating_groups.push((&opp_arr[..], MultiTeamOutcome::new(outcome.0[i + 1])));
-        }
-
-        let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
-
-        // Update current rating
-        if !new_ratings[0].is_empty() {
-            current = new_ratings[0][0];
-        }
-
-        // Update opponent ratings
-        for (i, opp_new) in new_ratings.iter().enumerate().skip(1) {
-            if !opp_new.is_empty() {
-                let model_idx = checkpoint_to_model[i];
-                if model_idx > 0 && model_idx <= num_sampled {
-                    opp_ratings[model_idx - 1] = opp_new[0];
-                }
-            }
-        }
-    }
-
-    // Build rating updates for the pool
-    let rating_updates: Vec<(usize, f64, f64, usize)> = sampled_indices
-        .iter()
-        .enumerate()
-        .map(|(i, &pool_idx)| {
-            (
-                pool_idx,
-                opp_ratings[i].rating,
-                opp_ratings[i].uncertainty,
-                total_games / num_sampled.max(1), // Approximate games per opponent
-            )
-        })
-        .collect();
-
-    // Update pool ratings (both learner and opponents)
-    opponent_pool.set_learner_rating(current);
-    opponent_pool.update_ratings_from_eval(&rating_updates, current_step);
+    // Note: qi scores are updated during training via queue_game_for_qi_update,
+    // not during pool evaluation. Pool eval just measures performance.
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(PoolEvalResult {
         current_avg_points,
         vs_best_margin,
-        current_rating: current.rating,
-        current_uncertainty: current.uncertainty,
         draw_rate,
         games_played: total_games,
-        num_opponents: num_sampled,
+        num_opponents: num_total_opponents,
         elapsed_ms,
     })
 }

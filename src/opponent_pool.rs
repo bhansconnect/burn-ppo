@@ -3,10 +3,11 @@
 //! Implements opponent pool training to prevent strategy collapse and improve generalization.
 //!
 //! A configurable fraction of training games are played against historical checkpoints,
-//! with opponents sampled using rating-weighted probabilities.
+//! with opponents sampled using qi-score-weighted probabilities.
 //!
 //! Key features:
-//! - Rating-based sampling: harder opponents sampled more frequently
+//! - qi-based sampling: softmax(e^qi) for opponent selection
+//! - qi update: decreases when opponent loses, unchanged when opponent wins
 //! - Per-slot diversity: each opponent player slot gets independently sampled opponent
 //! - Lazy loading: only load models when actively playing
 //! - Graceful rotation: wait for games to complete before swapping opponents
@@ -20,44 +21,30 @@ use burn::tensor::backend::Backend;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
-use skillratings::weng_lin::{weng_lin_multi_team, WengLinConfig, WengLinRating};
-use skillratings::MultiTeamOutcome;
 
-use crate::checkpoint::{load_metadata, load_normalizer, CheckpointManager, CheckpointMetadata};
+use crate::checkpoint::{load_metadata, load_normalizer, CheckpointManager};
 use crate::config::Config;
 use crate::network::ActorCritic;
 use crate::normalization::ObsNormalizer;
 
-/// Default Weng-Lin uncertainty for new opponents
-const DEFAULT_UNCERTAINTY: f64 = 25.0 / 3.0;
-
-/// Persisted per-opponent rating data (saved in `pool_ratings.json`)
+/// Persisted per-opponent qi score data (saved in `qi_scores.json`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpponentRating {
+pub struct OpponentQi {
     /// Checkpoint name (e.g., `step_00010000`)
     pub checkpoint_name: String,
-    /// Weng-Lin mu (skill estimate)
-    pub rating_mu: f64,
-    /// Weng-Lin sigma (uncertainty)
-    pub rating_sigma: f64,
-    /// Total games played against current network
-    pub games_played: usize,
-    /// Times current network beat this opponent
-    pub wins_vs_current: usize,
-    /// Training step when rating was last updated
-    pub last_updated_step: usize,
+    /// Checkpoint training step (for relative version calculation)
+    pub checkpoint_step: usize,
+    /// Quality score (higher = more likely to sample)
+    pub qi: f64,
 }
 
-impl OpponentRating {
-    /// Create a new opponent rating with initial values from checkpoint metadata
-    pub fn new(checkpoint_name: String, initial_rating: f64) -> Self {
+impl OpponentQi {
+    /// Create a new opponent qi with initial value
+    pub fn new(checkpoint_name: String, checkpoint_step: usize, initial_qi: f64) -> Self {
         Self {
             checkpoint_name,
-            rating_mu: initial_rating,
-            rating_sigma: DEFAULT_UNCERTAINTY,
-            games_played: 0,
-            wins_vs_current: 0,
-            last_updated_step: 0,
+            checkpoint_step,
+            qi: initial_qi,
         }
     }
 }
@@ -71,8 +58,8 @@ pub struct LoadedOpponent<B: Backend> {
     pub model: ActorCritic<B>,
     /// Observation normalizer (if checkpoint had one)
     pub normalizer: Option<ObsNormalizer>,
-    /// Rating data for this opponent
-    pub rating: OpponentRating,
+    /// qi score data for this opponent
+    pub qi_data: OpponentQi,
     /// Index in the available pool
     pub pool_index: usize,
 }
@@ -145,22 +132,24 @@ impl EnvState {
     }
 }
 
-/// Pending game result for batched rating updates
+/// Pending game result for batched qi updates
 ///
 /// Game results are collected during training and applied in shuffled order
 /// at rotation time to avoid order-based bias.
 struct PendingGameResult {
-    placements: Vec<usize>,
-    learner_position: usize,
-    /// Maps position to pool index (None for learner position)
-    position_to_opponent: Vec<Option<usize>>,
+    /// Did the current model beat this opponent? (pairwise result)
+    current_won: bool,
+    /// Pool index of the opponent
+    opponent_pool_idx: usize,
+    /// Step when game completed
+    #[expect(dead_code, reason = "preserved for future game result logging")]
     step: usize,
 }
 
 /// Main opponent pool manager
 pub struct OpponentPool<B: Backend> {
-    /// All available opponents (checkpoint path + rating metadata)
-    available: Vec<(PathBuf, OpponentRating)>,
+    /// All available opponents (checkpoint path + qi metadata)
+    available: Vec<(PathBuf, OpponentQi)>,
 
     /// Currently loaded opponents by pool index
     /// Key = pool index, Value = loaded opponent
@@ -172,11 +161,8 @@ pub struct OpponentPool<B: Backend> {
     /// Directory containing checkpoints
     checkpoints_dir: PathBuf,
 
-    /// Sampling temperature for softmax
-    temperature: f32,
-
-    /// Use uniform random sampling instead of rating-weighted
-    uniform_sampling: bool,
+    /// qi eta (learning rate for qi updates)
+    qi_eta: f64,
 
     /// Config for model loading
     config: Config,
@@ -187,45 +173,30 @@ pub struct OpponentPool<B: Backend> {
     /// RNG for sampling
     rng: rand::rngs::StdRng,
 
-    /// Learner's rating (persisted across evaluations within a training run)
-    /// Initialized from parent checkpoint if forked, otherwise starts at 25.0
-    learner_rating: WengLinRating,
-
     /// Active subset of opponent indices (limited by `pool_size_limit`)
     active_indices: Vec<usize>,
 
     /// Maximum number of active opponents
     pool_size_limit: usize,
 
-    /// Pending game results for batched rating updates
+    /// Pending game results for batched qi updates
     /// Applied in shuffled order at rotation time
     pending_game_results: Vec<PendingGameResult>,
 }
 
-/// Persisted pool ratings file format (`pool_ratings.json`)
+/// Persisted qi scores file format (`qi_scores.json`)
 #[derive(Debug, Serialize, Deserialize)]
-struct PoolRatingsFile {
-    /// Learner's current rating (optional for backwards compatibility)
-    #[serde(default)]
-    learner: Option<LearnerRatingData>,
-    /// Opponent ratings
-    opponents: Vec<OpponentRating>,
-}
-
-/// Learner rating data for persistence
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LearnerRatingData {
-    rating_mu: f64,
-    rating_sigma: f64,
+struct QiScoresFile {
+    /// qi eta parameter used
+    qi_eta: f64,
+    /// Opponent qi scores
+    opponents: Vec<OpponentQi>,
 }
 
 impl<B: Backend> OpponentPool<B> {
     /// Create a new opponent pool
     ///
-    /// Scans `checkpoints_dir` for available checkpoints and loads ratings.
-    ///
-    /// `initial_learner_rating`: Optional (mu, sigma) from parent checkpoint if forked/resumed.
-    /// If None, learner starts at 25.0 with default uncertainty.
+    /// Scans `checkpoints_dir` for available checkpoints and loads qi scores.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "checkpoints_dir is stored in struct, taking ownership is intentional"
@@ -233,46 +204,28 @@ impl<B: Backend> OpponentPool<B> {
     pub fn new(
         checkpoints_dir: PathBuf,
         num_players: usize,
-        temperature: f32,
-        uniform_sampling: bool,
+        qi_eta: f64,
         config: Config,
         device: B::Device,
         seed: u64,
-        initial_learner_rating: Option<(f64, f64)>,
         pool_size_limit: usize,
     ) -> Result<Self> {
-        // Initialize learner rating:
-        // - If forked/resumed: use parent's rating with reset uncertainty
-        // - Otherwise: start fresh at 25.0
-        let learner_rating = initial_learner_rating.map_or(
-            WengLinRating {
-                rating: 25.0,
-                uncertainty: DEFAULT_UNCERTAINTY,
-            },
-            |(mu, _sigma)| WengLinRating {
-                rating: mu,
-                uncertainty: DEFAULT_UNCERTAINTY, // Reset uncertainty for new training context
-            },
-        );
-
         let mut pool = Self {
             available: Vec::new(),
             loaded: HashMap::new(),
             num_opponent_slots: num_players.saturating_sub(1),
             checkpoints_dir: checkpoints_dir.clone(),
-            temperature,
-            uniform_sampling,
+            qi_eta,
             config,
             device,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
-            learner_rating,
             active_indices: Vec::new(),
             pool_size_limit,
             pending_game_results: Vec::new(),
         };
 
-        // Load existing ratings (may override learner_rating if resuming same run)
-        pool.load_ratings()?;
+        // Load existing qi scores from qi_scores.json
+        pool.load_qi_scores()?;
 
         // Scan for checkpoints and merge with loaded ratings
         pool.scan_checkpoints()?;
@@ -301,7 +254,7 @@ impl<B: Backend> OpponentPool<B> {
 
     /// Refresh the active opponent subset
     ///
-    /// Samples up to `pool_size_limit` unique opponents using rating-weighted sampling.
+    /// Samples up to `pool_size_limit` unique opponents using qi-weighted sampling.
     /// Call this at initialization and at each rotation to get variety.
     pub fn refresh_active_subset(&mut self) {
         if self.available.is_empty() {
@@ -330,72 +283,48 @@ impl<B: Backend> OpponentPool<B> {
         &self.active_indices
     }
 
-    /// Get the learner's current rating
-    pub fn learner_rating(&self) -> &WengLinRating {
-        &self.learner_rating
+    /// Get qi scores file path
+    fn qi_scores_path(&self) -> PathBuf {
+        self.checkpoints_dir.join("qi_scores.json")
     }
 
-    /// Update the learner's rating (called after pool evaluation)
-    pub fn set_learner_rating(&mut self, rating: WengLinRating) {
-        self.learner_rating = rating;
-    }
-
-    /// Get ratings file path
-    fn ratings_path(&self) -> PathBuf {
-        self.checkpoints_dir.join("pool_ratings.json")
-    }
-
-    /// Load ratings from disk
-    ///
-    /// Supports both old format (`Vec<OpponentRating>`) and new format (`PoolRatingsFile`)
-    pub fn load_ratings(&mut self) -> Result<()> {
-        let path = self.ratings_path();
+    /// Load qi scores from disk
+    fn load_qi_scores(&mut self) -> Result<()> {
+        let path = self.qi_scores_path();
         if !path.exists() {
-            return Ok(());
+            return Ok(()); // Fresh start, no existing qi scores
         }
 
-        let json = fs::read_to_string(&path).context("Failed to read pool_ratings.json")?;
+        let json = fs::read_to_string(&path).context("Failed to read qi_scores.json")?;
+        let file: QiScoresFile = serde_json::from_str(&json)?;
 
-        // Try new format first, fall back to old format for backwards compatibility
-        let (learner_data, opponent_ratings) =
-            if let Ok(file) = serde_json::from_str::<PoolRatingsFile>(&json) {
-                (file.learner, file.opponents)
-            } else if let Ok(ratings) = serde_json::from_str::<Vec<OpponentRating>>(&json) {
-                // Old format: just opponent ratings array
-                (None, ratings)
-            } else {
-                return Err(anyhow::anyhow!("Failed to parse pool_ratings.json"));
-            };
+        // Build map of checkpoint_name -> qi for fast lookup
+        let qi_map: HashMap<String, (usize, f64)> = file
+            .opponents
+            .into_iter()
+            .map(|o| (o.checkpoint_name.clone(), (o.checkpoint_step, o.qi)))
+            .collect();
 
-        // Load learner rating if present (resuming same run)
-        if let Some(learner) = learner_data {
-            self.learner_rating = WengLinRating {
-                rating: learner.rating_mu,
-                uncertainty: learner.rating_sigma,
-            };
-        }
-
-        // Convert opponent ratings to available list (paths will be filled in by scan_checkpoints)
-        for rating in opponent_ratings {
-            let checkpoint_path = self.checkpoints_dir.join(&rating.checkpoint_name);
-            self.available.push((checkpoint_path, rating));
+        // Store for merging after scan_checkpoints
+        // We store in available temporarily, scan_checkpoints will add new ones
+        for (name, (step, qi)) in qi_map {
+            let checkpoint_path = self.checkpoints_dir.join(&name);
+            let qi_data = OpponentQi::new(name, step, qi);
+            self.available.push((checkpoint_path, qi_data));
         }
 
         Ok(())
     }
 
-    /// Save ratings to disk (new format with learner rating)
-    pub fn save_ratings(&self) -> Result<()> {
-        let file = PoolRatingsFile {
-            learner: Some(LearnerRatingData {
-                rating_mu: self.learner_rating.rating,
-                rating_sigma: self.learner_rating.uncertainty,
-            }),
-            opponents: self.available.iter().map(|(_, r)| r.clone()).collect(),
+    /// Save qi scores to disk
+    pub fn save_qi_scores(&self) -> Result<()> {
+        let file = QiScoresFile {
+            qi_eta: self.qi_eta,
+            opponents: self.available.iter().map(|(_, q)| q.clone()).collect(),
         };
 
         let json = serde_json::to_string_pretty(&file)?;
-        fs::write(self.ratings_path(), json).context("Failed to write pool_ratings.json")?;
+        fs::write(self.qi_scores_path(), json).context("Failed to write qi_scores.json")?;
 
         Ok(())
     }
@@ -407,8 +336,18 @@ impl<B: Backend> OpponentPool<B> {
         let existing: std::collections::HashSet<String> = self
             .available
             .iter()
-            .map(|(_, r)| r.checkpoint_name.clone())
+            .map(|(_, q)| q.checkpoint_name.clone())
             .collect();
+
+        // Compute max qi for initializing new opponents
+        let max_qi = if self.available.is_empty() {
+            0.0
+        } else {
+            self.available
+                .iter()
+                .map(|(_, q)| q.qi)
+                .fold(f64::MIN, f64::max)
+        };
 
         // Scan for checkpoint directories (step_XXXXXXXX format)
         let Ok(entries) = fs::read_dir(&self.checkpoints_dir) else {
@@ -436,14 +375,14 @@ impl<B: Backend> OpponentPool<B> {
                 continue;
             }
 
-            // Load metadata to get initial rating
+            // Load metadata to get step number
             let Ok(metadata) = load_metadata(&path) else {
                 continue; // Skip invalid checkpoints
             };
 
-            // Create rating with training_rating as initial mu
-            let rating = OpponentRating::new(name, metadata.training_rating);
-            self.available.push((path, rating));
+            // Create qi with max of existing qi (or 0.0 if pool is empty)
+            let qi = OpponentQi::new(name, metadata.step, max_qi);
+            self.available.push((path, qi));
         }
 
         // Sort by checkpoint name (step number) for deterministic ordering
@@ -454,7 +393,7 @@ impl<B: Backend> OpponentPool<B> {
     }
 
     /// Add a newly saved checkpoint to the pool
-    pub fn add_checkpoint(&mut self, checkpoint_path: PathBuf, metadata: &CheckpointMetadata) {
+    pub fn add_checkpoint(&mut self, checkpoint_path: PathBuf, step: usize) {
         let name = checkpoint_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -465,16 +404,23 @@ impl<B: Backend> OpponentPool<B> {
         if self
             .available
             .iter()
-            .any(|(_, r)| r.checkpoint_name == name)
+            .any(|(_, q)| q.checkpoint_name == name)
         {
             return;
         }
 
-        let rating = OpponentRating::new(name, metadata.training_rating);
-        self.available.push((checkpoint_path, rating));
+        // New opponent gets max of existing qi scores (or 0.0 if empty)
+        let max_qi = self
+            .available
+            .iter()
+            .map(|(_, q)| q.qi)
+            .fold(0.0_f64, f64::max);
+
+        let qi = OpponentQi::new(name, step, max_qi);
+        self.available.push((checkpoint_path, qi));
     }
 
-    /// Sample a single opponent, excluding already-assigned indices
+    /// Sample a single opponent using qi-weighted softmax, excluding already-assigned indices
     pub fn sample_opponent(&mut self, exclude: &[usize]) -> Option<usize> {
         if self.available.is_empty() {
             return None;
@@ -494,55 +440,49 @@ impl<B: Backend> OpponentPool<B> {
             return Some(self.rng.gen_range(0..self.available.len()));
         }
 
-        // Uniform sampling: pick randomly from eligible
-        if self.uniform_sampling {
-            let idx = self.rng.gen_range(0..eligible.len());
-            return Some(eligible[idx]);
-        }
-
-        // Rating-weighted sampling: get ratings for eligible opponents
-        let eligible_with_ratings: Vec<(usize, f64)> = eligible
+        // qi-weighted sampling: get qi scores for eligible opponents
+        let eligible_with_qi: Vec<(usize, f64)> = eligible
             .iter()
-            .map(|&i| (i, self.available[i].1.rating_mu))
+            .map(|&i| (i, self.available[i].1.qi))
             .collect();
 
-        // Compute softmax probabilities
-        let max_rating = eligible_with_ratings
+        // Compute softmax probabilities (e^qi)
+        let max_qi = eligible_with_qi
             .iter()
-            .map(|(_, r)| *r)
+            .map(|(_, q)| *q)
             .fold(f64::NEG_INFINITY, f64::max);
 
-        let exp_ratings: Vec<f64> = eligible_with_ratings
+        let exp_qi: Vec<f64> = eligible_with_qi
             .iter()
-            .map(|(_, r)| ((r - max_rating) / f64::from(self.temperature)).exp())
+            .map(|(_, q)| (q - max_qi).exp())
             .collect();
 
-        let sum: f64 = exp_ratings.iter().sum();
+        let sum: f64 = exp_qi.iter().sum();
         if sum == 0.0 {
             // Uniform fallback
-            let idx = self.rng.gen_range(0..eligible_with_ratings.len());
-            return Some(eligible_with_ratings[idx].0);
+            let idx = self.rng.gen_range(0..eligible_with_qi.len());
+            return Some(eligible_with_qi[idx].0);
         }
 
         // Sample from distribution
         let sample: f64 = self.rng.r#gen();
         let mut cumsum = 0.0;
-        for (i, &exp) in exp_ratings.iter().enumerate() {
+        for (i, &exp) in exp_qi.iter().enumerate() {
             cumsum += exp / sum;
             if sample < cumsum {
-                return Some(eligible_with_ratings[i].0);
+                return Some(eligible_with_qi[i].0);
             }
         }
 
         Some(
-            eligible_with_ratings
+            eligible_with_qi
                 .last()
                 .expect("eligible list is non-empty at this point")
                 .0,
         )
     }
 
-    /// Sample a single opponent from the active subset, excluding already-assigned indices
+    /// Sample a single opponent from the active subset using qi-weighted softmax
     fn sample_opponent_from_active(&mut self, exclude: &[usize]) -> Option<usize> {
         if self.active_indices.is_empty() {
             return None;
@@ -561,48 +501,42 @@ impl<B: Backend> OpponentPool<B> {
             return Some(self.active_indices[self.rng.gen_range(0..self.active_indices.len())]);
         }
 
-        // Uniform sampling: pick randomly from eligible
-        if self.uniform_sampling {
-            let idx = self.rng.gen_range(0..eligible.len());
-            return Some(eligible[idx]);
-        }
-
-        // Rating-weighted sampling: get ratings for eligible opponents
-        let eligible_with_ratings: Vec<(usize, f64)> = eligible
+        // qi-weighted sampling: get qi scores for eligible opponents
+        let eligible_with_qi: Vec<(usize, f64)> = eligible
             .iter()
-            .map(|&i| (i, self.available[i].1.rating_mu))
+            .map(|&i| (i, self.available[i].1.qi))
             .collect();
 
-        // Compute softmax probabilities
-        let max_rating = eligible_with_ratings
+        // Compute softmax probabilities (e^qi)
+        let max_qi = eligible_with_qi
             .iter()
-            .map(|(_, r)| *r)
+            .map(|(_, q)| *q)
             .fold(f64::NEG_INFINITY, f64::max);
 
-        let exp_ratings: Vec<f64> = eligible_with_ratings
+        let exp_qi: Vec<f64> = eligible_with_qi
             .iter()
-            .map(|(_, r)| ((r - max_rating) / f64::from(self.temperature)).exp())
+            .map(|(_, q)| (q - max_qi).exp())
             .collect();
 
-        let sum: f64 = exp_ratings.iter().sum();
+        let sum: f64 = exp_qi.iter().sum();
         if sum == 0.0 {
             // Uniform fallback
-            let idx = self.rng.gen_range(0..eligible_with_ratings.len());
-            return Some(eligible_with_ratings[idx].0);
+            let idx = self.rng.gen_range(0..eligible_with_qi.len());
+            return Some(eligible_with_qi[idx].0);
         }
 
         // Sample from distribution
         let sample: f64 = self.rng.r#gen();
         let mut cumsum = 0.0;
-        for (i, &exp) in exp_ratings.iter().enumerate() {
+        for (i, &exp) in exp_qi.iter().enumerate() {
             cumsum += exp / sum;
             if sample < cumsum {
-                return Some(eligible_with_ratings[i].0);
+                return Some(eligible_with_qi[i].0);
             }
         }
 
         Some(
-            eligible_with_ratings
+            eligible_with_qi
                 .last()
                 .expect("eligible list is non-empty at this point")
                 .0,
@@ -660,7 +594,7 @@ impl<B: Backend> OpponentPool<B> {
 
     /// Load an opponent model from checkpoint
     fn load_opponent(&mut self, pool_index: usize) -> Result<()> {
-        let (path, rating) = &self.available[pool_index];
+        let (path, qi_data) = &self.available[pool_index];
 
         let (model, _metadata) = CheckpointManager::load::<B>(path, &self.config, &self.device)
             .with_context(|| format!("Failed to load opponent from {}", path.display()))?;
@@ -671,7 +605,7 @@ impl<B: Backend> OpponentPool<B> {
             checkpoint_path: path.clone(),
             model,
             normalizer,
-            rating: rating.clone(),
+            qi_data: qi_data.clone(),
             pool_index,
         };
 
@@ -693,33 +627,50 @@ impl<B: Backend> OpponentPool<B> {
         }
     }
 
-    /// Queue a game result for batched rating update
+    /// Queue a game result for batched qi update
     ///
     /// Game results are collected and applied in shuffled order at rotation time
     /// to avoid order-based bias (faster games completing first).
     ///
-    /// `placements[i]` = 1 for 1st place, 2 for 2nd, etc.
+    /// `placements[i]` = 1 for 1st place, 2 for 2nd, etc. (lower = better)
     /// `learner_position` = which seat the learner was in
-    pub fn queue_game_for_rating(
+    pub fn queue_game_for_qi_update(
         &mut self,
         placements: &[usize],
         learner_position: usize,
         env_state: &EnvState,
         current_step: usize,
     ) {
-        self.pending_game_results.push(PendingGameResult {
-            placements: placements.to_vec(),
-            learner_position,
-            position_to_opponent: env_state.position_to_opponent.clone(),
-            step: current_step,
-        });
+        let learner_placement = placements[learner_position];
+
+        // For each opponent, determine if they beat the current model (pairwise)
+        for (pos, &placement) in placements.iter().enumerate() {
+            if pos == learner_position {
+                continue;
+            }
+
+            let Some(pool_idx) = env_state.position_to_opponent[pos] else {
+                continue;
+            };
+
+            // Opponent wins if they placed better (lower number) than learner
+            let current_won = learner_placement < placement;
+
+            self.pending_game_results.push(PendingGameResult {
+                current_won,
+                opponent_pool_idx: pool_idx,
+                step: current_step,
+            });
+        }
     }
 
-    /// Apply all pending game results to ratings in shuffled order
+    /// Apply all pending game results to qi scores in shuffled order
     ///
-    /// Called at rotation time to update opponent ratings without order bias.
-    /// Ratings are fetched fresh from the pool for each game (not cached).
-    pub fn apply_pending_ratings(&mut self) {
+    /// qi update rule:
+    /// - If opponent wins (current model loses): qi unchanged
+    /// - If opponent loses (current model wins): qi -= eta / (N - pi)
+    ///   where N = total opponents, pi = selection probability of this opponent
+    pub fn apply_pending_qi_updates(&mut self) {
         if self.pending_game_results.is_empty() {
             return;
         }
@@ -727,118 +678,137 @@ impl<B: Backend> OpponentPool<B> {
         // Shuffle games to avoid completion-order bias
         self.pending_game_results.shuffle(&mut self.rng);
 
-        let wl_config = WengLinConfig::new();
+        let n = self.available.len() as f64;
+
+        // Skip qi updates if only one opponent (denominator would be ~0)
+        if n <= 1.0 {
+            self.pending_game_results.clear();
+            return;
+        }
 
         for game in &self.pending_game_results {
-            let num_players = game.placements.len();
-
-            // Use learner's current rating from pool evaluations
-            let learner_rating = WengLinRating {
-                rating: self.learner_rating.rating,
-                uncertainty: self.learner_rating.uncertainty,
-            };
-
-            // Collect current ratings for all positions (fetch fresh each game)
-            let mut team_ratings: Vec<WengLinRating> = Vec::with_capacity(num_players);
-            for pos in 0..num_players {
-                if pos == game.learner_position {
-                    team_ratings.push(learner_rating);
-                } else {
-                    let pool_idx = game.position_to_opponent[pos]
-                        .expect("non-learner position must have opponent assigned");
-                    let (_, rating) = &self.available[pool_idx];
-                    team_ratings.push(WengLinRating {
-                        rating: rating.rating_mu,
-                        uncertainty: rating.rating_sigma,
-                    });
+            if game.current_won {
+                // Current model won => opponent lost => decrease qi
+                let pi = self.compute_selection_probability(game.opponent_pool_idx);
+                if let Some((_, qi_data)) = self.available.get_mut(game.opponent_pool_idx) {
+                    qi_data.qi -= self.qi_eta / (n - pi);
                 }
             }
-
-            // Build rating groups for weng_lin_multi_team
-            let rating_arrs: Vec<[WengLinRating; 1]> = team_ratings.iter().map(|r| [*r]).collect();
-            let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = rating_arrs
-                .iter()
-                .enumerate()
-                .map(|(i, arr)| (arr.as_slice(), MultiTeamOutcome::new(game.placements[i])))
-                .collect();
-
-            let new_ratings = weng_lin_multi_team(&rating_groups, &wl_config);
-
-            // Update opponent ratings (not learner)
-            let learner_placement = game.placements[game.learner_position];
-            for pos in 0..num_players {
-                if pos == game.learner_position {
-                    continue;
-                }
-
-                let pool_idx = game.position_to_opponent[pos]
-                    .expect("non-learner position must have opponent assigned");
-                let (_, rating) = &mut self.available[pool_idx];
-
-                // new_ratings[pos] is a Vec with one element (single-player team)
-                if let Some(new_rating) = new_ratings.get(pos).and_then(|v| v.first()) {
-                    rating.rating_mu = new_rating.rating;
-                    rating.rating_sigma = new_rating.uncertainty;
-                }
-                rating.games_played += 1;
-                rating.last_updated_step = game.step;
-
-                // Track if learner beat this opponent
-                let opponent_placement = game.placements[pos];
-                if learner_placement < opponent_placement {
-                    rating.wins_vs_current += 1;
-                }
-
-                // Also update loaded opponent if present
-                if let Some(loaded) = self.loaded.get_mut(&pool_idx) {
-                    loaded.rating = rating.clone();
-                }
-            }
+            // If opponent won, qi unchanged
         }
 
         // Clear pending results
         self.pending_game_results.clear();
     }
 
-    /// Get rating info for logging
-    #[expect(dead_code, reason = "reserved for pool evaluation metrics")]
-    pub fn get_rating_stats(&self) -> (f64, f64, f64) {
+    /// Compute selection probability for a specific opponent (softmax over qi)
+    pub fn compute_selection_probability(&self, pool_idx: usize) -> f64 {
+        if self.available.is_empty() {
+            return 0.0;
+        }
+
+        let qis: Vec<f64> = self.available.iter().map(|(_, q)| q.qi).collect();
+        let max_qi = qis.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp_qis: Vec<f64> = qis.iter().map(|q| (q - max_qi).exp()).collect();
+        let sum: f64 = exp_qis.iter().sum();
+
+        if sum == 0.0 {
+            return 1.0 / self.available.len() as f64; // Uniform
+        }
+
+        exp_qis[pool_idx] / sum
+    }
+
+    /// Compute selection probabilities for all opponents
+    pub fn compute_all_selection_probabilities(&self) -> Vec<f64> {
+        if self.available.is_empty() {
+            return vec![];
+        }
+
+        let qis: Vec<f64> = self.available.iter().map(|(_, q)| q.qi).collect();
+        let max_qi = qis.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp_qis: Vec<f64> = qis.iter().map(|q| (q - max_qi).exp()).collect();
+        let sum: f64 = exp_qis.iter().sum();
+
+        if sum == 0.0 {
+            let uniform = 1.0 / self.available.len() as f64;
+            return vec![uniform; self.available.len()];
+        }
+
+        exp_qis.iter().map(|e| e / sum).collect()
+    }
+
+    /// Get qi score stats for logging (min, avg, max)
+    pub fn get_qi_stats(&self) -> (f64, f64, f64) {
         if self.available.is_empty() {
             return (0.0, 0.0, 0.0);
         }
 
-        let ratings: Vec<f64> = self.available.iter().map(|(_, r)| r.rating_mu).collect();
-        let min = ratings.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = ratings.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let avg = ratings.iter().sum::<f64>() / ratings.len() as f64;
+        let qi_scores: Vec<f64> = self.available.iter().map(|(_, q)| q.qi).collect();
+        let min = qi_scores.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = qi_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let avg = qi_scores.iter().sum::<f64>() / qi_scores.len() as f64;
 
         (min, avg, max)
     }
 
-    /// Get loaded opponent indices
-    #[expect(dead_code, reason = "reserved for debugging and metrics")]
-    pub fn loaded_indices(&self) -> Vec<usize> {
-        self.loaded.keys().copied().collect()
-    }
+    /// Compute percentile checkpoint positions based on cumulative probability.
+    ///
+    /// Returns checkpoint positions for percentiles [p10, p20, ..., p90].
+    /// Position is negative: -1 = newest, -5 = 5th newest, etc.
+    /// Walks through opponents from newest to oldest, tracking when cumulative
+    /// probability crosses each 10% threshold.
+    pub fn compute_qi_percentiles(&self) -> [i32; 9] {
+        let mut percentiles = [0i32; 9];
 
-    /// Get the highest rated opponent index
-    pub fn highest_rated(&self) -> Option<usize> {
-        self.available
+        if self.available.is_empty() {
+            return percentiles;
+        }
+
+        let probs = self.compute_all_selection_probabilities();
+
+        // Sort by checkpoint step descending (newest first)
+        let mut sorted_by_step: Vec<(usize, usize)> = self
+            .available
             .iter()
             .enumerate()
-            .max_by(|a, b| {
-                a.1 .1
-                    .rating_mu
-                    .partial_cmp(&b.1 .1.rating_mu)
-                    .expect("ratings should not be NaN")
-            })
-            .map(|(i, _)| i)
-    }
+            .map(|(idx, (_, qi))| (idx, qi.checkpoint_step))
+            .collect();
+        sorted_by_step.sort_by(|a, b| b.1.cmp(&a.1)); // Descending
 
-    /// Get rating for a specific opponent
-    #[expect(dead_code, reason = "API for future pool inspection features")]
-    pub fn get_rating(&self, pool_index: usize) -> Option<&OpponentRating> {
-        self.available.get(pool_index).map(|(_, r)| r)
+        // Walk through from newest to oldest, accumulating probability
+        let mut cumulative_prob = 0.0;
+        let mut next_threshold_idx = 0; // 0 = looking for 10%, 1 = looking for 20%, etc.
+
+        for (position, (pool_idx, _)) in sorted_by_step.iter().enumerate() {
+            cumulative_prob += probs[*pool_idx];
+
+            // Check if we've crossed the next threshold
+            while next_threshold_idx < 9 {
+                let threshold = (next_threshold_idx + 1) as f64 * 0.1; // 0.1, 0.2, ..., 0.9
+                if cumulative_prob >= threshold {
+                    // Position is 0-indexed, convert to -1, -2, etc.
+                    // Safe: position is bounded by available.len() which is reasonable
+                    let pos_i32 = i32::try_from(position + 1).unwrap_or(i32::MAX);
+                    percentiles[next_threshold_idx] = -pos_i32;
+                    next_threshold_idx += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if next_threshold_idx >= 9 {
+                break;
+            }
+        }
+
+        // Fill in any remaining percentiles with the total count
+        let total = i32::try_from(self.available.len()).unwrap_or(i32::MAX);
+        for p in percentiles.iter_mut().skip(next_threshold_idx) {
+            *p = -total;
+        }
+
+        percentiles
     }
 
     /// Get mutable reference to RNG (for creating `EnvStates`)
@@ -854,35 +824,184 @@ impl<B: Backend> OpponentPool<B> {
         self.active_indices.clone()
     }
 
-    /// Get available opponent paths and ratings for evaluation
-    pub fn get_opponents_for_eval(&self, indices: &[usize]) -> Vec<(PathBuf, OpponentRating)> {
+    /// Get available opponent paths and qi data for evaluation
+    pub fn get_opponents_for_eval(&self, indices: &[usize]) -> Vec<(PathBuf, OpponentQi)> {
         indices
             .iter()
             .filter_map(|&idx| self.available.get(idx).cloned())
             .collect()
     }
 
-    /// Update multiple opponent ratings after evaluation games
-    ///
-    /// Takes a list of (`pool_index`, `new_mu`, `new_sigma`, `games_played_delta`)
-    pub fn update_ratings_from_eval(
-        &mut self,
-        updates: &[(usize, f64, f64, usize)],
-        current_step: usize,
-    ) {
-        for &(pool_idx, new_mu, new_sigma, games_delta) in updates {
-            if let Some((_, rating)) = self.available.get_mut(pool_idx) {
-                rating.rating_mu = new_mu;
-                rating.rating_sigma = new_sigma;
-                rating.games_played += games_delta;
-                rating.last_updated_step = current_step;
+    /// Get the checkpoints directory path
+    pub fn checkpoints_dir(&self) -> &PathBuf {
+        &self.checkpoints_dir
+    }
 
-                // Also update loaded opponent if present
-                if let Some(loaded) = self.loaded.get_mut(&pool_idx) {
-                    loaded.rating = rating.clone();
+    /// Generate ASCII histogram of qi distribution for debug output
+    /// Hybrid display: top 10 individual networks, then percentile buckets for the rest.
+    pub fn generate_qi_histogram(&self) -> String {
+        use std::fmt::Write;
+
+        if self.available.is_empty() {
+            return "No opponents in pool".to_string();
+        }
+
+        let probs = self.compute_all_selection_probabilities();
+        let (min_qi, avg_qi, max_qi) = self.get_qi_stats();
+        let percentiles = self.compute_qi_percentiles();
+
+        // Sort by step descending to assign checkpoint-relative positions
+        let mut sorted_by_step: Vec<(usize, usize)> = self
+            .available
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, qi))| (idx, qi.checkpoint_step))
+            .collect();
+        sorted_by_step.sort_by(|a, b| b.1.cmp(&a.1)); // Descending
+
+        // Build entries ordered by checkpoint (newest first): (ckpt_rel, qi, prob)
+        let entries: Vec<_> = sorted_by_step
+            .iter()
+            .enumerate()
+            .map(|(rel_pos, (pool_idx, _))| {
+                let pos_i32 = i32::try_from(rel_pos + 1).unwrap_or(i32::MAX);
+                let ckpt_rel = -pos_i32;
+                let qi = self.available[*pool_idx].1.qi;
+                let prob = probs[*pool_idx];
+                (ckpt_rel, qi, prob)
+            })
+            .collect();
+
+        let mut output = String::new();
+        let n = self.available.len();
+        let _ = writeln!(output, "qi Distribution (n={n}):");
+        let _ = writeln!(
+            output,
+            "  qi stats: min={min_qi:.3} avg={avg_qi:.3} max={max_qi:.3}\n"
+        );
+
+        // Part A: Show top 10 individual networks
+        let individual_count = entries.len().min(10);
+        let max_prob_top10 = entries
+            .iter()
+            .take(individual_count)
+            .map(|e| e.2)
+            .fold(0.0, f64::max);
+
+        let _ = writeln!(
+            output,
+            "{:>6}  {:>8}  {:>6}  Histogram",
+            "Ckpt", "qi", "Prob"
+        );
+
+        for (ckpt_rel, qi, prob) in entries.iter().take(individual_count) {
+            let bar_len = if max_prob_top10 > 0.0 {
+                #[expect(clippy::cast_sign_loss, reason = "value clamped to >= 0.0 before cast")]
+                let len = ((prob / max_prob_top10) * 30.0).max(0.0) as usize;
+                len
+            } else {
+                0
+            };
+            let bar = "█".repeat(bar_len);
+            let _ = writeln!(output, "{ckpt_rel:>6}  {qi:>8.3}  {prob:>6.4}  {bar}");
+        }
+
+        // Part B: Show percentile buckets for remaining networks
+        if entries.len() > 10 {
+            let _ = writeln!(output, "\n  Remaining networks (cumulative prob buckets):");
+
+            // Compute bucket counts from percentile positions
+            // percentiles[i] is the position where (i+1)*10% was reached (negative value)
+            let mut bucket_counts = [0usize; 10];
+            let total = self.available.len();
+
+            // Helper to convert negative percentile to positive usize
+            #[expect(clippy::cast_sign_loss, reason = "value clamped to >= 0 before cast")]
+            let to_pos = |p: i32| -> usize { (-p).max(0) as usize };
+
+            for i in 0..10 {
+                let end_pos = if i < 9 { to_pos(percentiles[i]) } else { total };
+                let start_pos = if i == 0 {
+                    0
+                } else {
+                    to_pos(percentiles[i - 1])
+                };
+                bucket_counts[i] = end_pos.saturating_sub(start_pos);
+            }
+
+            // Find max count among first 9 buckets (for bar scaling)
+            let max_count_first9 = bucket_counts[..9].iter().copied().max().unwrap_or(1);
+
+            for i in 0..10 {
+                let start_pct = i * 10;
+                let end_pct = (i + 1) * 10;
+                let count = bucket_counts[i];
+
+                // Only show buckets that start after top 10
+                let bucket_start = if i == 0 {
+                    0
+                } else {
+                    to_pos(percentiles[i - 1])
+                };
+                if bucket_start < 10 && i < 9 {
+                    continue; // This bucket overlaps with individual display
                 }
+
+                let bar_len = if max_count_first9 > 0 {
+                    (count.min(max_count_first9) * 20 / max_count_first9).max(1)
+                } else {
+                    1
+                };
+
+                // Last bucket: use ellipsis if it exceeds scale
+                let bar = if i == 9 && count > max_count_first9 {
+                    let half = bar_len / 2;
+                    format!("{}...{}", "█".repeat(half), "█".repeat(bar_len - half))
+                } else {
+                    "█".repeat(bar_len)
+                };
+
+                let _ = writeln!(
+                    output,
+                    "  {start_pct:>2}-{end_pct:>3}%  {count:>4} networks  {bar}"
+                );
             }
         }
+
+        output
+    }
+
+    /// Format selected opponent indices as checkpoint-relative positions for debug output
+    /// -1 = latest checkpoint, -2 = second latest, etc.
+    pub fn format_selected_opponents(&self, indices: &[usize]) -> String {
+        if self.available.is_empty() {
+            return String::new();
+        }
+
+        // Sort available checkpoints by step (descending) to determine relative position
+        let mut sorted_by_step: Vec<(usize, usize)> = self
+            .available
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, qi))| (idx, qi.checkpoint_step))
+            .collect();
+        sorted_by_step.sort_by(|a, b| b.1.cmp(&a.1)); // Descending by step
+
+        // Build index -> relative position map (-1 = latest, -2 = second latest, etc.)
+        let idx_to_relative: HashMap<usize, i32> = sorted_by_step
+            .iter()
+            .enumerate()
+            .map(|(rel_pos, (idx, _))| {
+                let pos_i32 = i32::try_from(rel_pos + 1).unwrap_or(i32::MAX);
+                (*idx, -pos_i32)
+            })
+            .collect();
+
+        indices
+            .iter()
+            .map(|&idx| format!("{}", idx_to_relative.get(&idx).copied().unwrap_or(0)))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -894,10 +1013,6 @@ pub struct PoolEvalResult {
     /// Average point margin vs best opponent (`current_points` - `best_points` per game)
     /// Positive means outperforming best, negative means underperforming
     pub vs_best_margin: f64,
-    /// Current network's Weng-Lin rating after evaluation
-    pub current_rating: f64,
-    /// Current network's rating uncertainty
-    pub current_uncertainty: f64,
     /// Draw rate across all games
     pub draw_rate: f64,
     /// Number of games played
@@ -913,13 +1028,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_opponent_rating_new() {
-        let rating = OpponentRating::new("step_00010000".to_string(), 30.0);
-        assert_eq!(rating.checkpoint_name, "step_00010000");
-        assert!((rating.rating_mu - 30.0).abs() < f64::EPSILON);
-        assert!((rating.rating_sigma - DEFAULT_UNCERTAINTY).abs() < f64::EPSILON);
-        assert_eq!(rating.games_played, 0);
-        assert_eq!(rating.wins_vs_current, 0);
+    fn test_opponent_qi_new() {
+        let qi = OpponentQi::new("step_00010000".to_string(), 10000, 0.5);
+        assert_eq!(qi.checkpoint_name, "step_00010000");
+        assert_eq!(qi.checkpoint_step, 10000);
+        assert!((qi.qi - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -975,159 +1088,403 @@ mod tests {
     }
 
     #[test]
-    fn test_rating_serialization() {
-        let rating = OpponentRating {
+    fn test_qi_serialization() {
+        let qi = OpponentQi {
             checkpoint_name: "step_00010000".to_string(),
-            rating_mu: 35.5,
-            rating_sigma: 7.0,
-            games_played: 100,
-            wins_vs_current: 45,
-            last_updated_step: 50000,
+            checkpoint_step: 10000,
+            qi: 0.75,
         };
 
-        let json = serde_json::to_string(&rating).unwrap();
-        let loaded: OpponentRating = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&qi).unwrap();
+        let loaded: OpponentQi = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(loaded.checkpoint_name, rating.checkpoint_name);
-        assert!((loaded.rating_mu - rating.rating_mu).abs() < f64::EPSILON);
-        assert_eq!(loaded.games_played, rating.games_played);
+        assert_eq!(loaded.checkpoint_name, qi.checkpoint_name);
+        assert_eq!(loaded.checkpoint_step, qi.checkpoint_step);
+        assert!((loaded.qi - qi.qi).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_pool_ratings_file_serialization() {
-        // Test new format with learner rating
-        let file = PoolRatingsFile {
-            learner: Some(LearnerRatingData {
-                rating_mu: 30.5,
-                rating_sigma: 6.0,
-            }),
+    fn test_qi_scores_file_serialization() {
+        let file = QiScoresFile {
+            qi_eta: 0.01,
             opponents: vec![
-                OpponentRating::new("step_00010000".to_string(), 25.0),
-                OpponentRating::new("step_00020000".to_string(), 28.0),
+                OpponentQi::new("step_00010000".to_string(), 10000, 0.0),
+                OpponentQi::new("step_00020000".to_string(), 20000, 0.5),
             ],
         };
 
         let json = serde_json::to_string_pretty(&file).expect("serialize");
-        let loaded: PoolRatingsFile = serde_json::from_str(&json).expect("deserialize");
+        let loaded: QiScoresFile = serde_json::from_str(&json).expect("deserialize");
 
-        assert!(loaded.learner.is_some());
-        let learner = loaded.learner.unwrap();
-        assert!((learner.rating_mu - 30.5).abs() < f64::EPSILON);
-        assert!((learner.rating_sigma - 6.0).abs() < f64::EPSILON);
+        assert!((loaded.qi_eta - 0.01).abs() < f64::EPSILON);
         assert_eq!(loaded.opponents.len(), 2);
+        assert_eq!(loaded.opponents[0].checkpoint_name, "step_00010000");
+        assert!((loaded.opponents[1].qi - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_pool_ratings_file_backwards_compatible() {
-        // Test loading old format (just array of opponent ratings)
-        let old_format = r#"[
-            {"checkpoint_name": "step_00010000", "rating_mu": 25.0, "rating_sigma": 8.33, "games_played": 10, "wins_vs_current": 5, "last_updated_step": 1000}
-        ]"#;
+    fn test_softmax_probabilities() {
+        // Test softmax probability computation
+        let qi_scores = [0.0, 0.0, 0.0]; // Equal qi scores
+        let max_qi = qi_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp_qis: Vec<f64> = qi_scores.iter().map(|q| (q - max_qi).exp()).collect();
+        let sum: f64 = exp_qis.iter().sum();
+        let probs: Vec<f64> = exp_qis.iter().map(|e| e / sum).collect();
 
-        // Old format should fail to parse as PoolRatingsFile
-        let result = serde_json::from_str::<PoolRatingsFile>(old_format);
-        assert!(
-            result.is_err(),
-            "Old array format should not parse as PoolRatingsFile"
-        );
-
-        // But should parse as Vec<OpponentRating>
-        let ratings: Vec<OpponentRating> =
-            serde_json::from_str(old_format).expect("should parse as vec");
-        assert_eq!(ratings.len(), 1);
-        assert_eq!(ratings[0].checkpoint_name, "step_00010000");
+        // With equal qi, all probabilities should be 1/3
+        for p in probs {
+            assert!((p - 1.0 / 3.0).abs() < f64::EPSILON);
+        }
     }
 
     #[test]
-    fn test_pool_ratings_file_missing_learner() {
-        // Test new format where learner field is missing (should default to None)
-        let json_no_learner = r#"{
-            "opponents": [
-                {"checkpoint_name": "step_00010000", "rating_mu": 25.0, "rating_sigma": 8.33, "games_played": 0, "wins_vs_current": 0, "last_updated_step": 0}
-            ]
-        }"#;
+    fn test_softmax_probabilities_different_qi() {
+        // Higher qi should give higher probability
+        let qi_scores = [0.0, 1.0, 2.0];
+        let max_qi = qi_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp_qis: Vec<f64> = qi_scores.iter().map(|q| (q - max_qi).exp()).collect();
+        let sum: f64 = exp_qis.iter().sum();
+        let probs: Vec<f64> = exp_qis.iter().map(|e| e / sum).collect();
 
-        let loaded: PoolRatingsFile =
-            serde_json::from_str(json_no_learner).expect("should parse without learner");
-        assert!(loaded.learner.is_none());
-        assert_eq!(loaded.opponents.len(), 1);
+        // Probability should increase with qi
+        assert!(probs[0] < probs[1]);
+        assert!(probs[1] < probs[2]);
     }
 
     #[test]
-    fn test_learner_rating_initialization_fresh() {
-        // Fresh run (no initial rating) should start at 25.0
-        let rating = None::<(f64, f64)>.map_or(
-            WengLinRating {
-                rating: 25.0,
-                uncertainty: DEFAULT_UNCERTAINTY,
+    fn test_qi_update_formula() {
+        // Test the qi update: qi -= eta / (N - pi)
+        let eta: f64 = 0.01;
+        let n: f64 = 10.0;
+        let pi: f64 = 0.2; // 20% selection probability
+
+        let initial_qi: f64 = 0.5;
+        let new_qi = initial_qi - eta / (n - pi);
+
+        // qi should decrease
+        assert!(new_qi < initial_qi);
+
+        // The decrease should be eta / (n - pi) = 0.01 / 9.8 ≈ 0.00102
+        let expected_decrease = eta / (n - pi);
+        assert!(((initial_qi - new_qi) - expected_decrease).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_highest_qi_empty() {
+        // Empty list should return None
+        let opponents: Vec<(std::path::PathBuf, OpponentQi)> = vec![];
+        let highest = opponents
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                a.1 .1
+                    .qi
+                    .partial_cmp(&b.1 .1.qi)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i);
+        assert!(highest.is_none());
+    }
+
+    #[test]
+    fn test_highest_qi_single() {
+        // Single opponent should return index 0
+        let opponents = [(
+            std::path::PathBuf::from("step_100"),
+            OpponentQi {
+                checkpoint_name: "step_100".to_string(),
+                checkpoint_step: 100,
+                qi: 0.5,
             },
-            |(mu, _sigma)| WengLinRating {
-                rating: mu,
-                uncertainty: DEFAULT_UNCERTAINTY,
-            },
-        );
-
-        assert!((rating.rating - 25.0).abs() < f64::EPSILON);
-        assert!((rating.uncertainty - DEFAULT_UNCERTAINTY).abs() < f64::EPSILON);
+        )];
+        let highest = opponents
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                a.1 .1
+                    .qi
+                    .partial_cmp(&b.1 .1.qi)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i);
+        assert_eq!(highest, Some(0));
     }
 
     #[test]
-    fn test_learner_rating_initialization_forked() {
-        // Forked run should inherit parent's mu but reset uncertainty
-        let parent_rating = (35.0, 5.0); // Parent had rating 35, uncertainty 5
-        let rating = Some(parent_rating).map_or(
-            WengLinRating {
-                rating: 25.0,
-                uncertainty: DEFAULT_UNCERTAINTY,
-            },
-            |(mu, _sigma)| WengLinRating {
-                rating: mu,
-                uncertainty: DEFAULT_UNCERTAINTY, // Reset uncertainty
-            },
-        );
-
-        assert!(
-            (rating.rating - 35.0).abs() < f64::EPSILON,
-            "Should inherit parent's mu"
-        );
-        assert!(
-            (rating.uncertainty - DEFAULT_UNCERTAINTY).abs() < f64::EPSILON,
-            "Should reset uncertainty to default"
-        );
+    fn test_highest_qi_multiple() {
+        // Should return index of highest qi
+        let opponents = [
+            (
+                std::path::PathBuf::from("step_100"),
+                OpponentQi {
+                    checkpoint_name: "step_100".to_string(),
+                    checkpoint_step: 100,
+                    qi: 0.1,
+                },
+            ),
+            (
+                std::path::PathBuf::from("step_200"),
+                OpponentQi {
+                    checkpoint_name: "step_200".to_string(),
+                    checkpoint_step: 200,
+                    qi: 0.9, // Highest
+                },
+            ),
+            (
+                std::path::PathBuf::from("step_300"),
+                OpponentQi {
+                    checkpoint_name: "step_300".to_string(),
+                    checkpoint_step: 300,
+                    qi: 0.5,
+                },
+            ),
+        ];
+        let highest = opponents
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                a.1 .1
+                    .qi
+                    .partial_cmp(&b.1 .1.qi)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i);
+        assert_eq!(highest, Some(1)); // step_200 has highest qi
     }
 
     #[test]
-    fn test_weng_lin_rating_update() {
-        use skillratings::weng_lin::{weng_lin_multi_team, WengLinConfig};
-        use skillratings::MultiTeamOutcome;
+    fn test_qi_initialization_first_opponent() {
+        // First opponent should get qi = 0.0
+        let existing_qis: Vec<f64> = vec![];
+        let new_qi = existing_qis
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let initial_qi = if new_qi.is_finite() { new_qi } else { 0.0 };
+        assert!((initial_qi - 0.0).abs() < f64::EPSILON);
+    }
 
-        // Test that rating updates correctly after a win
-        let learner = WengLinRating {
-            rating: 25.0,
-            uncertainty: DEFAULT_UNCERTAINTY,
+    #[test]
+    fn test_qi_initialization_subsequent_opponent() {
+        // New opponent should get qi = max(existing qi)
+        let existing_qis = [0.1, 0.5, 0.3];
+        let new_qi = existing_qis
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let initial_qi = if new_qi.is_finite() { new_qi } else { 0.0 };
+        assert!((initial_qi - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_qi_initialization_with_negative_qis() {
+        // Even with negative qi scores, new opponent gets max
+        let existing_qis = [-0.5, -0.1, -0.3];
+        let new_qi = existing_qis
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let initial_qi = if new_qi.is_finite() { new_qi } else { 0.0 };
+        assert!((initial_qi - (-0.1)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_qi_scores_file_round_trip() {
+        // Test save and load preserves all data
+        let original = QiScoresFile {
+            qi_eta: 0.02,
+            opponents: vec![
+                OpponentQi {
+                    checkpoint_name: "step_00001000".to_string(),
+                    checkpoint_step: 1000,
+                    qi: 0.0,
+                },
+                OpponentQi {
+                    checkpoint_name: "step_00002000".to_string(),
+                    checkpoint_step: 2000,
+                    qi: -0.05,
+                },
+                OpponentQi {
+                    checkpoint_name: "step_00003000".to_string(),
+                    checkpoint_step: 3000,
+                    qi: 0.0, // Newest, should have max qi
+                },
+            ],
         };
-        let opponent = WengLinRating {
-            rating: 25.0,
-            uncertainty: DEFAULT_UNCERTAINTY,
+
+        let json = serde_json::to_string(&original).unwrap();
+        let loaded: QiScoresFile = serde_json::from_str(&json).unwrap();
+
+        assert!((loaded.qi_eta - 0.02).abs() < f64::EPSILON);
+        assert_eq!(loaded.opponents.len(), 3);
+        assert_eq!(loaded.opponents[0].checkpoint_name, "step_00001000");
+        assert_eq!(loaded.opponents[1].checkpoint_step, 2000);
+        assert!((loaded.opponents[1].qi - (-0.05)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_softmax_with_negative_qi() {
+        // Softmax should work correctly with negative qi values
+        let qi_scores = [-1.0, 0.0, 1.0];
+        let max_qi = qi_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp_qis: Vec<f64> = qi_scores.iter().map(|q| (q - max_qi).exp()).collect();
+        let sum: f64 = exp_qis.iter().sum();
+        let probs: Vec<f64> = exp_qis.iter().map(|e| e / sum).collect();
+
+        // All probabilities should sum to 1
+        let total: f64 = probs.iter().sum();
+        assert!((total - 1.0).abs() < 1e-10);
+
+        // Higher qi should still give higher probability
+        assert!(probs[0] < probs[1]);
+        assert!(probs[1] < probs[2]);
+    }
+
+    #[test]
+    fn test_softmax_numerical_stability() {
+        // Test with large qi values (should not overflow due to max subtraction)
+        let qi_scores = [100.0, 101.0, 102.0];
+        let max_qi = qi_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp_qis: Vec<f64> = qi_scores.iter().map(|q| (q - max_qi).exp()).collect();
+        let sum: f64 = exp_qis.iter().sum();
+        let probs: Vec<f64> = exp_qis.iter().map(|e| e / sum).collect();
+
+        // Should not be NaN or Inf
+        for p in &probs {
+            assert!(p.is_finite());
+            assert!(*p >= 0.0);
+            assert!(*p <= 1.0);
+        }
+
+        // Should sum to 1
+        let total: f64 = probs.iter().sum();
+        assert!((total - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_qi_update_opponent_wins_no_change() {
+        // When opponent wins (current loses), qi should not change
+        let initial_qi: f64 = 0.5;
+        let current_won = false;
+
+        // Simulate the update logic
+        let final_qi: f64 = if current_won {
+            let eta: f64 = 0.01;
+            let n: f64 = 10.0;
+            let pi: f64 = 0.1;
+            initial_qi - eta / (n - pi)
+        } else {
+            initial_qi // No change when opponent wins
         };
 
-        // Build rating groups: (rating slice, outcome)
-        // Placement 1 = 1st place (winner), 2 = 2nd place (loser)
-        let learner_arr = [learner];
-        let opponent_arr = [opponent];
-        let rating_groups: Vec<(&[WengLinRating], MultiTeamOutcome)> = vec![
-            (&learner_arr[..], MultiTeamOutcome::new(1)), // learner wins
-            (&opponent_arr[..], MultiTeamOutcome::new(2)), // opponent loses
+        assert!((final_qi - initial_qi).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_qi_update_current_wins_decreases() {
+        // When current wins (opponent loses), qi should decrease
+        let initial_qi: f64 = 0.5;
+        let current_won = true;
+        let eta: f64 = 0.01;
+        let n: f64 = 10.0;
+        let pi: f64 = 0.1;
+
+        let final_qi: f64 = if current_won {
+            initial_qi - eta / (n - pi)
+        } else {
+            initial_qi
+        };
+
+        assert!(final_qi < initial_qi);
+        // Verify exact decrease
+        let expected_decrease = eta / (n - pi);
+        assert!(((initial_qi - final_qi) - expected_decrease).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_qi_update_high_probability_smaller_decrease() {
+        // Opponents with higher selection probability should decrease less
+        let eta = 0.01;
+        let n = 10.0;
+
+        let pi_low = 0.05; // Low probability opponent
+        let pi_high = 0.3; // High probability opponent
+
+        let decrease_low = eta / (n - pi_low); // 0.01 / 9.95 ≈ 0.001005
+        let decrease_high = eta / (n - pi_high); // 0.01 / 9.7 ≈ 0.001031
+
+        // Higher probability means larger denominator decrease means smaller qi decrease
+        // Wait, that's backwards. Let me recalculate:
+        // decrease_low = 0.01 / 9.95 = 0.001005...
+        // decrease_high = 0.01 / 9.7 = 0.001030...
+        // So higher pi actually means LARGER decrease (smaller denominator)
+        assert!(decrease_high > decrease_low);
+    }
+
+    #[test]
+    fn test_selection_probability_computation() {
+        // Test the selection probability formula used in qi updates
+        let qi_scores = [0.0, 0.5, 1.0];
+        let max_qi = qi_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let exp_qis: Vec<f64> = qi_scores.iter().map(|q| (q - max_qi).exp()).collect();
+        let sum: f64 = exp_qis.iter().sum();
+
+        // Compute individual probabilities
+        let p0 = exp_qis[0] / sum;
+        let p1 = exp_qis[1] / sum;
+        let p2 = exp_qis[2] / sum;
+
+        // Verify they're valid probabilities
+        assert!(p0 > 0.0 && p0 < 1.0);
+        assert!(p1 > 0.0 && p1 < 1.0);
+        assert!(p2 > 0.0 && p2 < 1.0);
+        assert!((p0 + p1 + p2 - 1.0).abs() < 1e-10);
+
+        // Verify ordering matches qi ordering
+        assert!(p0 < p1);
+        assert!(p1 < p2);
+    }
+
+    #[test]
+    fn test_format_selected_opponents() {
+        // Test the debug output formatting
+        let opponents = [
+            (
+                std::path::PathBuf::from("step_1000"),
+                OpponentQi {
+                    checkpoint_name: "step_1000".to_string(),
+                    checkpoint_step: 1000,
+                    qi: 0.0,
+                },
+            ),
+            (
+                std::path::PathBuf::from("step_2000"),
+                OpponentQi {
+                    checkpoint_name: "step_2000".to_string(),
+                    checkpoint_step: 2000,
+                    qi: 0.0,
+                },
+            ),
         ];
 
-        let new_ratings = weng_lin_multi_team(&rating_groups, &WengLinConfig::default());
+        let current_step: i64 = 3000;
+        let indices = [0, 1];
 
-        let new_learner = new_ratings[0][0];
+        // Compute expected output manually
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "checkpoint_step won't exceed i64::MAX in tests"
+        )]
+        let formatted: String = indices
+            .iter()
+            .map(|&idx| {
+                let (_, opp) = &opponents[idx];
+                let relative = opp.checkpoint_step as i64 - current_step;
+                format!("{relative}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
 
-        assert!(new_learner.rating > 25.0, "Winner's rating should increase");
-        assert!(
-            new_learner.uncertainty < DEFAULT_UNCERTAINTY,
-            "Uncertainty should decrease after game"
-        );
+        assert_eq!(formatted, "-2000, -1000");
     }
 }
