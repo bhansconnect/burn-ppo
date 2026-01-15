@@ -21,10 +21,10 @@ pub struct TrainingSupervisor {
     run_dir: PathBuf,
     /// Number of checkpoints to save before restarting subprocess
     reload_every_n: usize,
-    /// Total timesteps target (for completion check)
-    total_timesteps: usize,
-    /// Optional override for `total_timesteps` to pass to child
-    total_timesteps_override: Option<usize>,
+    /// Total steps target (for completion check)
+    total_steps: usize,
+    /// Optional override for `total_steps` to pass to child
+    total_steps_override: Option<usize>,
     /// Optional max training time to pass to child
     max_training_time_override: Option<String>,
     /// Flag to signal graceful shutdown
@@ -48,8 +48,8 @@ impl TrainingSupervisor {
     pub fn new_resume(
         run_dir: PathBuf,
         reload_every_n: usize,
-        total_timesteps: usize,
-        total_timesteps_override: Option<usize>,
+        total_steps: usize,
+        total_steps_override: Option<usize>,
         max_training_time_override: Option<String>,
         running: Arc<AtomicBool>,
         debug_opponents: bool,
@@ -57,8 +57,8 @@ impl TrainingSupervisor {
         Self {
             run_dir,
             reload_every_n,
-            total_timesteps,
-            total_timesteps_override,
+            total_steps,
+            total_steps_override,
             max_training_time_override,
             running,
             is_fresh_run: false,
@@ -74,8 +74,8 @@ impl TrainingSupervisor {
     pub fn new_fresh(
         run_dir: PathBuf,
         reload_every_n: usize,
-        total_timesteps: usize,
-        total_timesteps_override: Option<usize>,
+        total_steps: usize,
+        total_steps_override: Option<usize>,
         max_training_time_override: Option<String>,
         running: Arc<AtomicBool>,
         config_path: PathBuf,
@@ -87,8 +87,8 @@ impl TrainingSupervisor {
         Self {
             run_dir,
             reload_every_n,
-            total_timesteps,
-            total_timesteps_override,
+            total_steps,
+            total_steps_override,
             max_training_time_override,
             running,
             is_fresh_run: true,
@@ -201,8 +201,8 @@ impl TrainingSupervisor {
         args.push(self.reload_every_n.to_string());
 
         // Pass through overridable args if set
-        if let Some(ts) = self.total_timesteps_override {
-            args.push("--total-timesteps".to_string());
+        if let Some(ts) = self.total_steps_override {
+            args.push("--total-steps".to_string());
             args.push(ts.to_string());
         }
         if let Some(ref time) = self.max_training_time_override {
@@ -246,7 +246,7 @@ impl TrainingSupervisor {
         }
     }
 
-    /// Check if training has reached the target timesteps
+    /// Check if training has reached the target steps
     fn is_training_complete(&self) -> Result<bool> {
         let checkpoint_dir = self.run_dir.join("checkpoints").join("latest");
         if !checkpoint_dir.exists() {
@@ -254,6 +254,6 @@ impl TrainingSupervisor {
         }
 
         let metadata = load_metadata(&checkpoint_dir)?;
-        Ok(metadata.step >= self.total_timesteps)
+        Ok(metadata.step >= self.total_steps)
     }
 }

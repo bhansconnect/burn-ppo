@@ -86,11 +86,11 @@ pub struct TrainArgs {
     #[arg(long, help = "Learning rate (default: 0.00025)")]
     pub learning_rate: Option<f64>,
 
-    #[arg(long, help = "Total training timesteps (default: 1000000)")]
-    pub total_timesteps: Option<usize>,
+    #[arg(long, help = "Total training steps (default: 1000000)")]
+    pub total_steps: Option<usize>,
 
     /// Maximum training time with unit suffix (e.g., "30s", "5m", "2h")
-    /// Training stops early if this time is reached before `total_timesteps`
+    /// Training stops early if this time is reached before `total_steps`
     #[arg(long)]
     pub max_training_time: Option<String>,
 
@@ -281,8 +281,8 @@ impl TrainArgs {
     /// Generate CLI args for passthrough to subprocess
     ///
     /// Returns all override arguments that should be passed to a subprocess.
-    /// Excludes args already handled specially by supervisor (`total_timesteps`,
-    /// `max_training_time`, seed, `debug_opponents`) and meta args (config, resume, etc.)
+    /// Excludes args already handled specially by supervisor (`total_steps`,
+    /// `max_training_time`, `seed`, `debug_opponents`) and meta args (config, resume, etc.)
     pub fn to_passthrough_args(&self) -> Vec<String> {
         let mut args = Vec::new();
 
@@ -371,7 +371,7 @@ impl TrainArgs {
         push_opt!(self.opponent_pool_size_limit, "--opponent-pool-size-limit");
 
         // Note: These are handled specially by supervisor and excluded:
-        // - total_timesteps, max_training_time, seed, debug_opponents
+        // - total_steps, max_training_time, seed, debug_opponents
         // - config, resume, fork, run_name, backend
         // - reload_every_n_checkpoints, elapsed_time_offset_ms, max_checkpoints_this_run
 
@@ -636,8 +636,8 @@ pub struct Config {
     pub return_clip: f32,
 
     // Training
-    #[serde(default = "default_total_timesteps")]
-    pub total_timesteps: usize,
+    #[serde(default = "default_total_steps")]
+    pub total_steps: usize,
     #[serde(default = "default_num_epochs")]
     pub num_epochs: usize,
     #[serde(default = "default_num_minibatches")]
@@ -645,7 +645,7 @@ pub struct Config {
     #[serde(default = "default_adam_epsilon")]
     pub adam_epsilon: f64,
     /// Maximum training wall-clock time (e.g., "30s", "5m", "2h")
-    /// Training stops when this time is reached OR `total_timesteps`, whichever first
+    /// Training stops when this time is reached OR `total_steps`, whichever first
     #[serde(default)]
     pub max_training_time: Option<String>,
 
@@ -775,7 +775,7 @@ const fn default_max_grad_norm() -> f64 {
 const fn default_return_clip() -> f32 {
     10.0 // Standard VecNormalize default
 }
-const fn default_total_timesteps() -> usize {
+const fn default_total_steps() -> usize {
     1_000_000
 }
 const fn default_num_epochs() -> usize {
@@ -873,7 +873,7 @@ impl Default for Config {
             normalize_obs: false,
             normalize_returns: true, // Enabled by default
             return_clip: default_return_clip(),
-            total_timesteps: default_total_timesteps(),
+            total_steps: default_total_steps(),
             num_epochs: default_num_epochs(),
             num_minibatches: default_num_minibatches(),
             adam_epsilon: default_adam_epsilon(),
@@ -1031,8 +1031,8 @@ impl Config {
         }
 
         // Training
-        if let Some(ts) = args.total_timesteps {
-            self.total_timesteps = ts;
+        if let Some(ts) = args.total_steps {
+            self.total_steps = ts;
         }
         if let Some(ref t) = args.max_training_time {
             self.max_training_time = Some(t.clone());
@@ -1119,12 +1119,12 @@ impl Config {
 
     /// Apply limited CLI overrides for resume mode
     ///
-    /// When resuming, we only allow extending `total_timesteps` and setting `max_training_time`.
+    /// When resuming, we only allow extending `total_steps` and setting `max_training_time`.
     /// Other parameters are locked to the original run config.
     pub fn apply_resume_overrides(&mut self, args: &CliArgs) {
         // Only allow extending training duration and setting time limit
-        if let Some(ts) = args.total_timesteps {
-            self.total_timesteps = ts;
+        if let Some(ts) = args.total_steps {
+            self.total_steps = ts;
         }
         if let Some(ref t) = args.max_training_time {
             self.max_training_time = Some(t.clone());

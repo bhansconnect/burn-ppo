@@ -71,7 +71,7 @@ impl CartPole {
     }
 
     /// Get state as observation vector
-    /// Includes normalized timestep (0-1) so value function can predict time-dependent returns
+    /// Includes normalized step (0-1) so value function can predict time-dependent returns
     fn get_obs(&self) -> Vec<f32> {
         let normalized_time = self.steps as f32 / MAX_STEPS as f32;
         vec![

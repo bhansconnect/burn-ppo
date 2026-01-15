@@ -501,7 +501,7 @@ All reward comes from turn-by-turn deltas for better credit assignment.
 
 ### Validation Benchmarks
 
-| Phase | Target Score | Timesteps | Baseline |
+| Phase | Target Score | Steps | Baseline |
 |-------|--------------|-----------|----------|
 | Micro | > 15 | 1M | Random: ~8 |
 | Mini | > 40 | 5M | Random: ~20 |

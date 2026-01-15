@@ -57,10 +57,10 @@ gamma = 0.99
 gae_lambda = 0.95
 clip_epsilon = 0.2
 entropy_coef = 0.01
-total_timesteps = 1_000_000
+total_steps = 1_000_000
 ```
 
-CLI overrides use kebab-case: `--learning-rate`, `--num-envs`, `--total-timesteps`.
+CLI overrides use kebab-case: `--learning-rate`, `--num-envs`, `--total-steps`.
 
 ## Monitoring with Aim
 
@@ -143,13 +143,13 @@ This loads the config from the run directory and continues where training left o
 
 ### Extend training duration
 
-To train beyond the original `total_timesteps`:
+To train beyond the original `total_steps`:
 
 ```bash
-cargo run --release -- --resume runs/<run_name> --total-timesteps 2000000
+cargo run --release -- --resume runs/<run_name> --total-steps 2000000
 ```
 
-Note: Only `--total-timesteps` can be overridden when resuming. Other config changes are ignored to preserve training consistency.
+Note: Only `--total-steps` can be overridden when resuming. Other config changes are ignored to preserve training consistency.
 
 ### Fork with different config
 
@@ -158,7 +158,7 @@ Create a new run starting from an existing checkpoint with different hyperparame
 ```bash
 # Fork from best checkpoint with new learning rate
 cargo run --release -- --fork runs/<run_name>/checkpoints/best \
-    --learning-rate 0.0001 --total-timesteps 500000
+    --learning-rate 0.0001 --total-steps 500000
 
 # Fork from a specific step
 cargo run --release -- --fork runs/<run_name>/checkpoints/step_00050000 \

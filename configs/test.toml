@@ -4,7 +4,7 @@
 env = "cartpole"
 num_envs = 2
 num_steps = 8
-total_timesteps = 64
+total_steps = 64
 num_epochs = 1
 num_minibatches = 1
 

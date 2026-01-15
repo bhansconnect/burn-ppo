@@ -269,9 +269,9 @@ where
             let metadata = resumed_metadata.expect("resumed_metadata required for Resume/Fork");
 
             // Check for training completion
-            if metadata.step >= config.total_timesteps {
+            if metadata.step >= config.total_steps {
                 println!(
-                    "Training already complete at step {}. Use --total-timesteps to extend.",
+                    "Training already complete at step {}. Use --total-steps to extend.",
                     metadata.step
                 );
                 return Ok(());
@@ -426,9 +426,9 @@ where
 
     // Training state
     let steps_per_update = config.num_steps * num_envs;
-    let total_updates = config.total_timesteps / steps_per_update;
-    let remaining_timesteps = config.total_timesteps.saturating_sub(global_step);
-    let num_updates = remaining_timesteps / steps_per_update;
+    let total_updates = config.total_steps / steps_per_update;
+    let remaining_steps = config.total_steps.saturating_sub(global_step);
+    let num_updates = remaining_steps / steps_per_update;
 
     // For LR annealing, we need to know how many updates have already happened
     let update_offset = global_step / steps_per_update;
@@ -439,13 +439,13 @@ where
     if !quiet {
         if let Some(ref limit_str) = config.max_training_time {
             println!(
-                "Training for {} timesteps ({} updates) or {}, whichever comes first",
-                config.total_timesteps, num_updates, limit_str
+                "Training for {} steps ({} updates) or {}, whichever comes first",
+                config.total_steps, num_updates, limit_str
             );
         } else {
             println!(
-                "Training for {} timesteps ({} updates of {} steps each)",
-                config.total_timesteps, num_updates, steps_per_update
+                "Training for {} steps ({} updates of {} steps each)",
+                config.total_steps, num_updates, steps_per_update
             );
         }
         println!("---");
@@ -461,7 +461,7 @@ where
     }
     let elapsed_offset = std::time::Duration::from_millis(elapsed_time_offset_ms);
     let progress = TrainingProgress::new_with_offset_and_position(
-        config.total_timesteps as u64,
+        config.total_steps as u64,
         num_players as usize,
         elapsed_offset,
         global_step as u64, // Start at resumed position to avoid flash to 0
@@ -1560,8 +1560,8 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
         TrainingSupervisor::new_resume(
             run_dir,
             args.reload_every_n_checkpoints,
-            config.total_timesteps,
-            args.total_timesteps,
+            config.total_steps,
+            args.total_steps,
             args.max_training_time.clone(),
             running,
             args.debug_opponents,
@@ -1592,8 +1592,8 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
         TrainingSupervisor::new_fresh(
             run_dir,
             args.reload_every_n_checkpoints,
-            config.total_timesteps,
-            args.total_timesteps,
+            config.total_steps,
+            args.total_steps,
             args.max_training_time.clone(),
             running,
             args.config.clone(),
@@ -1668,7 +1668,7 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
             let mut config = Config::load_from_path(&config_path)
                 .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
 
-            // Apply limited resume overrides (only total_timesteps allowed)
+            // Apply limited resume overrides (only total_steps allowed)
             config.apply_resume_overrides(args);
 
             // Load checkpoint metadata

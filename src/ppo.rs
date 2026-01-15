@@ -2505,7 +2505,7 @@ mod tests {
         let device = Default::default();
 
         // Create observation data where we can verify filtering
-        // Obs shape: [8, 3] - 8 timesteps, 3 features
+        // Obs shape: [8, 3] - 8 steps, 3 features
         let obs: Tensor<TestBackend, 2> = Tensor::from_floats(
             [
                 [0.0, 1.0, 2.0],

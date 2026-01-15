@@ -17,7 +17,7 @@ fn run_binary(args: &[&str], run_dir: &Path) -> Output {
 env = "cartpole"
 num_envs = 2
 num_steps = 8
-total_timesteps = 64
+total_steps = 64
 num_epochs = 1
 num_minibatches = 1
 hidden_size = 16
@@ -163,17 +163,17 @@ fn test_fresh_training_with_seed_override() {
 }
 
 #[test]
-fn test_fresh_training_with_timesteps_override() {
+fn test_fresh_training_with_steps_override() {
     let dir = tempdir().unwrap();
-    let output = run_binary(&["--total-timesteps", "32"], dir.path());
+    let output = run_binary(&["--total-steps", "32"], dir.path());
 
     assert!(output.status.success());
 
     let run_dir = get_first_run_dir(dir.path()).unwrap();
     let config_content = fs::read_to_string(run_dir.join("config.toml")).unwrap();
     assert!(
-        config_content.contains("total_timesteps = 32"),
-        "Timesteps override not applied"
+        config_content.contains("total_steps = 32"),
+        "Steps override not applied"
     );
 }
 
@@ -196,8 +196,8 @@ fn test_resume_training() {
     let run_dir = get_first_run_dir(dir.path()).unwrap();
     let run_dir_str = run_dir.to_str().unwrap();
 
-    // Second run: resume with more timesteps
-    let output2 = run_binary_raw(&["train", "--resume", run_dir_str, "--total-timesteps", "128"]);
+    // Second run: resume with more steps
+    let output2 = run_binary_raw(&["train", "--resume", run_dir_str, "--total-steps", "128"]);
 
     assert!(
         output2.status.success(),
@@ -573,7 +573,7 @@ fn test_training_with_normalize_obs() {
 env = "cartpole"
 num_envs = 2
 num_steps = 8
-total_timesteps = 64
+total_steps = 64
 num_epochs = 1
 num_minibatches = 1
 hidden_size = 16
@@ -645,7 +645,7 @@ fn test_connect_four_training() {
 env = "connect_four"
 num_envs = 2
 num_steps = 8
-total_timesteps = 64
+total_steps = 64
 num_epochs = 1
 num_minibatches = 1
 hidden_size = 16
@@ -692,7 +692,7 @@ fn test_liars_dice_training() {
 env = "liars_dice"
 num_envs = 2
 num_steps = 8
-total_timesteps = 64
+total_steps = 64
 num_epochs = 1
 num_minibatches = 1
 hidden_size = 16
@@ -743,7 +743,7 @@ fn test_cnn_training_connect_four() {
 env = "connect_four"
 num_envs = 2
 num_steps = 8
-total_timesteps = 32
+total_steps = 32
 num_epochs = 1
 num_minibatches = 1
 network_type = "cnn"
@@ -799,7 +799,7 @@ fn test_cnn_checkpoint_resume() {
 env = "connect_four"
 num_envs = 2
 num_steps = 8
-total_timesteps = 32
+total_steps = 32
 num_epochs = 1
 num_minibatches = 1
 network_type = "cnn"
@@ -844,7 +844,7 @@ run_dir = "{}"
     let run_dir_str = run_dir.to_str().unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--resume", run_dir_str, "--total-timesteps", "128"])
+        .args(["train", "--resume", run_dir_str, "--total-steps", "128"])
         .output()
         .expect("Failed to execute");
 
@@ -865,7 +865,7 @@ fn test_cnn_checkpoint_metadata() {
 env = "connect_four"
 num_envs = 2
 num_steps = 8
-total_timesteps = 32
+total_steps = 32
 num_epochs = 1
 num_minibatches = 1
 network_type = "cnn"
@@ -953,7 +953,7 @@ fn test_cnn_eval() {
 env = "connect_four"
 num_envs = 2
 num_steps = 8
-total_timesteps = 32
+total_steps = 32
 num_epochs = 1
 num_minibatches = 1
 network_type = "cnn"
@@ -1032,7 +1032,7 @@ fn test_reload_every_n_checkpoints() {
 env = "cartpole"
 num_envs = 2
 num_steps = 8
-total_timesteps = 128
+total_steps = 128
 num_epochs = 1
 num_minibatches = 1
 hidden_size = 8
@@ -1093,7 +1093,7 @@ run_dir = "{}"
 }
 
 #[test]
-fn test_reload_resume_with_extended_timesteps() {
+fn test_reload_resume_with_extended_steps() {
     let dir = tempdir().unwrap();
 
     // Phase 1: Initial training with reload
@@ -1102,7 +1102,7 @@ fn test_reload_resume_with_extended_timesteps() {
 env = "cartpole"
 num_envs = 2
 num_steps = 8
-total_timesteps = 64
+total_steps = 64
 num_epochs = 1
 num_minibatches = 1
 hidden_size = 8
@@ -1154,13 +1154,13 @@ run_dir = "{}"
         serde_json::from_str(&fs::read_to_string(&latest_meta_path).unwrap()).unwrap();
     let initial_step = initial_metadata["step"].as_u64().unwrap();
 
-    // Phase 2: Resume with extended timesteps (also using reload mode)
+    // Phase 2: Resume with extended steps (also using reload mode)
     let output2 = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
         .args([
             "train",
             "--resume",
             run_dir_str,
-            "--total-timesteps",
+            "--total-steps",
             "128",
             "--reload-every-n-checkpoints",
             "1",
@@ -1170,7 +1170,7 @@ run_dir = "{}"
 
     assert!(
         output2.status.success(),
-        "Resume with extended timesteps failed: {}",
+        "Resume with extended steps failed: {}",
         String::from_utf8_lossy(&output2.stderr)
     );
 
@@ -1195,7 +1195,7 @@ fn test_connect_four_training_with_debug_opponents() {
 env = "connect_four"
 num_envs = 4
 num_steps = 8
-total_timesteps = 256
+total_steps = 256
 num_epochs = 1
 num_minibatches = 1
 hidden_size = 16

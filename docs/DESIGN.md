@@ -188,7 +188,7 @@ Save and restore training state. Uses Burn's record system for model weights, pl
 ### CartPole
 Classic control task. Simple physics (cart + pole), 4D observation, 2 discrete actions. Used for validating the PPO implementation against known baselines.
 
-**Validation target:** Average return > 195 for 100 consecutive episodes in < 200k timesteps.
+**Validation target:** Average return > 195 for 100 consecutive episodes in < 200k steps.
 
 ### Connect Four
 7x6 board game with self-play. Agent plays against itself (or a fixed policy for initial testing). 42D observation (flattened board), 7 discrete actions (column choice).
@@ -343,7 +343,7 @@ All hyperparameters live in TOML config files. CLI can override any field.
 
 **PPO:** `learning_rate`, `gamma`, `gae_lambda`, `clip_epsilon`, `entropy_coef`, `value_coef`, `max_grad_norm`
 
-**Training:** `total_timesteps`, `num_epochs`, `num_minibatches`, `adam_epsilon`
+**Training:** `total_steps`, `num_epochs`, `num_minibatches`, `adam_epsilon`
 
 **Network:** `hidden_size`, `num_hidden`
 
