@@ -1251,8 +1251,8 @@ debug_qi = true
         "Checkpoints directory should exist"
     );
 
-    // Verify qi_scores.json was saved
-    let qi_scores_path = checkpoints_dir.join("qi_scores.json");
+    // Verify qi_scores.json was saved (in run folder, not checkpoints folder)
+    let qi_scores_path = run_dir.join("qi_scores.json");
     assert!(
         qi_scores_path.exists(),
         "qi_scores.json should be saved when opponent pool is enabled"

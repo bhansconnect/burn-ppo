@@ -448,6 +448,9 @@ pub struct OpponentEpisodeCompletion {
     pub placements: Vec<usize>,
     /// Pool indices of opponents in this game
     pub opponent_pool_indices: Vec<usize>,
+    /// Pre-computed placements for rating history (learner first, then opponents in order).
+    /// Built before shuffle to ensure correct state access.
+    pub rating_placements: Vec<usize>,
     /// Whether this env was playing against opponents (vs self-play)
     pub is_opponent_game: bool,
 }
@@ -722,6 +725,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             if is_opponent_game {
                 if let Some(ref places) = placements {
                     // Track opponent completion for rating update
+                    // IMPORTANT: Build rating_placements BEFORE shuffle modifies env_state
                     let env_state = &env_states[env_idx];
                     let opponent_indices: Vec<usize> = env_state
                         .position_to_opponent
@@ -729,10 +733,20 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                         .filter_map(|&opt| opt)
                         .collect();
 
+                    // Build rating placements while state is still valid
+                    // Format: [learner_placement, opponent1_placement, opponent2_placement, ...]
+                    let mut rating_placements = vec![places[env_state.learner_position]];
+                    for (pos, slot) in env_state.position_to_opponent.iter().enumerate() {
+                        if slot.is_some() {
+                            rating_placements.push(places[pos]);
+                        }
+                    }
+
                     opponent_completions.push(OpponentEpisodeCompletion {
                         env_idx,
                         placements: places.clone(),
                         opponent_pool_indices: opponent_indices,
+                        rating_placements,
                         is_opponent_game: true,
                     });
                 }

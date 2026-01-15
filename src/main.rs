@@ -382,6 +382,14 @@ where
     }
     logger.flush()?;
 
+    // Log default elo values at step 0 for fresh training (no rating data exists yet)
+    if matches!(mode, TrainingMode::Fresh) {
+        logger.log_scalar("train/current_elo", 1000.0, 0)?;
+        logger.log_scalar("train/best_elo", 1000.0, 0)?;
+        logger.log_scalar("train/best_step", 0.0, 0)?;
+        logger.flush()?;
+    }
+
     // Create checkpoint manager
     let mut checkpoint_manager = CheckpointManager::new(run_dir)?;
     checkpoint_manager.set_best_avg_return(best_return);
@@ -724,18 +732,17 @@ where
                             .map(|&idx| pool.get_checkpoint_name(idx))
                             .collect();
 
-                        // Rearrange placements: [learner_placement, opponent_placements...]
-                        // completion.placements is indexed by position
-                        let mut rating_placements =
-                            vec![completion.placements[env_state.learner_position]];
-                        // Get opponent positions from position_to_opponent mapping
-                        for (pos, slot) in env_state.position_to_opponent.iter().enumerate() {
-                            if slot.is_some() {
-                                rating_placements.push(completion.placements[pos]);
-                            }
+                        // Filter out games where all opponents are the same as current (self-play)
+                        let dominated_by_current =
+                            opponent_names.iter().all(|name| name == &current_name);
+                        if !dominated_by_current {
+                            // Use pre-computed placements (built before env_state was shuffled)
+                            history.record_game(
+                                &current_name,
+                                &opponent_names,
+                                completion.rating_placements.clone(),
+                            );
                         }
-
-                        history.record_game(&current_name, &opponent_names, rating_placements);
                     }
                 }
             }
@@ -1192,23 +1199,11 @@ where
                 let result = history.compute_ratings();
                 let elo_compute_ms = elo_start.elapsed().as_secs_f64() * 1000.0;
 
-                logger.log_scalar(
-                    "training/elo_compute_ms",
-                    elo_compute_ms as f32,
-                    global_step,
-                )?;
-                logger.log_scalar(
-                    "training/current_elo",
-                    result.current_elo as f32,
-                    global_step,
-                )?;
-                logger.log_scalar("training/best_elo", result.best_elo as f32, global_step)?;
-                logger.log_scalar("training/best_step", result.best_step as f32, global_step)?;
-                logger.log_scalar(
-                    "training/rating_games",
-                    result.total_games as f32,
-                    global_step,
-                )?;
+                logger.log_scalar("train/elo_compute_ms", elo_compute_ms as f32, global_step)?;
+                logger.log_scalar("train/current_elo", result.current_elo as f32, global_step)?;
+                logger.log_scalar("train/best_elo", result.best_elo as f32, global_step)?;
+                logger.log_scalar("train/best_step", result.best_step as f32, global_step)?;
+                logger.log_scalar("train/rating_games", result.total_games as f32, global_step)?;
 
                 // Print rating status
                 progress.println(&format!(
@@ -1229,8 +1224,8 @@ where
                 }
 
                 // Update root symlink to point to latest checkpoint's graph
-                let root_graph = run_dir.join("checkpoints/elo_graph.png");
-                let relative_target = format!("{checkpoint_name}/elo_graph.png");
+                let root_graph = run_dir.join("elo_graph.png");
+                let relative_target = format!("checkpoints/{checkpoint_name}/elo_graph.png");
                 // Remove existing symlink if present
                 let _ = std::fs::remove_file(&root_graph);
                 #[cfg(unix)]
@@ -1417,23 +1412,11 @@ where
             let result = history.compute_ratings();
             let elo_compute_ms = elo_start.elapsed().as_secs_f64() * 1000.0;
 
-            logger.log_scalar(
-                "training/elo_compute_ms",
-                elo_compute_ms as f32,
-                global_step,
-            )?;
-            logger.log_scalar(
-                "training/current_elo",
-                result.current_elo as f32,
-                global_step,
-            )?;
-            logger.log_scalar("training/best_elo", result.best_elo as f32, global_step)?;
-            logger.log_scalar("training/best_step", result.best_step as f32, global_step)?;
-            logger.log_scalar(
-                "training/rating_games",
-                result.total_games as f32,
-                global_step,
-            )?;
+            logger.log_scalar("train/elo_compute_ms", elo_compute_ms as f32, global_step)?;
+            logger.log_scalar("train/current_elo", result.current_elo as f32, global_step)?;
+            logger.log_scalar("train/best_elo", result.best_elo as f32, global_step)?;
+            logger.log_scalar("train/best_step", result.best_step as f32, global_step)?;
+            logger.log_scalar("train/rating_games", result.total_games as f32, global_step)?;
 
             // Print rating status
             progress.println(&format!(
@@ -1454,8 +1437,8 @@ where
             }
 
             // Update root symlink to point to latest checkpoint's graph
-            let root_graph = run_dir.join("checkpoints/elo_graph.png");
-            let relative_target = format!("{checkpoint_name}/elo_graph.png");
+            let root_graph = run_dir.join("elo_graph.png");
+            let relative_target = format!("checkpoints/{checkpoint_name}/elo_graph.png");
             // Remove existing symlink if present
             let _ = std::fs::remove_file(&root_graph);
             #[cfg(unix)]

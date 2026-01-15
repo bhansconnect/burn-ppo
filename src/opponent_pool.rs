@@ -264,9 +264,12 @@ impl<B: Backend> OpponentPool<B> {
         &self.active_indices
     }
 
-    /// Get qi scores file path
+    /// Get qi scores file path (in run folder, not checkpoints folder)
     fn qi_scores_path(&self) -> PathBuf {
-        self.checkpoints_dir.join("qi_scores.json")
+        self.checkpoints_dir
+            .parent()
+            .expect("checkpoints_dir has parent")
+            .join("qi_scores.json")
     }
 
     /// Load qi scores from disk

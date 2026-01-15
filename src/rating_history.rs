@@ -322,13 +322,10 @@ impl RatingHistory {
             }
         }
 
-        // Current = most recent checkpoint (or the one set as current)
-        let current_idx = self
-            .current_checkpoint
-            .as_ref()
-            .and_then(|name| self.checkpoint_to_idx.get(name).copied())
-            .unwrap_or(num_checkpoints.saturating_sub(1));
-
+        // Current = second-to-last checkpoint (the one that has played games)
+        // The latest checkpoint was just created and hasn't played rating games yet,
+        // so we report the previous checkpoint's rating instead
+        let current_idx = num_checkpoints.saturating_sub(2);
         let current_rating = adjusted_ratings.get(current_idx).copied().unwrap_or(1000.0);
 
         // Cache ratings
@@ -374,6 +371,12 @@ impl RatingHistory {
             .collect();
 
         data.sort_by_key(|(step, _)| *step);
+
+        // Skip the latest checkpoint - it was just created and hasn't played
+        // rating games yet, so its Elo is not meaningful
+        if data.len() > 1 {
+            data.pop();
+        }
 
         if data.is_empty() {
             return Ok(());
@@ -492,10 +495,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut history = RatingHistory::new(dir.path());
 
+        // Create 3 checkpoints: 0, 10000, 20000
+        // current_elo reports second-to-last (10000) since latest (20000) has no games yet
         history.on_checkpoint_saved("step_00000000", 0);
         history.on_checkpoint_saved("step_00010000", 10000);
+        history.on_checkpoint_saved("step_00020000", 20000);
 
-        // Current (step 10000) beats first checkpoint consistently
+        // Checkpoint 10000 beats checkpoint 0 consistently
         for _ in 0..10 {
             history.record_game("step_00010000", &["step_00000000".to_string()], vec![1, 2]);
         }
@@ -503,7 +509,7 @@ mod tests {
         let result = history.compute_ratings();
 
         // First checkpoint should be anchored at 1000
-        // Current should be rated higher (won all games)
+        // current_elo reports second-to-last checkpoint (step 10000) which won all games
         assert!(result.current_elo > 1000.0);
         assert_eq!(result.best_step, 10000);
         assert_eq!(result.total_games, 10);
