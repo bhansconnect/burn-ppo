@@ -1590,7 +1590,7 @@ where
                     num_players,
                 );
                 #[cfg(feature = "tracy")]
-                B::sync(&device);
+                let _ = B::sync(&device);
                 out
             };
             // All intermediate autodiff tensors dropped!
@@ -1606,7 +1606,7 @@ where
                 profile_scope!("backward");
                 let grads = loss.backward();
                 #[cfg(feature = "tracy")]
-                B::sync(&device);
+                let _ = B::sync(&device);
                 grads
             };
             // Now ZERO autodiff tensors exist!
@@ -1635,7 +1635,7 @@ where
                 let grads = GradientsParams::from_grads(grads, &model);
                 let updated = optimizer.step(learning_rate, model, grads);
                 #[cfg(feature = "tracy")]
-                B::sync(&device);
+                let _ = B::sync(&device);
                 updated
             };
 
@@ -1724,7 +1724,7 @@ where
     };
 
     // Cleanup memory in hopes of avoiding any leaks.
-    B::sync(&device);
+    let _ = B::sync(&device);
     B::memory_cleanup(&device);
 
     (model, metrics)

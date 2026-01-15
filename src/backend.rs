@@ -23,6 +23,8 @@ pub fn available_backends() -> Vec<&'static str> {
         "cuda",
         #[cfg(feature = "libtorch")]
         "libtorch",
+        #[cfg(feature = "cpu")]
+        "cpu",
     ]
 }
 
@@ -32,7 +34,8 @@ pub fn default_backend() -> &'static str {
     "ndarray"
 }
 
-/// Returns the best available backend for this build (cuda > libtorch > wgpu > ndarray)
+/// Returns the best available backend for this build (cuda > libtorch > wgpu > ndarray > cpu)
+/// Note: ndarray is faster than `CubeCL` CPU for small MLPs (matmul not fully optimized in `CubeCL`)
 #[must_use]
 pub fn best_available_backend() -> &'static str {
     #[cfg(feature = "cuda")]
@@ -41,6 +44,7 @@ pub fn best_available_backend() -> &'static str {
     return "libtorch";
     #[cfg(all(feature = "wgpu", not(feature = "cuda"), not(feature = "libtorch")))]
     return "wgpu";
+    // ndarray is faster than CubeCL CPU for small MLPs, so prefer it
     #[cfg(all(
         not(feature = "wgpu"),
         not(feature = "cuda"),
@@ -105,6 +109,12 @@ macro_rules! dispatch_backend {
                 let $device = burn::backend::ndarray::NdArrayDevice::default();
                 $callback
             }
+            #[cfg(feature = "cpu")]
+            "cpu" => {
+                type TB = Autodiff<burn::backend::Cpu>;
+                let $device = burn::backend::cpu::CpuDevice::default();
+                $callback
+            }
             _ => anyhow::bail!(
                 "Unknown backend '{}'. Available: {}",
                 $backend_name,
@@ -121,6 +131,7 @@ pub fn get_backend_display_name(backend: &str) -> &'static str {
         "cuda" => "CUDA",
         "libtorch" => "LibTorch",
         "wgpu" => "WGPU",
+        "cpu" => "CubeCL CPU",
         "ndarray" => "NdArray",
         _ => "Unknown",
     }
