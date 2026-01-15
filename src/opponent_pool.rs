@@ -669,10 +669,14 @@ impl<B: Backend> OpponentPool<B> {
 
     /// Apply all pending game results to qi scores in shuffled order
     ///
-    /// qi update rule:
+    /// qi update rule (`OpenAI` Five Appendix N, Equation 14):
     /// - If opponent wins (current model loses): qi unchanged
-    /// - If opponent loses (current model wins): qi -= eta / (N - pi)
+    /// - If opponent loses (current model wins): qi -= eta / (N * pi)
     ///   where N = total opponents, pi = selection probability of this opponent
+    ///
+    /// The N*pi denominator creates important feedback: opponents with low
+    /// selection probability decrease faster, concentrating probability mass
+    /// in strong (recent) opponents during fast learning phases.
     pub fn apply_pending_qi_updates(&mut self) {
         if self.pending_game_results.is_empty() {
             return;
@@ -694,7 +698,7 @@ impl<B: Backend> OpponentPool<B> {
                 // Current model won => opponent lost => decrease qi
                 let pi = self.compute_selection_probability(game.opponent_pool_idx);
                 if let Some((_, qi_data)) = self.available.get_mut(game.opponent_pool_idx) {
-                    qi_data.qi -= self.qi_eta / (n - pi);
+                    qi_data.qi -= self.qi_eta / (n * pi);
                 }
             }
             // If opponent won, qi unchanged
@@ -1203,19 +1207,19 @@ mod tests {
 
     #[test]
     fn test_qi_update_formula() {
-        // Test the qi update: qi -= eta / (N - pi)
+        // Test the qi update: qi -= eta / (N * pi)  (OpenAI Five Appendix N, Eq. 14)
         let eta: f64 = 0.01;
         let n: f64 = 10.0;
         let pi: f64 = 0.2; // 20% selection probability
 
         let initial_qi: f64 = 0.5;
-        let new_qi = initial_qi - eta / (n - pi);
+        let new_qi = initial_qi - eta / (n * pi);
 
         // qi should decrease
         assert!(new_qi < initial_qi);
 
-        // The decrease should be eta / (n - pi) = 0.01 / 9.8 ≈ 0.00102
-        let expected_decrease = eta / (n - pi);
+        // The decrease should be eta / (n * pi) = 0.01 / 2.0 = 0.005
+        let expected_decrease = eta / (n * pi);
         assert!(((initial_qi - new_qi) - expected_decrease).abs() < f64::EPSILON);
     }
 
@@ -1422,7 +1426,7 @@ mod tests {
             let eta: f64 = 0.01;
             let n: f64 = 10.0;
             let pi: f64 = 0.1;
-            initial_qi - eta / (n - pi)
+            initial_qi - eta / (n * pi)
         } else {
             initial_qi // No change when opponent wins
         };
@@ -1440,35 +1444,34 @@ mod tests {
         let pi: f64 = 0.1;
 
         let final_qi: f64 = if current_won {
-            initial_qi - eta / (n - pi)
+            initial_qi - eta / (n * pi)
         } else {
             initial_qi
         };
 
         assert!(final_qi < initial_qi);
-        // Verify exact decrease
-        let expected_decrease = eta / (n - pi);
+        // Verify exact decrease: eta / (n * pi) = 0.01 / 1.0 = 0.01
+        let expected_decrease = eta / (n * pi);
         assert!(((initial_qi - final_qi) - expected_decrease).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_qi_update_high_probability_smaller_decrease() {
-        // Opponents with higher selection probability should decrease less
+        // With formula qi -= eta / (N * pi), opponents with higher selection
+        // probability should decrease LESS (larger denominator = smaller decrease).
+        // This creates important feedback: low-probability opponents decrease
+        // faster, concentrating probability mass in strong opponents.
         let eta = 0.01;
         let n = 10.0;
 
         let pi_low = 0.05; // Low probability opponent
         let pi_high = 0.3; // High probability opponent
 
-        let decrease_low = eta / (n - pi_low); // 0.01 / 9.95 ≈ 0.001005
-        let decrease_high = eta / (n - pi_high); // 0.01 / 9.7 ≈ 0.001031
+        let decrease_low = eta / (n * pi_low); // 0.01 / 0.5 = 0.02
+        let decrease_high = eta / (n * pi_high); // 0.01 / 3.0 ≈ 0.00333
 
-        // Higher probability means larger denominator decrease means smaller qi decrease
-        // Wait, that's backwards. Let me recalculate:
-        // decrease_low = 0.01 / 9.95 = 0.001005...
-        // decrease_high = 0.01 / 9.7 = 0.001030...
-        // So higher pi actually means LARGER decrease (smaller denominator)
-        assert!(decrease_high > decrease_low);
+        // Higher probability means larger denominator, means SMALLER qi decrease
+        assert!(decrease_high < decrease_low);
     }
 
     #[test]
