@@ -183,6 +183,9 @@ where
     // Initialize RNG
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.seed);
 
+    TB::seed(device, config.seed);
+    <TB as burn::tensor::backend::AutodiffBackend>::InnerBackend::seed(device, config.seed);
+
     // Create vectorized environment
     let num_envs = config.num_envs();
     let mut vec_env = VecEnv::new(num_envs, env_factory);
