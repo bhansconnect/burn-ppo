@@ -1435,6 +1435,12 @@ where
             if let Err(e) = pool.save_qi_scores() {
                 progress.eprintln(&format!("Warning: Failed to save qi scores: {e}"));
             }
+            // Save qi probability graph (only in debug_qi mode)
+            if config.debug_qi {
+                if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
+                    progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
+                }
+            }
         }
 
         // Log final checkpoint save message
