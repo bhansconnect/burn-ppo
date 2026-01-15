@@ -33,6 +33,7 @@ mod ppo;
 mod profile;
 mod progress;
 mod rating_history;
+mod schedule;
 mod supervisor;
 mod tournament;
 mod utils;
@@ -204,14 +205,6 @@ where
             obs_shape,
             action_count,
             num_players
-        );
-    }
-
-    // Warning for conflicting entropy config
-    if config.adaptive_entropy && config.entropy_anneal {
-        eprintln!(
-            "Warning: Both adaptive_entropy and entropy_anneal are enabled. \
-             adaptive_entropy takes precedence; entropy_anneal will be ignored."
         );
     }
 
@@ -426,12 +419,8 @@ where
 
     // Training state
     let steps_per_update = config.num_steps * num_envs;
-    let total_updates = config.total_steps / steps_per_update;
     let remaining_steps = config.total_steps.saturating_sub(global_step);
     let num_updates = remaining_steps / steps_per_update;
-
-    // For LR annealing, we need to know how many updates have already happened
-    let update_offset = global_step / steps_per_update;
 
     // Parse time limit (fail fast if invalid)
     let time_limit = config.max_training_duration()?;
@@ -607,16 +596,17 @@ where
     // - Multiplayer: best is updated via rating system (auto_update_best = false)
     let use_avg_return_for_best = num_players == 1;
 
-    // Adaptive entropy controller (if enabled)
-    let mut entropy_controller = if config.adaptive_entropy {
-        Some(entropy::AdaptiveEntropyController::new(
-            config,
+    // Adaptive entropy controller (if enabled via adaptive_entropy schedule)
+    let mut entropy_controller = config.adaptive_entropy.as_ref().map(|target_schedule| {
+        entropy::AdaptiveEntropyController::new(
+            target_schedule.clone(),
             action_count,
-            config.entropy_coef,
-        ))
-    } else {
-        None
-    };
+            config.entropy_coef.initial_value(),
+            config.adaptive_entropy_min_coef,
+            config.adaptive_entropy_max_coef,
+            config.adaptive_entropy_delta,
+        )
+    });
 
     // Memory tracking for stats_alloc feature
     // Track net memory = allocated + reallocated - deallocated (actual heap usage)
@@ -648,35 +638,18 @@ where
             }
         }
 
-        // Learning rate annealing (decay to final value, default 0)
-        let lr = if config.lr_anneal {
-            let actual_update = update_offset + update;
-            let progress_frac = actual_update as f64 / total_updates as f64;
-            config.learning_rate + (config.lr_final - config.learning_rate) * progress_frac
-        } else {
-            config.learning_rate
-        };
+        // Learning rate from schedule (uses absolute timesteps)
+        let lr = config.learning_rate.get(global_step as u64);
 
         // Entropy coefficient calculation:
         // 1. Adaptive entropy: PID-inspired control targeting specific entropy levels
-        // 2. Entropy annealing: linear decay to final value
-        // 3. Constant: use entropy_coef as-is
-        let actual_update = update_offset + update;
-        let progress_frac = actual_update as f64 / total_updates as f64;
-
+        // 2. Entropy schedule: use schedule.get(step)
         let (ent_coef, entropy_target) = if let Some(ref mut controller) = entropy_controller {
             // Adaptive entropy takes precedence
-            controller.get_coefficient(progress_frac)
-        } else if config.entropy_anneal {
-            // Linear annealing (default: decay to 50% of initial)
-            let final_coef = config
-                .entropy_coef_final
-                .unwrap_or(config.entropy_coef * 0.5);
-            let coef = config.entropy_coef + (final_coef - config.entropy_coef) * progress_frac;
-            (coef, 0.0) // No target for annealing mode
+            controller.get_coefficient(global_step as u64)
         } else {
-            // Constant coefficient
-            (config.entropy_coef, 0.0)
+            // Use entropy coefficient schedule
+            (config.entropy_coef.get(global_step as u64), 0.0)
         };
 
         // Collect rollouts using non-autodiff model for inference
@@ -941,10 +914,10 @@ where
             logger.log_scalar("train/policy_loss", metrics.policy_loss, global_step)?;
             logger.log_scalar("train/value_loss", metrics.value_loss, global_step)?;
             logger.log_scalar("train/entropy", metrics.entropy, global_step)?;
-            // Log adaptive entropy metrics when enabled
-            if config.adaptive_entropy {
+            logger.log_scalar("train/entropy_coef", ent_coef as f32, global_step)?;
+            // Log adaptive entropy target when enabled
+            if config.adaptive_entropy.is_some() {
                 logger.log_scalar("train/entropy_target", entropy_target as f32, global_step)?;
-                logger.log_scalar("train/entropy_coef", ent_coef as f32, global_step)?;
             }
             logger.log_scalar("train/approx_kl", metrics.approx_kl, global_step)?;
             logger.log_scalar("train/clip_fraction", metrics.clip_fraction, global_step)?;

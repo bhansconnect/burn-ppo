@@ -9,13 +9,11 @@ reward_shaping_coef = 0.05  # Per-round survival bonus (0.0 for pure zero-sum)
 
 # PPO hyperparameters
 learning_rate = 0.0003
-lr_anneal = false
 gamma = 0.99
 gae_lambda = 0.95
 clip_epsilon = 0.1
 clip_value = false
 entropy_coef = 0.01      # Higher entropy for bluffing exploration
-entropy_anneal = false
 value_coef = 0.5
 max_grad_norm = 0.5
 target_kl = 0.02

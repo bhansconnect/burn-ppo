@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::schedule::Schedule;
+
 /// Parse a duration string with unit suffix (e.g., "30s", "5m", "2h")
 /// Supports: s (seconds), m (minutes), h (hours)
 fn parse_duration(s: &str) -> Result<std::time::Duration> {
@@ -83,8 +85,11 @@ pub struct TrainArgs {
     )]
     pub num_envs: Option<usize>,
 
-    #[arg(long, help = "Learning rate (default: 0.00025)")]
-    pub learning_rate: Option<f64>,
+    #[arg(
+        long,
+        help = "Learning rate - static value or schedule (e.g., '0.0003' or '0.0003@0,0.00003@30M')"
+    )]
+    pub learning_rate: Option<String>,
 
     #[arg(long, help = "Total training steps (default: 1000000)")]
     pub total_steps: Option<usize>,
@@ -158,13 +163,6 @@ pub struct TrainArgs {
     #[arg(long)]
     pub reward_shaping_coef: Option<f32>,
 
-    /// Enable/disable learning rate annealing (use --lr-anneal=false to disable)
-    #[arg(long, help = "Enable learning rate annealing (default: true)")]
-    pub lr_anneal: Option<bool>,
-
-    #[arg(long, help = "Final learning rate when annealing (default: 0)")]
-    pub lr_final: Option<f64>,
-
     #[arg(long, help = "Discount factor (default: 0.99)")]
     pub gamma: Option<f64>,
 
@@ -177,29 +175,17 @@ pub struct TrainArgs {
     #[arg(long, help = "Enable value clipping (default: false)")]
     pub clip_value: Option<bool>,
 
-    #[arg(long, help = "Entropy coefficient (default: 0.01)")]
-    pub entropy_coef: Option<f64>,
-
-    #[arg(long, action = clap::ArgAction::Set, help = "Enable entropy coefficient annealing (default: false)")]
-    pub entropy_anneal: Option<bool>,
+    #[arg(
+        long,
+        help = "Entropy coefficient - static value or schedule (e.g., '0.01' or '0.02@0,0.005@30M')"
+    )]
+    pub entropy_coef: Option<String>,
 
     #[arg(
         long,
-        help = "Final entropy coefficient when annealing (default: 10% of initial)"
+        help = "Adaptive entropy target - static or schedule (e.g., '0.5' or '0.7@0,0.7@3M,0.2@30M'), or 'none' to disable. Ratio of max entropy."
     )]
-    pub entropy_coef_final: Option<f64>,
-
-    #[arg(long, action = clap::ArgAction::Set, help = "Enable adaptive entropy control (default: false)")]
-    pub adaptive_entropy: Option<bool>,
-
-    #[arg(long, help = "Start target as ratio of max entropy (default: 0.7)")]
-    pub adaptive_entropy_start: Option<f64>,
-
-    #[arg(long, help = "Final target as ratio of max entropy (default: 0.2)")]
-    pub adaptive_entropy_final: Option<f64>,
-
-    #[arg(long, help = "Warmup fraction before decay starts (default: 0.1)")]
-    pub adaptive_entropy_warmup: Option<f64>,
+    pub adaptive_entropy: Option<String>,
 
     #[arg(long, help = "Minimum entropy coefficient (default: 0.001)")]
     pub adaptive_entropy_min_coef: Option<f64>,
@@ -313,26 +299,23 @@ impl TrainArgs {
         push_opt!(self.cnn_num_fc_layers, "--cnn-num-fc-layers");
 
         // PPO hyperparameters
+        // Schedule types are passed as strings (e.g., "0.0003" or "0.0003@0,0.00003@30M")
         push_opt!(self.learning_rate, "--learning-rate");
-        push_opt!(self.lr_anneal, "--lr-anneal");
-        push_opt!(self.lr_final, "--lr-final");
         push_opt!(self.gamma, "--gamma");
         push_opt!(self.gae_lambda, "--gae-lambda");
         push_opt!(self.clip_epsilon, "--clip-epsilon");
         push_opt!(self.clip_value, "--clip-value");
         push_opt!(self.entropy_coef, "--entropy-coef");
-        push_opt!(self.entropy_anneal, "--entropy-anneal");
-        push_opt!(self.entropy_coef_final, "--entropy-coef-final");
         push_opt!(self.value_coef, "--value-coef");
         push_opt!(self.max_grad_norm, "--max-grad-norm");
         push_opt!(self.target_kl, "--target-kl");
         push_opt!(self.num_steps, "--num-steps");
 
         // Adaptive entropy
-        push_opt!(self.adaptive_entropy, "--adaptive-entropy");
-        push_opt!(self.adaptive_entropy_start, "--adaptive-entropy-start");
-        push_opt!(self.adaptive_entropy_final, "--adaptive-entropy-final");
-        push_opt!(self.adaptive_entropy_warmup, "--adaptive-entropy-warmup");
+        if let Some(ref schedule) = self.adaptive_entropy {
+            args.push("--adaptive-entropy".to_string());
+            args.push(schedule.clone());
+        }
         push_opt!(
             self.adaptive_entropy_min_coef,
             "--adaptive-entropy-min-coef"
@@ -562,13 +545,10 @@ pub struct Config {
     pub reward_shaping_coef: f32,
 
     // PPO hyperparameters
+    /// Learning rate - can be static value or schedule with milestones.
+    /// Examples: 0.0003 (static), [[0.0003, 0], [0.00003, 30000000]] (schedule)
     #[serde(default = "default_learning_rate")]
-    pub learning_rate: f64,
-    #[serde(default = "default_true")]
-    pub lr_anneal: bool,
-    /// Final learning rate when annealing (default: 0)
-    #[serde(default)]
-    pub lr_final: f64,
+    pub learning_rate: Schedule,
     #[serde(default = "default_gamma")]
     pub gamma: f64,
     #[serde(default = "default_gae_lambda")]
@@ -577,31 +557,18 @@ pub struct Config {
     pub clip_epsilon: f64,
     #[serde(default)]
     pub clip_value: bool,
+    /// Entropy coefficient - can be static value or schedule with milestones.
+    /// Examples: 0.01 (static), [[0.02, 0], [0.005, 30000000]] (schedule)
     #[serde(default = "default_entropy_coef")]
-    pub entropy_coef: f64,
-    /// Whether to anneal entropy coefficient over training
-    /// When true, decays from `entropy_coef` to 10% of initial value
-    #[serde(default)]
-    pub entropy_anneal: bool,
-    /// Final entropy coefficient when annealing (None = 10% of initial)
-    #[serde(default)]
-    pub entropy_coef_final: Option<f64>,
+    pub entropy_coef: Schedule,
 
     // Adaptive entropy control (PID-inspired target tracking)
-    /// Enable adaptive entropy coefficient control.
-    /// Adjusts coefficient to maintain target entropy levels throughout training.
-    /// Mutually exclusive with `entropy_anneal` (this takes precedence).
+    /// Adaptive entropy target schedule (ratio of max entropy).
+    /// When set, enables adaptive control which adjusts coefficient to hit target.
+    /// Examples: 0.5 (static 50%), [[0.7, 0], [0.7, 3000000], [0.2, 30000000]] (schedule)
+    /// Overrides `entropy_coef` when set.
     #[serde(default)]
-    pub adaptive_entropy: bool,
-    /// Start target as ratio of max entropy (0-1). Default: 0.7 (70% of `ln(num_actions)`)
-    #[serde(default = "default_adaptive_entropy_start")]
-    pub adaptive_entropy_start: f64,
-    /// Final target as ratio of max entropy (0-1). Default: 0.2 (20% of `ln(num_actions)`)
-    #[serde(default = "default_adaptive_entropy_final")]
-    pub adaptive_entropy_final: f64,
-    /// Warmup fraction before decay starts (0-1). Default: 0.1 (10% of training)
-    #[serde(default = "default_adaptive_entropy_warmup")]
-    pub adaptive_entropy_warmup: f64,
+    pub adaptive_entropy: Option<Schedule>,
     /// Minimum entropy coefficient. Default: 0.001
     #[serde(default = "default_adaptive_entropy_min_coef")]
     pub adaptive_entropy_min_coef: f64,
@@ -727,8 +694,8 @@ const fn default_num_steps() -> usize {
 const fn default_reward_shaping_coef() -> f32 {
     0.0 // Pure zero-sum by default
 }
-const fn default_learning_rate() -> f64 {
-    2.5e-4
+fn default_learning_rate() -> Schedule {
+    Schedule::constant(2.5e-4)
 }
 const fn default_true() -> bool {
     true
@@ -742,20 +709,11 @@ const fn default_gae_lambda() -> f64 {
 const fn default_clip_epsilon() -> f64 {
     0.2
 }
-const fn default_entropy_coef() -> f64 {
-    0.01
+fn default_entropy_coef() -> Schedule {
+    Schedule::constant(0.01)
 }
 
 // Adaptive entropy defaults
-const fn default_adaptive_entropy_start() -> f64 {
-    0.7 // 70% of max entropy (high exploration early)
-}
-const fn default_adaptive_entropy_final() -> f64 {
-    0.2 // 20% of max entropy (exploitation late)
-}
-const fn default_adaptive_entropy_warmup() -> f64 {
-    0.1 // 10% of training at constant high target
-}
 const fn default_adaptive_entropy_min_coef() -> f64 {
     0.001
 }
@@ -851,19 +809,12 @@ impl Default for Config {
             num_steps: default_num_steps(),
             reward_shaping_coef: default_reward_shaping_coef(),
             learning_rate: default_learning_rate(),
-            lr_anneal: default_true(),
-            lr_final: 0.0,
             gamma: default_gamma(),
             gae_lambda: default_gae_lambda(),
             clip_epsilon: default_clip_epsilon(),
             clip_value: false,
             entropy_coef: default_entropy_coef(),
-            entropy_anneal: false,
-            entropy_coef_final: None,
-            adaptive_entropy: false,
-            adaptive_entropy_start: default_adaptive_entropy_start(),
-            adaptive_entropy_final: default_adaptive_entropy_final(),
-            adaptive_entropy_warmup: default_adaptive_entropy_warmup(),
+            adaptive_entropy: None,
             adaptive_entropy_min_coef: default_adaptive_entropy_min_coef(),
             adaptive_entropy_max_coef: default_adaptive_entropy_max_coef(),
             adaptive_entropy_delta: default_adaptive_entropy_delta(),
@@ -960,14 +911,11 @@ impl Config {
         }
 
         // PPO hyperparameters
-        if let Some(lr) = args.learning_rate {
-            self.learning_rate = lr;
-        }
-        if let Some(v) = args.lr_anneal {
-            self.lr_anneal = v;
-        }
-        if let Some(v) = args.lr_final {
-            self.lr_final = v;
+        if let Some(ref lr) = args.learning_rate {
+            match Schedule::parse_cli(lr) {
+                Ok(s) => self.learning_rate = s,
+                Err(e) => eprintln!("Warning: invalid --learning-rate '{lr}': {e}"),
+            }
         }
         if let Some(v) = args.gamma {
             self.gamma = v;
@@ -981,26 +929,22 @@ impl Config {
         if let Some(v) = args.clip_value {
             self.clip_value = v;
         }
-        if let Some(v) = args.entropy_coef {
-            self.entropy_coef = v;
+        if let Some(ref v) = args.entropy_coef {
+            match Schedule::parse_cli(v) {
+                Ok(s) => self.entropy_coef = s,
+                Err(e) => eprintln!("Warning: invalid --entropy-coef '{v}': {e}"),
+            }
         }
-        if let Some(v) = args.entropy_anneal {
-            self.entropy_anneal = v;
-        }
-        if let Some(v) = args.entropy_coef_final {
-            self.entropy_coef_final = Some(v);
-        }
-        if let Some(v) = args.adaptive_entropy {
-            self.adaptive_entropy = v;
-        }
-        if let Some(v) = args.adaptive_entropy_start {
-            self.adaptive_entropy_start = v;
-        }
-        if let Some(v) = args.adaptive_entropy_final {
-            self.adaptive_entropy_final = v;
-        }
-        if let Some(v) = args.adaptive_entropy_warmup {
-            self.adaptive_entropy_warmup = v;
+        if let Some(ref v) = args.adaptive_entropy {
+            let lower = v.trim().to_lowercase();
+            if lower == "none" || lower == "off" || lower == "disabled" {
+                self.adaptive_entropy = None;
+            } else {
+                match Schedule::parse_cli(v) {
+                    Ok(s) => self.adaptive_entropy = Some(s),
+                    Err(e) => eprintln!("Warning: invalid --adaptive-entropy '{v}': {e}"),
+                }
+            }
         }
         if let Some(v) = args.adaptive_entropy_min_coef {
             self.adaptive_entropy_min_coef = v;
@@ -1145,12 +1089,6 @@ impl Config {
         if args.learning_rate.is_some() {
             ignored.push("--learning-rate");
         }
-        if args.lr_anneal.is_some() {
-            ignored.push("--lr-anneal");
-        }
-        if args.lr_final.is_some() {
-            ignored.push("--lr-final");
-        }
         if args.gamma.is_some() {
             ignored.push("--gamma");
         }
@@ -1166,23 +1104,8 @@ impl Config {
         if args.entropy_coef.is_some() {
             ignored.push("--entropy-coef");
         }
-        if args.entropy_anneal.is_some() {
-            ignored.push("--entropy-anneal");
-        }
-        if args.entropy_coef_final.is_some() {
-            ignored.push("--entropy-coef-final");
-        }
         if args.adaptive_entropy.is_some() {
             ignored.push("--adaptive-entropy");
-        }
-        if args.adaptive_entropy_start.is_some() {
-            ignored.push("--adaptive-entropy-start");
-        }
-        if args.adaptive_entropy_final.is_some() {
-            ignored.push("--adaptive-entropy-final");
-        }
-        if args.adaptive_entropy_warmup.is_some() {
-            ignored.push("--adaptive-entropy-warmup");
         }
         if args.adaptive_entropy_min_coef.is_some() {
             ignored.push("--adaptive-entropy-min-coef");
@@ -1319,8 +1242,12 @@ impl Config {
             );
         }
 
-        if self.learning_rate <= 0.0 {
-            bail!("learning_rate must be > 0");
+        // Validate learning_rate schedule has positive initial value
+        if self.learning_rate.initial_value() <= 0.0 {
+            bail!(
+                "learning_rate must be > 0 (initial value: {})",
+                self.learning_rate.initial_value()
+            );
         }
         if self.gamma < 0.0 || self.gamma > 1.0 {
             bail!("gamma must be in [0, 1]");
@@ -1328,21 +1255,16 @@ impl Config {
         if self.clip_epsilon <= 0.0 {
             bail!("clip_epsilon must be > 0");
         }
-        if self.entropy_coef < 0.0 {
-            bail!("entropy_coef must be >= 0");
+        // Validate entropy_coef schedule has non-negative initial value
+        if self.entropy_coef.initial_value() < 0.0 {
+            bail!(
+                "entropy_coef must be >= 0 (initial value: {})",
+                self.entropy_coef.initial_value()
+            );
         }
 
         // Validate adaptive entropy config
-        if self.adaptive_entropy {
-            if self.adaptive_entropy_start < 0.0 || self.adaptive_entropy_start > 1.0 {
-                bail!("adaptive_entropy_start must be in [0, 1]");
-            }
-            if self.adaptive_entropy_final < 0.0 || self.adaptive_entropy_final > 1.0 {
-                bail!("adaptive_entropy_final must be in [0, 1]");
-            }
-            if self.adaptive_entropy_warmup < 0.0 || self.adaptive_entropy_warmup > 1.0 {
-                bail!("adaptive_entropy_warmup must be in [0, 1]");
-            }
+        if self.adaptive_entropy.is_some() {
             if self.adaptive_entropy_min_coef < 0.0 {
                 bail!("adaptive_entropy_min_coef must be >= 0");
             }
@@ -1505,7 +1427,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.env, "cartpole");
-        assert_eq!(config.learning_rate, 2.5e-4);
+        assert_eq!(config.learning_rate.initial_value(), 2.5e-4);
         assert_eq!(config.adam_epsilon, 1e-5);
     }
 
@@ -1530,7 +1452,7 @@ mod tests {
     #[test]
     fn test_config_validate_bad_lr() {
         let config = Config {
-            learning_rate: -0.1,
+            learning_rate: Schedule::constant(-0.1),
             ..Default::default()
         };
         assert!(config.validate().is_err());
