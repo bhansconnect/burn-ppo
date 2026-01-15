@@ -625,9 +625,9 @@ where
             break;
         }
 
-        // Check time limit
+        // Check time limit (accounting for elapsed time from previous subprocess reloads)
         if let Some(limit) = time_limit {
-            if training_start.elapsed() >= limit {
+            if training_start.elapsed() + elapsed_offset >= limit {
                 // Safe: time_limit is Some only when max_training_time is Some
                 let limit_str = config
                     .max_training_time
