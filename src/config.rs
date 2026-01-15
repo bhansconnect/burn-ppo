@@ -267,9 +267,6 @@ pub struct TrainArgs {
     )]
     pub qi_eta: Option<f64>,
 
-    #[arg(long, help = "Enable qi debug graphs at each checkpoint")]
-    pub debug_qi: bool,
-
     #[arg(long, help = "Print selected opponents during training and evaluation")]
     pub debug_opponents: bool,
 
@@ -605,9 +602,6 @@ pub struct Config {
     /// qi score learning rate for opponent sampling
     #[serde(default = "default_qi_eta")]
     pub qi_eta: f64,
-    /// Enable qi debug graphs at each checkpoint
-    #[serde(default)]
-    pub debug_qi: bool,
     /// Print selected opponents during training and evaluation
     #[serde(default)]
     pub debug_opponents: bool,
@@ -799,7 +793,6 @@ impl Default for Config {
             opponent_pool_fraction: default_opponent_pool_fraction(),
             opponent_pool_rotation_steps: default_opponent_pool_rotation_steps(),
             qi_eta: default_qi_eta(),
-            debug_qi: false,
             debug_opponents: false,
             opponent_pool_size_limit: default_opponent_pool_size_limit(),
             seed: default_seed(),
@@ -1005,9 +998,6 @@ impl Config {
         }
         if let Some(v) = args.qi_eta {
             self.qi_eta = v;
-        }
-        if args.debug_qi {
-            self.debug_qi = true;
         }
         if args.debug_opponents {
             self.debug_opponents = true;

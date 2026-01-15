@@ -1217,20 +1217,10 @@ where
                     progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
                 }
 
-                // Generate Elo graph in checkpoint directory
-                let graph_path = checkpoint_path.join("elo_graph.png");
+                // Generate Elo graph in run root (overwrites previous)
+                let graph_path = run_dir.join("elo_graph.png");
                 if let Err(e) = history.generate_graph(&graph_path) {
                     progress.eprintln(&format!("Warning: Failed to generate Elo graph: {e}"));
-                }
-
-                // Update root symlink to point to latest checkpoint's graph
-                let root_graph = run_dir.join("elo_graph.png");
-                let relative_target = format!("checkpoints/{checkpoint_name}/elo_graph.png");
-                // Remove existing symlink if present
-                let _ = std::fs::remove_file(&root_graph);
-                #[cfg(unix)]
-                if let Err(e) = std::os::unix::fs::symlink(&relative_target, &root_graph) {
-                    progress.eprintln(&format!("Warning: Failed to create Elo graph symlink: {e}"));
                 }
             }
 
@@ -1269,31 +1259,11 @@ where
             };
             progress.println(&checkpoint_msg);
 
-            // Print qi histogram and log percentile metrics if debug_qi is enabled
-            if config.debug_qi {
-                if let Some(ref pool) = opponent_pool {
-                    if pool.has_opponents() {
-                        // Log percentile metrics
-                        let percentiles = pool.compute_qi_percentiles();
-                        for (i, &pos) in percentiles.iter().enumerate() {
-                            let pct = (i + 1) * 10;
-                            logger.log_scalar(
-                                &format!("qi/percentile_p{pct}"),
-                                pos as f32,
-                                global_step,
-                            )?;
-                        }
-
-                        // Print histogram to stderr
-                        let histogram = pool.generate_qi_histogram();
-                        for line in histogram.lines() {
-                            progress.eprintln(line);
-                        }
-
-                        // Save probability graph to checkpoint directory
-                        if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
-                            progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
-                        }
+            // Save qi probability graph to checkpoint directory
+            if let Some(ref pool) = opponent_pool {
+                if pool.has_opponents() {
+                    if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
+                        progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
                     }
                 }
             }
@@ -1388,11 +1358,9 @@ where
             if let Err(e) = pool.save_qi_scores() {
                 progress.eprintln(&format!("Warning: Failed to save qi scores: {e}"));
             }
-            // Save qi probability graph (only in debug_qi mode)
-            if config.debug_qi {
-                if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
-                    progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
-                }
+            // Save qi probability graph
+            if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
+                progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
             }
         }
 
@@ -1430,20 +1398,10 @@ where
                 progress.eprintln(&format!("Warning: Failed to update best checkpoint: {e}"));
             }
 
-            // Generate Elo graph in checkpoint directory
-            let graph_path = checkpoint_path.join("elo_graph.png");
+            // Generate Elo graph in run root (overwrites previous)
+            let graph_path = run_dir.join("elo_graph.png");
             if let Err(e) = history.generate_graph(&graph_path) {
                 progress.eprintln(&format!("Warning: Failed to generate Elo graph: {e}"));
-            }
-
-            // Update root symlink to point to latest checkpoint's graph
-            let root_graph = run_dir.join("elo_graph.png");
-            let relative_target = format!("checkpoints/{checkpoint_name}/elo_graph.png");
-            // Remove existing symlink if present
-            let _ = std::fs::remove_file(&root_graph);
-            #[cfg(unix)]
-            if let Err(e) = std::os::unix::fs::symlink(&relative_target, &root_graph) {
-                progress.eprintln(&format!("Warning: Failed to create Elo graph symlink: {e}"));
             }
         }
 
@@ -1606,7 +1564,6 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
             args.total_timesteps,
             args.max_training_time.clone(),
             running,
-            args.debug_qi,
             args.debug_opponents,
         )
     } else {
@@ -1642,7 +1599,6 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
             args.config.clone(),
             run_name,
             args.seed,
-            args.debug_qi,
             args.debug_opponents,
         )
     };
