@@ -16,6 +16,11 @@ clip_value = false       # Value function clipping disabled
 entropy_coef = 0.02      # Recommended PPO default that works pretty well.
 entropy_anneal = false   # Keep constant - aggressive decay causes premature convergence
 
+# While historical opponents theoretically help,
+# they are so slow that running without is better.
+# Just train more steps instead of with opponents.
+opponent_pool_enabled = false
+
 # Adaptive entropy - prevents premature convergence, maintains exploration
 adaptive_entropy = true
 adaptive_entropy_start = 0.7   # Start at 70% of max entropy
