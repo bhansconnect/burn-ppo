@@ -39,6 +39,8 @@ pub struct TrainingSupervisor {
     seed_override: Option<u64>,
     /// Enable opponent debug output (pass through to subprocess)
     debug_opponents: bool,
+    /// CLI override args to pass through to subprocess (for fresh runs only)
+    cli_overrides: Vec<String>,
 }
 
 impl TrainingSupervisor {
@@ -64,6 +66,7 @@ impl TrainingSupervisor {
             run_name: None,
             seed_override: None, // Seed not overridable for resume
             debug_opponents,
+            cli_overrides: Vec::new(), // CLI overrides not applied for resume
         }
     }
 
@@ -79,6 +82,7 @@ impl TrainingSupervisor {
         run_name: String,
         seed_override: Option<u64>,
         debug_opponents: bool,
+        cli_overrides: Vec<String>,
     ) -> Self {
         Self {
             run_dir,
@@ -92,6 +96,7 @@ impl TrainingSupervisor {
             run_name: Some(run_name),
             seed_override,
             debug_opponents,
+            cli_overrides,
         }
     }
 
@@ -181,6 +186,8 @@ impl TrainingSupervisor {
                     .expect("run_name set for fresh run")
                     .clone(),
             );
+            // Pass through CLI overrides for fresh run
+            args.extend(self.cli_overrides.clone());
         } else {
             // Resume mode
             args.push("--resume".to_string());

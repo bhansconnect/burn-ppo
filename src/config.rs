@@ -277,6 +277,108 @@ pub struct TrainArgs {
     pub opponent_pool_size_limit: Option<usize>,
 }
 
+impl TrainArgs {
+    /// Generate CLI args for passthrough to subprocess
+    ///
+    /// Returns all override arguments that should be passed to a subprocess.
+    /// Excludes args already handled specially by supervisor (`total_timesteps`,
+    /// `max_training_time`, seed, `debug_opponents`) and meta args (config, resume, etc.)
+    pub fn to_passthrough_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+
+        // Helper macro to reduce boilerplate
+        macro_rules! push_opt {
+            ($field:expr, $flag:literal) => {
+                if let Some(v) = &$field {
+                    args.push($flag.to_string());
+                    args.push(v.to_string());
+                }
+            };
+        }
+
+        // Environment
+        push_opt!(self.env, "--env");
+        push_opt!(self.num_envs, "--num-envs");
+        push_opt!(self.reward_shaping_coef, "--reward-shaping-coef");
+
+        // Network
+        push_opt!(self.network_type, "--network-type");
+        push_opt!(self.split_networks, "--split-networks");
+        push_opt!(self.hidden_size, "--hidden-size");
+        push_opt!(self.num_hidden, "--num-hidden");
+        push_opt!(self.activation, "--activation");
+        push_opt!(self.num_conv_layers, "--num-conv-layers");
+        push_opt!(self.kernel_size, "--kernel-size");
+        push_opt!(self.cnn_fc_hidden_size, "--cnn-fc-hidden-size");
+        push_opt!(self.cnn_num_fc_layers, "--cnn-num-fc-layers");
+
+        // PPO hyperparameters
+        push_opt!(self.learning_rate, "--learning-rate");
+        push_opt!(self.lr_anneal, "--lr-anneal");
+        push_opt!(self.lr_final, "--lr-final");
+        push_opt!(self.gamma, "--gamma");
+        push_opt!(self.gae_lambda, "--gae-lambda");
+        push_opt!(self.clip_epsilon, "--clip-epsilon");
+        push_opt!(self.clip_value, "--clip-value");
+        push_opt!(self.entropy_coef, "--entropy-coef");
+        push_opt!(self.entropy_anneal, "--entropy-anneal");
+        push_opt!(self.entropy_coef_final, "--entropy-coef-final");
+        push_opt!(self.value_coef, "--value-coef");
+        push_opt!(self.max_grad_norm, "--max-grad-norm");
+        push_opt!(self.target_kl, "--target-kl");
+        push_opt!(self.num_steps, "--num-steps");
+
+        // Adaptive entropy
+        push_opt!(self.adaptive_entropy, "--adaptive-entropy");
+        push_opt!(self.adaptive_entropy_start, "--adaptive-entropy-start");
+        push_opt!(self.adaptive_entropy_final, "--adaptive-entropy-final");
+        push_opt!(self.adaptive_entropy_warmup, "--adaptive-entropy-warmup");
+        push_opt!(
+            self.adaptive_entropy_min_coef,
+            "--adaptive-entropy-min-coef"
+        );
+        push_opt!(
+            self.adaptive_entropy_max_coef,
+            "--adaptive-entropy-max-coef"
+        );
+        push_opt!(self.adaptive_entropy_delta, "--adaptive-entropy-delta");
+
+        // Normalization
+        push_opt!(self.normalize_obs, "--normalize-obs");
+        push_opt!(self.normalize_returns, "--normalize-returns");
+
+        // Training
+        push_opt!(self.num_epochs, "--num-epochs");
+        push_opt!(self.num_minibatches, "--num-minibatches");
+        push_opt!(self.adam_epsilon, "--adam-epsilon");
+
+        // Checkpointing/Logging
+        if let Some(v) = &self.run_dir {
+            args.push("--run-dir".to_string());
+            args.push(v.to_string_lossy().to_string());
+        }
+        push_opt!(self.checkpoint_freq, "--checkpoint-freq");
+        push_opt!(self.log_freq, "--log-freq");
+
+        // Opponent pool training
+        push_opt!(self.opponent_pool_enabled, "--opponent-pool-enabled");
+        push_opt!(self.opponent_pool_fraction, "--opponent-pool-fraction");
+        push_opt!(
+            self.opponent_pool_rotation_steps,
+            "--opponent-pool-rotation-steps"
+        );
+        push_opt!(self.qi_eta, "--qi-eta");
+        push_opt!(self.opponent_pool_size_limit, "--opponent-pool-size-limit");
+
+        // Note: These are handled specially by supervisor and excluded:
+        // - total_timesteps, max_training_time, seed, debug_opponents
+        // - config, resume, fork, run_name, backend
+        // - reload_every_n_checkpoints, elapsed_time_offset_ms, max_checkpoints_this_run
+
+        args
+    }
+}
+
 /// Arguments for evaluation
 #[derive(Parser, Debug)]
 #[expect(
