@@ -300,7 +300,7 @@ impl<B: Backend> OpponentPool<B> {
         Ok(())
     }
 
-    /// Save qi scores to disk
+    /// Save qi scores to disk (atomic write via temp file + rename)
     pub fn save_qi_scores(&self) -> Result<()> {
         let file = QiScoresFile {
             qi_eta: self.qi_eta,
@@ -308,7 +308,12 @@ impl<B: Backend> OpponentPool<B> {
         };
 
         let json = serde_json::to_string_pretty(&file)?;
-        fs::write(self.qi_scores_path(), json).context("Failed to write qi_scores.json")?;
+
+        // Atomic write: temp file + rename
+        let path = self.qi_scores_path();
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(&temp_path, json).context("Failed to write temp qi_scores file")?;
+        fs::rename(&temp_path, &path).context("Failed to rename qi_scores file")?;
 
         Ok(())
     }
@@ -697,8 +702,15 @@ impl<B: Backend> OpponentPool<B> {
             if game.current_won {
                 // Current model won => opponent lost => decrease qi
                 let pi = self.compute_selection_probability(game.opponent_pool_idx);
-                if let Some((_, qi_data)) = self.available.get_mut(game.opponent_pool_idx) {
-                    qi_data.qi -= self.qi_eta / (n * pi);
+                // Skip update if probability is zero/NaN (opponent is effectively "retired")
+                if pi > 0.0 && pi.is_finite() {
+                    if let Some((_, qi_data)) = self.available.get_mut(game.opponent_pool_idx) {
+                        let update = self.qi_eta / (n * pi);
+                        // Only apply if update is finite (guards against inf from division)
+                        if update.is_finite() {
+                            qi_data.qi -= update;
+                        }
+                    }
                 }
             }
             // If opponent won, qi unchanged
@@ -716,7 +728,19 @@ impl<B: Backend> OpponentPool<B> {
 
         let qis: Vec<f64> = self.available.iter().map(|(_, q)| q.qi).collect();
         let max_qi = qis.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let exp_qis: Vec<f64> = qis.iter().map(|q| (q - max_qi).exp()).collect();
+
+        // Handle -inf explicitly to avoid NaN from (-inf) - (-inf)
+        // Finite but very negative values naturally underflow to 0 in exp()
+        let exp_qis: Vec<f64> = qis
+            .iter()
+            .map(|q| {
+                if *q == f64::NEG_INFINITY {
+                    0.0 // -inf means zero probability
+                } else {
+                    (q - max_qi).exp()
+                }
+            })
+            .collect();
         let sum: f64 = exp_qis.iter().sum();
 
         if sum == 0.0 {
@@ -734,7 +758,19 @@ impl<B: Backend> OpponentPool<B> {
 
         let qis: Vec<f64> = self.available.iter().map(|(_, q)| q.qi).collect();
         let max_qi = qis.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let exp_qis: Vec<f64> = qis.iter().map(|q| (q - max_qi).exp()).collect();
+
+        // Handle -inf explicitly to avoid NaN from (-inf) - (-inf)
+        // Finite but very negative values naturally underflow to 0 in exp()
+        let exp_qis: Vec<f64> = qis
+            .iter()
+            .map(|q| {
+                if *q == f64::NEG_INFINITY {
+                    0.0 // -inf means zero probability
+                } else {
+                    (q - max_qi).exp()
+                }
+            })
+            .collect();
         let sum: f64 = exp_qis.iter().sum();
 
         if sum == 0.0 {
