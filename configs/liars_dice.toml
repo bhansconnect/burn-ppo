@@ -3,9 +3,13 @@
 
 # Environment
 env = "liars_dice"
-num_envs = 32
+num_envs = 128          # More envs improves throughput with opponent pool
 num_steps = 64          # Longer rollouts for complex game dynamics
 reward_shaping_coef = 0.05  # Per-round survival bonus (0.0 for pure zero-sum)
+
+# Opponent pool: train against historical versions (0.0 = disabled)
+# 25% of envs play against historical checkpoints, 75% self-play
+opponent_pool_fraction = 0.25
 
 # PPO hyperparameters
 learning_rate = 0.0003

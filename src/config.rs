@@ -238,14 +238,11 @@ pub struct TrainArgs {
     pub log_freq: Option<usize>,
 
     // --- Opponent Pool Training ---
-    #[arg(long, action = clap::ArgAction::Set, help = "Enable opponent pool training (default: true)")]
-    pub opponent_pool_enabled: Option<bool>,
-
-    #[arg(long, help = "Fraction of envs for opponent games (default: 0.25)")]
+    #[arg(
+        long,
+        help = "Fraction of envs for opponent games (0.0 = disabled, default: 0.25)"
+    )]
     pub opponent_pool_fraction: Option<f32>,
-
-    #[arg(long, help = "Steps between opponent rotation (default: 512)")]
-    pub opponent_pool_rotation_steps: Option<usize>,
 
     #[arg(
         long,
@@ -255,12 +252,6 @@ pub struct TrainArgs {
 
     #[arg(long, help = "Print selected opponents during training and evaluation")]
     pub debug_opponents: bool,
-
-    #[arg(
-        long,
-        help = "Max opponents in active pool for training/eval (default: 32)"
-    )]
-    pub opponent_pool_size_limit: Option<usize>,
 }
 
 impl TrainArgs {
@@ -344,14 +335,8 @@ impl TrainArgs {
         push_opt!(self.log_freq, "--log-freq");
 
         // Opponent pool training
-        push_opt!(self.opponent_pool_enabled, "--opponent-pool-enabled");
         push_opt!(self.opponent_pool_fraction, "--opponent-pool-fraction");
-        push_opt!(
-            self.opponent_pool_rotation_steps,
-            "--opponent-pool-rotation-steps"
-        );
         push_opt!(self.qi_eta, "--qi-eta");
-        push_opt!(self.opponent_pool_size_limit, "--opponent-pool-size-limit");
 
         // Note: These are handled specially by supervisor and excluded:
         // - total_steps, max_training_time, seed, debug_opponents
@@ -658,25 +643,16 @@ pub struct Config {
     pub log_freq: usize,
 
     // Opponent Pool Training (OpenAI Five-style historical opponent training)
-    /// Enable opponent pool training for multiplayer games
-    /// When enabled, a fraction of training games are played against historical checkpoints
-    #[serde(default = "default_true")]
-    pub opponent_pool_enabled: bool,
-    /// Fraction of environments dedicated to opponent games (0.0-1.0)
+    /// Fraction of environments dedicated to opponent games (0.0 = disabled, 0.0-1.0)
+    /// When > 0, that fraction of training games are played against historical checkpoints
     #[serde(default = "default_opponent_pool_fraction")]
     pub opponent_pool_fraction: f32,
-    /// Steps between opponent rotation triggers
-    #[serde(default = "default_opponent_pool_rotation_steps")]
-    pub opponent_pool_rotation_steps: usize,
     /// qi score learning rate for opponent sampling
     #[serde(default = "default_qi_eta")]
     pub qi_eta: f64,
     /// Print selected opponents during training and evaluation
     #[serde(default)]
     pub debug_opponents: bool,
-    /// Maximum opponents in active pool for training
-    #[serde(default = "default_opponent_pool_size_limit")]
-    pub opponent_pool_size_limit: usize,
 
     // Experiment
     #[serde(default = "default_seed")]
@@ -787,16 +763,10 @@ const fn default_seed() -> u64 {
 
 // Opponent pool defaults
 const fn default_opponent_pool_fraction() -> f32 {
-    0.25 // 25% of envs play against opponents
-}
-const fn default_opponent_pool_rotation_steps() -> usize {
-    2000
+    0.25 // 25% of envs play against opponents (0.0 = disabled)
 }
 const fn default_qi_eta() -> f64 {
     0.01 // OpenAI Five default
-}
-const fn default_opponent_pool_size_limit() -> usize {
-    32
 }
 
 impl Default for Config {
@@ -842,12 +812,9 @@ impl Default for Config {
             run_dir: default_run_dir(),
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
-            opponent_pool_enabled: true,
             opponent_pool_fraction: default_opponent_pool_fraction(),
-            opponent_pool_rotation_steps: default_opponent_pool_rotation_steps(),
             qi_eta: default_qi_eta(),
             debug_opponents: false,
-            opponent_pool_size_limit: default_opponent_pool_size_limit(),
             seed: default_seed(),
             run_name: None,
             forked_from: None,
@@ -1033,23 +1000,14 @@ impl Config {
         }
 
         // Opponent pool training
-        if let Some(v) = args.opponent_pool_enabled {
-            self.opponent_pool_enabled = v;
-        }
         if let Some(v) = args.opponent_pool_fraction {
             self.opponent_pool_fraction = v;
-        }
-        if let Some(v) = args.opponent_pool_rotation_steps {
-            self.opponent_pool_rotation_steps = v;
         }
         if let Some(v) = args.qi_eta {
             self.qi_eta = v;
         }
         if args.debug_opponents {
             self.debug_opponents = true;
-        }
-        if let Some(v) = args.opponent_pool_size_limit {
-            self.opponent_pool_size_limit = v;
         }
 
         // Experiment
@@ -1172,20 +1130,11 @@ impl Config {
         }
 
         // Opponent pool training
-        if args.opponent_pool_enabled.is_some() {
-            ignored.push("--opponent-pool-enabled");
-        }
         if args.opponent_pool_fraction.is_some() {
             ignored.push("--opponent-pool-fraction");
         }
-        if args.opponent_pool_rotation_steps.is_some() {
-            ignored.push("--opponent-pool-rotation-steps");
-        }
         if args.qi_eta.is_some() {
             ignored.push("--qi-eta");
-        }
-        if args.opponent_pool_size_limit.is_some() {
-            ignored.push("--opponent-pool-size-limit");
         }
 
         // Experiment
@@ -1318,19 +1267,11 @@ impl Config {
         }
 
         // Validate opponent pool config
-        if self.opponent_pool_enabled {
-            if self.opponent_pool_fraction < 0.0 || self.opponent_pool_fraction > 1.0 {
-                bail!("opponent_pool_fraction must be in [0.0, 1.0]");
-            }
-            if self.opponent_pool_rotation_steps == 0 {
-                bail!("opponent_pool_rotation_steps must be > 0");
-            }
-            if self.qi_eta <= 0.0 {
-                bail!("qi_eta must be > 0");
-            }
-            if self.opponent_pool_size_limit == 0 {
-                bail!("opponent_pool_size_limit must be > 0");
-            }
+        if self.opponent_pool_fraction < 0.0 || self.opponent_pool_fraction > 1.0 {
+            bail!("opponent_pool_fraction must be in [0.0, 1.0]");
+        }
+        if self.opponent_pool_fraction > 0.0 && self.qi_eta <= 0.0 {
+            bail!("qi_eta must be > 0 when opponent pool is enabled");
         }
 
         Ok(())

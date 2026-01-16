@@ -751,9 +751,8 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                     });
                 }
 
-                // Resample opponents for next game (with replacement, QI-weighted)
-                env_states[env_idx].assigned_opponents =
-                    opponent_pool.sample_all_slots_with_replacement();
+                // Resample opponents for next game (without replacement, qi-weighted)
+                env_states[env_idx].assigned_opponents = opponent_pool.sample_all_slots();
 
                 // Shuffle positions for next episode with new opponents
                 env_states[env_idx].shuffle_positions(num_players, rng);

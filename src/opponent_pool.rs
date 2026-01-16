@@ -154,11 +154,9 @@ pub struct OpponentPool<B: Backend> {
     /// RNG for sampling
     rng: rand::rngs::StdRng,
 
-    /// Active subset of opponent indices (limited by `pool_size_limit`)
-    active_indices: Vec<usize>,
-
-    /// Maximum number of active opponents
-    pool_size_limit: usize,
+    /// Current opponent indices shared by all envs (length = `num_opponent_slots`)
+    /// Refreshed after each policy update for optimal batching
+    current_opponents: Vec<usize>,
 
     /// Pending game results for batched qi updates
     /// Applied in shuffled order at rotation time
@@ -189,7 +187,6 @@ impl<B: Backend> OpponentPool<B> {
         config: Config,
         device: B::Device,
         seed: u64,
-        pool_size_limit: usize,
     ) -> Result<Self> {
         let mut pool = Self {
             available: Vec::new(),
@@ -200,8 +197,7 @@ impl<B: Backend> OpponentPool<B> {
             config,
             device,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
-            active_indices: Vec::new(),
-            pool_size_limit,
+            current_opponents: Vec::new(),
             pending_game_results: Vec::new(),
         };
 
@@ -211,10 +207,30 @@ impl<B: Backend> OpponentPool<B> {
         // Scan for checkpoints and merge with loaded ratings
         pool.scan_checkpoints()?;
 
-        // Initialize active subset
-        pool.refresh_active_subset();
+        // Initialize current opponents
+        pool.refresh_current_opponents();
 
         Ok(pool)
+    }
+
+    /// Refresh the current opponent set for all envs to share
+    ///
+    /// Samples `num_opponent_slots` unique opponents using qi-weighted sampling.
+    /// All opponent envs share these opponents for optimal forward pass batching.
+    /// Call this after each policy update.
+    pub fn refresh_current_opponents(&mut self) {
+        self.current_opponents.clear();
+
+        if self.available.is_empty() {
+            return;
+        }
+
+        // Sample num_opponent_slots unique opponents
+        for _ in 0..self.num_opponent_slots {
+            if let Some(idx) = self.sample_opponent(&self.current_opponents.clone()) {
+                self.current_opponents.push(idx);
+            }
+        }
     }
 
     /// Get number of available opponents
@@ -231,37 +247,6 @@ impl<B: Backend> OpponentPool<B> {
     /// Check if pool has enough opponents for training
     pub fn has_opponents(&self) -> bool {
         !self.available.is_empty()
-    }
-
-    /// Refresh the active opponent subset
-    ///
-    /// Samples up to `pool_size_limit` unique opponents using qi-weighted sampling.
-    /// Call this at initialization and at each rotation to get variety.
-    pub fn refresh_active_subset(&mut self) {
-        if self.available.is_empty() {
-            self.active_indices.clear();
-            return;
-        }
-
-        let max_active = self.pool_size_limit.min(self.available.len());
-        let mut selected = Vec::with_capacity(max_active);
-
-        // Sample opponents using rating-weighted (or uniform) sampling
-        while selected.len() < max_active {
-            if let Some(idx) = self.sample_opponent(&selected) {
-                selected.push(idx);
-            } else {
-                break;
-            }
-        }
-
-        self.active_indices = selected;
-    }
-
-    /// Get the current active opponent indices
-    #[expect(dead_code, reason = "reserved for debugging and metrics")]
-    pub fn active_indices(&self) -> &[usize] {
-        &self.active_indices
     }
 
     /// Get qi scores file path (in run folder, not checkpoints folder)
@@ -474,87 +459,12 @@ impl<B: Backend> OpponentPool<B> {
         )
     }
 
-    /// Sample a single opponent from the active subset using qi-weighted softmax
-    fn sample_opponent_from_active(&mut self, exclude: &[usize]) -> Option<usize> {
-        if self.active_indices.is_empty() {
-            return None;
-        }
-
-        // Get eligible opponent indices from active subset
-        let eligible: Vec<usize> = self
-            .active_indices
-            .iter()
-            .filter(|&&i| !exclude.contains(&i))
-            .copied()
-            .collect();
-
-        if eligible.is_empty() {
-            // Fall back to any active opponent if all are excluded
-            return Some(self.active_indices[self.rng.gen_range(0..self.active_indices.len())]);
-        }
-
-        // qi-weighted sampling: get qi scores for eligible opponents
-        let eligible_with_qi: Vec<(usize, f64)> = eligible
-            .iter()
-            .map(|&i| (i, self.available[i].1.qi))
-            .collect();
-
-        // Compute softmax probabilities (e^qi)
-        let max_qi = eligible_with_qi
-            .iter()
-            .map(|(_, q)| *q)
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        let exp_qi: Vec<f64> = eligible_with_qi
-            .iter()
-            .map(|(_, q)| (q - max_qi).exp())
-            .collect();
-
-        let sum: f64 = exp_qi.iter().sum();
-        if sum == 0.0 {
-            // Uniform fallback
-            let idx = self.rng.gen_range(0..eligible_with_qi.len());
-            return Some(eligible_with_qi[idx].0);
-        }
-
-        // Sample from distribution
-        let sample: f64 = self.rng.r#gen();
-        let mut cumsum = 0.0;
-        for (i, &exp) in exp_qi.iter().enumerate() {
-            cumsum += exp / sum;
-            if sample < cumsum {
-                return Some(eligible_with_qi[i].0);
-            }
-        }
-
-        Some(
-            eligible_with_qi
-                .last()
-                .expect("eligible list is non-empty at this point")
-                .0,
-        )
-    }
-
-    /// Sample opponents for all slots (`num_players` - 1 unique opponents)
-    /// Samples ONLY from the active subset
-    pub fn sample_all_slots(&mut self) -> Vec<usize> {
-        let mut assigned = Vec::with_capacity(self.num_opponent_slots);
-
-        for _ in 0..self.num_opponent_slots {
-            if let Some(idx) = self.sample_opponent_from_active(&assigned) {
-                assigned.push(idx);
-            }
-        }
-
-        assigned
-    }
-
-    /// Sample opponents for all slots WITH REPLACEMENT
-    /// Same opponent can appear in multiple slots
-    pub fn sample_all_slots_with_replacement(&mut self) -> Vec<usize> {
-        (0..self.num_opponent_slots)
-            .filter_map(|_| self.sample_opponent_from_active(&[])) // Empty exclude = with replacement
-            .collect()
+    /// Get the current opponent set for a game
+    ///
+    /// Returns a copy of the current opponents (refreshed after each policy update).
+    /// All envs share the same opponent set for optimal forward pass batching.
+    pub fn sample_all_slots(&self) -> Vec<usize> {
+        self.current_opponents.clone()
     }
 
     /// Get checkpoint name for a pool index
@@ -784,23 +694,6 @@ impl<B: Backend> OpponentPool<B> {
     /// Get mutable reference to RNG (for creating `EnvStates`)
     pub fn rng_mut(&mut self) -> &mut rand::rngs::StdRng {
         &mut self.rng
-    }
-
-    /// Get opponents for evaluation
-    ///
-    /// Returns the active subset of opponents (limited by `pool_size_limit`).
-    /// The active subset is refreshed at each rotation.
-    pub fn sample_eval_opponents(&self) -> Vec<usize> {
-        self.active_indices.clone()
-    }
-
-    /// Get the checkpoints directory path
-    #[expect(
-        dead_code,
-        reason = "pool eval removed but keeping for potential future use"
-    )]
-    pub fn checkpoints_dir(&self) -> &PathBuf {
-        &self.checkpoints_dir
     }
 
     /// Format selected opponent indices as checkpoint-relative positions for debug output

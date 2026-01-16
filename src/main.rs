@@ -496,7 +496,8 @@ where
     let mut episodes_since_log_mp: Vec<(Vec<f32>, Option<GameOutcome>)> = Vec::new();
 
     // Opponent pool initialization (if enabled for multiplayer training)
-    let needs_opponent_pool = config.opponent_pool_enabled;
+    // fraction > 0.0 means enabled
+    let needs_opponent_pool = config.opponent_pool_fraction > 0.0;
     let mut opponent_pool: Option<OpponentPool<TB::InnerBackend>> =
         if needs_opponent_pool && num_players > 1 {
             let checkpoints_dir = run_dir.join("checkpoints");
@@ -508,7 +509,6 @@ where
                 config.clone(),
                 device.clone(),
                 config.seed,
-                config.opponent_pool_size_limit,
             ) {
                 Ok(pool) => {
                     progress.println(&format!(
@@ -553,7 +553,7 @@ where
         clippy::cast_sign_loss,
         reason = "opponent_pool_fraction is always positive"
     )]
-    let num_opponent_envs = if config.opponent_pool_enabled && opponent_pool.is_some() {
+    let num_opponent_envs = if needs_opponent_pool && opponent_pool.is_some() {
         let raw = num_envs as f32 * config.opponent_pool_fraction;
         if raw > 0.0 && raw < 1.0 {
             progress.eprintln(&format!(
@@ -572,7 +572,7 @@ where
     };
 
     // Initialize env states for opponent pool training (only when training is enabled)
-    let mut env_states: Vec<EnvState> = if config.opponent_pool_enabled
+    let mut env_states: Vec<EnvState> = if needs_opponent_pool
         && opponent_pool
             .as_ref()
             .is_some_and(opponent_pool::OpponentPool::has_opponents)
@@ -587,9 +587,6 @@ where
     } else {
         Vec::new()
     };
-
-    // Track steps since last opponent rotation
-    let mut steps_since_rotation: usize = 0;
 
     // Determine how "best" checkpoint should be selected
     // - Single-player: use avg_return (auto_update_best = true)
@@ -720,37 +717,31 @@ where
                 }
             }
 
-            // Handle rotation
-            steps_since_rotation += steps_per_update;
-            if steps_since_rotation >= config.opponent_pool_rotation_steps {
-                steps_since_rotation = 0;
+            // Apply pending qi updates and refresh opponent selection
+            // Note: new checkpoints are added via pool.add_checkpoint() when saved
+            pool.apply_pending_qi_updates();
+            pool.refresh_current_opponents();
 
-                // Apply pending qi updates
-                pool.apply_pending_qi_updates();
-
-                // Refresh pool (scan for new checkpoints)
-                let _ = pool.scan_checkpoints();
-
-                // Re-sample active subset (provides variety + includes new checkpoints)
-                pool.refresh_active_subset();
-
-                // Debug output for opponent selection (to stderr for debug output)
-                if config.debug_opponents {
-                    let mut active = pool.sample_eval_opponents();
-                    active.sort_by(|a, b| b.cmp(a));
-                    let formatted = pool.format_selected_opponents(&active);
-                    progress.eprintln(&format!(
-                        "[debug-opponents] Rotation at step {global_step}: active pool [{formatted}]"
-                    ));
-                }
-
-                // Unload unused opponents
-                let in_use: Vec<usize> = env_states
+            // Debug output for opponent selection (to stderr for debug output)
+            if config.debug_opponents {
+                let mut active: Vec<usize> = env_states
                     .iter()
                     .flat_map(|s| s.assigned_opponents.iter().copied())
                     .collect();
-                pool.unload_unused(&in_use);
+                active.sort_unstable();
+                active.dedup();
+                let formatted = pool.format_selected_opponents(&active);
+                progress.eprintln(&format!(
+                    "[debug-opponents] Rotation at step {global_step}: active pool [{formatted}]"
+                ));
             }
+
+            // Unload unused opponents to free memory
+            let in_use: Vec<usize> = env_states
+                .iter()
+                .flat_map(|s| s.assigned_opponents.iter().copied())
+                .collect();
+            pool.unload_unused(&in_use);
 
             episodes
         } else {
@@ -1422,7 +1413,18 @@ where
         // Natural completion: show full completion output
         progress.finish();
         println!("---");
-        println!("Training complete!");
+        let total_time = training_start.elapsed() + elapsed_offset;
+        let total_secs = total_time.as_secs();
+        let hours = total_secs / 3600;
+        let minutes = (total_secs % 3600) / 60;
+        let seconds = total_secs % 60;
+        if hours > 0 {
+            println!("Training completed in {hours}h {minutes}m {seconds}s");
+        } else if minutes > 0 {
+            println!("Training completed in {minutes}m {seconds}s");
+        } else {
+            println!("Training completed in {seconds}s");
+        }
         if !recent_returns.is_empty() {
             let avg_return: f32 = recent_returns.iter().sum::<f32>() / recent_returns.len() as f32;
             println!("Final average return (last 100 episodes): {avg_return:.1}");

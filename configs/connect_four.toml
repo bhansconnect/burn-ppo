@@ -3,7 +3,7 @@
 
 # Environment
 env = "connect_four"
-num_envs = 32
+num_envs = 128
 num_steps = 64
 
 # PPO hyperparameters
@@ -14,10 +14,9 @@ clip_epsilon = 0.1       # PPO clip range
 clip_value = false       # Value function clipping disabled
 entropy_coef = 0.02      # Recommended PPO default that works pretty well.
 
-# While historical opponents theoretically help,
-# they are so slow that running without is better.
-# Just train more steps instead of with opponents.
-opponent_pool_enabled = false
+# Opponent pool: train against historical versions (0.0 = disabled)
+# 25% of envs play against historical checkpoints, 75% self-play
+opponent_pool_fraction = 0.25
 
 # Adaptive entropy - prevents premature convergence, maintains exploration
 # Schedule: 70% max entropy -> hold during warmup -> decay to 20% by 20M steps
