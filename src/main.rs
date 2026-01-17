@@ -51,15 +51,16 @@ use clap::Parser;
 use rand::SeedableRng;
 
 use crate::checkpoint::{
-    load_normalizer, load_optimizer, load_return_normalizer, load_rng_state, save_normalizer,
-    save_optimizer, save_return_normalizer, save_rng_state, CheckpointManager, CheckpointMetadata,
+    load_normalizer, load_optimizer, load_popart_normalizer, load_return_normalizer,
+    load_rng_state, save_normalizer, save_optimizer, save_popart_normalizer,
+    save_return_normalizer, save_rng_state, CheckpointManager, CheckpointMetadata,
 };
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_avg_points, Environment, GameOutcome, VecEnv};
 use crate::envs::{CartPole, ConnectFour, LiarsDice};
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
-use crate::normalization::{ObsNormalizer, ReturnNormalizer};
+use crate::normalization::{ObsNormalizer, PopArtNormalizer, ReturnNormalizer};
 use crate::opponent_pool::{EnvState, OpponentPool};
 use crate::ppo::{
     collect_rollouts, collect_rollouts_with_opponents, compute_gae, compute_gae_multiplayer,
@@ -229,6 +230,13 @@ where
         None
     };
 
+    // Create PopArt normalizer if enabled
+    let mut popart_normalizer: Option<PopArtNormalizer> = if config.normalize_values {
+        Some(PopArtNormalizer::new(num_players as usize))
+    } else {
+        None
+    };
+
     // Create optimizer with gradient clipping
     let optimizer_config = AdamConfig::new()
         .with_epsilon(config.adam_epsilon as f32)
@@ -324,6 +332,24 @@ where
                     }
                     Err(e) => {
                         eprintln!("Warning: Failed to load return normalizer: {e}");
+                    }
+                }
+            }
+
+            // Load PopArt normalizer if it was saved
+            if config.normalize_values {
+                match load_popart_normalizer(checkpoint_dir) {
+                    Ok(Some(loaded_norm)) => {
+                        popart_normalizer = Some(loaded_norm);
+                        if !quiet {
+                            println!("Loaded PopArt normalizer from checkpoint");
+                        }
+                    }
+                    Ok(None) => {
+                        // No PopArt normalizer saved (old checkpoint), keep the fresh one
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load PopArt normalizer: {e}");
                     }
                 }
             }
@@ -677,6 +703,7 @@ where
                 obs_normalizer.as_mut(),
                 return_normalizer.as_mut(),
                 global_step,
+                popart_normalizer.as_ref(),
             );
 
             // Queue opponent completions for batched qi updates and record for rating
@@ -756,6 +783,7 @@ where
                 &mut rng,
                 obs_normalizer.as_mut(),
                 return_normalizer.as_mut(),
+                popart_normalizer.as_ref(),
             )
         };
         rollout_time_acc += rollout_start.elapsed();
@@ -805,6 +833,17 @@ where
                 .reshape([num_envs, obs_dim]);
         let (_, all_values) = inference_model.forward(obs_tensor);
 
+        // Denormalize bootstrap values if PopArt is active
+        // After rescaling, model outputs normalized values - convert back to raw for GAE
+        let all_values = if let Some(ref popart) = popart_normalizer {
+            let mut values_data: Vec<f32> = all_values.into_data().to_vec().expect("values");
+            popart.denormalize_all_players(&mut values_data, num_players as usize);
+            Tensor::<TB::InnerBackend, 1>::from_floats(values_data.as_slice(), device)
+                .reshape([num_envs, num_players as usize])
+        } else {
+            all_values
+        };
+
         // Compute GAE - dispatch based on number of players
         let gae_start = std::time::Instant::now();
         if num_players > 1 {
@@ -842,6 +881,7 @@ where
             ent_coef,
             action_count,
             &mut rng,
+            popart_normalizer.as_mut(),
         );
         update_time_acc += update_start.elapsed();
         model = updated_model;
@@ -944,6 +984,32 @@ where
                 metrics.value_error_max,
                 global_step,
             )?;
+
+            // Value normalization metrics (when enabled)
+            if let Some(ref norm) = popart_normalizer {
+                // Per-player statistics
+                for p in 0..norm.num_players() {
+                    logger.log_scalar(
+                        &format!("value_norm/mean_p{p}"),
+                        norm.mean(p) as f32,
+                        global_step,
+                    )?;
+                    logger.log_scalar(
+                        &format!("value_norm/std_p{p}"),
+                        norm.std(p) as f32,
+                        global_step,
+                    )?;
+                }
+            }
+            if let Some(target_mean) = metrics.value_norm_target_mean {
+                logger.log_scalar("value_norm/target_mean", target_mean, global_step)?;
+            }
+            if let Some(target_std) = metrics.value_norm_target_std {
+                logger.log_scalar("value_norm/target_std", target_std, global_step)?;
+            }
+            if let Some(rescale_mag) = metrics.value_norm_rescale_mag {
+                logger.log_scalar("value_norm/rescale_mag", rescale_mag, global_step)?;
+            }
 
             // Steps per second (since last log)
             let now = std::time::Instant::now();
@@ -1137,6 +1203,13 @@ where
                 }
             }
 
+            // Save PopArt normalizer if enabled
+            if let Some(ref norm) = popart_normalizer {
+                if let Err(e) = save_popart_normalizer(norm, &checkpoint_path) {
+                    progress.eprintln(&format!("Warning: Failed to save PopArt normalizer: {e}"));
+                }
+            }
+
             // Save RNG state for reproducible continuation
             if let Err(e) = save_rng_state(&mut rng, &checkpoint_path) {
                 progress.eprintln(&format!("Warning: Failed to save RNG state: {e}"));
@@ -1311,6 +1384,13 @@ where
         if let Some(ref norm) = return_normalizer {
             if let Err(e) = save_return_normalizer(norm, &checkpoint_path) {
                 progress.eprintln(&format!("Warning: Failed to save return normalizer: {e}"));
+            }
+        }
+
+        // Save PopArt normalizer if enabled
+        if let Some(ref norm) = popart_normalizer {
+            if let Err(e) = save_popart_normalizer(norm, &checkpoint_path) {
+                progress.eprintln(&format!("Warning: Failed to save PopArt normalizer: {e}"));
             }
         }
 

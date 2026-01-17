@@ -259,6 +259,171 @@ impl ReturnNormalizer {
     }
 }
 
+/// Value normalization with weight rescaling
+///
+/// Implements the algorithm from "Learning values across many orders of magnitude"
+/// (van Hasselt et al., 2016). Maintains running mean and standard deviation of value targets
+/// (returns), and rescales value head weights when statistics change to preserve output semantics.
+///
+/// Key difference from `ReturnNormalizer`:
+/// - `ReturnNormalizer`: Normalizes rewards during rollout collection
+/// - Value normalization: Normalizes value targets during loss and rescales critic weights
+///
+/// For multiplayer games, maintains per-player statistics since different players
+/// may experience different reward scales.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PopArtNormalizer {
+    /// Running mean per player
+    mean: Vec<f64>,
+    /// Running M2 for Welford's variance computation per player
+    var: Vec<f64>,
+    /// Sample count per player
+    count: Vec<f64>,
+    /// Number of players
+    num_players: usize,
+    /// Small epsilon for numerical stability
+    epsilon: f64,
+}
+
+impl PopArtNormalizer {
+    /// Create a new value normalizer
+    ///
+    /// # Arguments
+    /// * `num_players` - Number of players (1 for single-player games)
+    pub fn new(num_players: usize) -> Self {
+        Self {
+            mean: vec![0.0; num_players],
+            var: vec![0.0; num_players],
+            count: vec![0.0; num_players],
+            num_players,
+            epsilon: 1e-4,
+        }
+    }
+
+    /// Get current mean for a player
+    pub fn mean(&self, player: usize) -> f64 {
+        self.mean[player]
+    }
+
+    /// Get current standard deviation for a player
+    ///
+    /// Returns 1.0 before initialization to avoid rescaling with invalid statistics.
+    pub fn std(&self, player: usize) -> f64 {
+        if self.count[player] < 2.0 {
+            1.0
+        } else {
+            (self.var[player] / self.count[player] + self.epsilon).sqrt()
+        }
+    }
+
+    /// Check if normalizer is initialized (has enough samples for any player)
+    pub fn is_initialized(&self) -> bool {
+        self.count.iter().any(|&c| c >= 2.0)
+    }
+
+    /// Get number of players
+    pub fn num_players(&self) -> usize {
+        self.num_players
+    }
+
+    /// Update statistics with a batch of returns
+    ///
+    /// Uses Welford's online algorithm for numerically stable mean/variance computation.
+    ///
+    /// # Arguments
+    /// * `returns` - Flat array of returns
+    /// * `acting_players` - Player index for each return
+    ///
+    /// # Returns
+    /// Tuple of old means and stds for weight rescaling
+    pub fn update(&mut self, returns: &[f32], acting_players: &[usize]) -> (Vec<f64>, Vec<f64>) {
+        // Capture old statistics before update
+        let old_means: Vec<f64> = self.mean.clone();
+        let old_stds: Vec<f64> = (0..self.num_players).map(|p| self.std(p)).collect();
+
+        // Update using Welford's algorithm per player
+        for (&ret, &player) in returns.iter().zip(acting_players.iter()) {
+            let x = f64::from(ret);
+            self.count[player] += 1.0;
+            let delta = x - self.mean[player];
+            self.mean[player] += delta / self.count[player];
+            let delta2 = x - self.mean[player];
+            self.var[player] += delta * delta2;
+        }
+
+        (old_means, old_stds)
+    }
+
+    /// Normalize returns for loss computation
+    ///
+    /// Applies (return - mean) / std normalization per player.
+    ///
+    /// # Arguments
+    /// * `returns` - Returns to normalize
+    /// * `acting_players` - Player index for each return
+    ///
+    /// # Returns
+    /// Normalized returns (identity if not initialized)
+    pub fn normalize(&self, returns: &[f32], acting_players: &[usize]) -> Vec<f32> {
+        returns
+            .iter()
+            .zip(acting_players.iter())
+            .map(|(&ret, &player)| {
+                if self.count[player] < 2.0 {
+                    ret
+                } else {
+                    let normalized = (f64::from(ret) - self.mean[player]) / self.std(player);
+                    normalized as f32
+                }
+            })
+            .collect()
+    }
+
+    /// Denormalize values from normalized space to raw space
+    ///
+    /// Applies the inverse of `normalize()`: value * std + mean per player.
+    ///
+    /// # Arguments
+    /// * `values` - Normalized values to denormalize
+    /// * `acting_players` - Player index for each value
+    ///
+    /// # Returns
+    /// Denormalized (raw) values (identity if not initialized)
+    #[cfg(test)]
+    pub fn denormalize(&self, values: &[f32], acting_players: &[usize]) -> Vec<f32> {
+        values
+            .iter()
+            .zip(acting_players.iter())
+            .map(|(&v, &player)| {
+                if self.count[player] < 2.0 {
+                    v // Not initialized, identity transform
+                } else {
+                    let denormalized = f64::from(v) * self.std(player) + self.mean[player];
+                    denormalized as f32
+                }
+            })
+            .collect()
+    }
+
+    /// Denormalize all player values in-place
+    ///
+    /// For tensors with shape `[num_envs, num_players]` flattened to `[num_envs * num_players]`,
+    /// applies denormalization per player in-place.
+    ///
+    /// # Arguments
+    /// * `values` - Flattened values array, modified in-place
+    /// * `num_players` - Number of players (stride for chunking)
+    pub fn denormalize_all_players(&self, values: &mut [f32], num_players: usize) {
+        for chunk in values.chunks_mut(num_players) {
+            for (p, v) in chunk.iter_mut().enumerate() {
+                if self.count[p] >= 2.0 {
+                    *v = (f64::from(*v) * self.std(p) + self.mean[p]) as f32;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +764,207 @@ mod tests {
         assert_eq!(loaded.returns[0][0], norm.returns[0][0]);
         assert_eq!(loaded.count, norm.count);
         assert!((loaded.var - norm.var).abs() < 1e-10);
+    }
+
+    // ======== PopArtNormalizer Tests ========
+
+    #[test]
+    fn test_popart_creation() {
+        let norm = PopArtNormalizer::new(2);
+        assert_eq!(norm.num_players(), 2);
+        assert!(!norm.is_initialized());
+        // Returns 1.0 std when not initialized (to avoid rescaling)
+        assert_eq!(norm.std(0), 1.0);
+        assert_eq!(norm.std(1), 1.0);
+    }
+
+    #[test]
+    fn test_popart_update_single_player() {
+        let mut norm = PopArtNormalizer::new(1);
+
+        // First sample - not yet initialized (need at least 2)
+        let (_old_means, old_stds) = norm.update(&[10.0], &[0]);
+        assert!(!norm.is_initialized());
+        assert_eq!(old_stds[0], 1.0); // Old std was 1.0 (uninitialized)
+
+        // Second sample - now initialized
+        let (_old_means, _old_stds) = norm.update(&[20.0], &[0]);
+        assert!(norm.is_initialized());
+
+        // Mean should be 15.0
+        assert!((norm.mean(0) - 15.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_popart_normalize() {
+        let mut norm = PopArtNormalizer::new(1);
+
+        // Add samples to get known statistics
+        // [0, 10, 20, 30, 40] -> mean=20, variance=200, std~=14.14
+        norm.update(&[0.0, 10.0, 20.0, 30.0, 40.0], &[0, 0, 0, 0, 0]);
+
+        // Normalizing the mean should give ~0
+        let normalized = norm.normalize(&[20.0], &[0]);
+        assert!(normalized[0].abs() < 0.1);
+
+        // Normalizing value above mean should give positive
+        let normalized = norm.normalize(&[34.14], &[0]); // ~1 std above mean
+        assert!(normalized[0] > 0.5 && normalized[0] < 1.5);
+    }
+
+    #[test]
+    fn test_popart_per_player_stats() {
+        let mut norm = PopArtNormalizer::new(2);
+
+        // Player 0 gets small rewards
+        norm.update(&[1.0, 2.0, 3.0], &[0, 0, 0]);
+
+        // Player 1 gets large rewards
+        norm.update(&[100.0, 200.0, 300.0], &[1, 1, 1]);
+
+        // Means should be different
+        assert!((norm.mean(0) - 2.0).abs() < 0.01);
+        assert!((norm.mean(1) - 200.0).abs() < 0.01);
+
+        // Normalizing each player's mean should give ~0
+        let normalized = norm.normalize(&[2.0, 200.0], &[0, 1]);
+        assert!(normalized[0].abs() < 0.1);
+        assert!(normalized[1].abs() < 0.1);
+    }
+
+    #[test]
+    fn test_popart_returns_old_stats() {
+        let mut norm = PopArtNormalizer::new(1);
+
+        // Add initial samples
+        norm.update(&[0.0, 10.0], &[0, 0]);
+        let mean_before = norm.mean(0);
+        let std_before = norm.std(0);
+
+        // Update returns OLD stats
+        let (old_means, old_stds) = norm.update(&[20.0], &[0]);
+
+        // Old stats should match what we captured
+        assert!((old_means[0] - mean_before).abs() < 1e-10);
+        assert!((old_stds[0] - std_before).abs() < 1e-10);
+
+        // New stats should be different
+        assert!(norm.mean(0) != mean_before);
+    }
+
+    #[test]
+    fn test_popart_serialization() {
+        let mut norm = PopArtNormalizer::new(2);
+        norm.update(&[1.0, 2.0, 100.0], &[0, 0, 1]);
+        norm.update(&[3.0, 200.0], &[0, 1]);
+
+        let json = serde_json::to_string(&norm).unwrap();
+        let loaded: PopArtNormalizer = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.num_players(), 2);
+        assert!((loaded.mean(0) - norm.mean(0)).abs() < 1e-10);
+        assert!((loaded.mean(1) - norm.mean(1)).abs() < 1e-10);
+        assert!((loaded.std(0) - norm.std(0)).abs() < 1e-10);
+        assert!((loaded.std(1) - norm.std(1)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_popart_normalize_before_initialized() {
+        let mut norm = PopArtNormalizer::new(1);
+
+        // Only one sample - not initialized
+        norm.update(&[10.0], &[0]);
+        assert!(!norm.is_initialized());
+
+        // Should return identity (unnormalized)
+        let result = norm.normalize(&[5.0], &[0]);
+        assert_eq!(result[0], 5.0);
+    }
+
+    #[test]
+    fn test_popart_denormalize_inverse_of_normalize() {
+        let mut norm = PopArtNormalizer::new(2);
+        // Add samples to initialize both players
+        norm.update(&[10.0, 20.0, 100.0, 200.0], &[0, 0, 1, 1]);
+
+        let original = vec![15.0, 150.0];
+        let players = vec![0, 1];
+
+        // Normalize then denormalize should recover original
+        let normalized = norm.normalize(&original, &players);
+        let denormalized = norm.denormalize(&normalized, &players);
+
+        for (o, d) in original.iter().zip(denormalized.iter()) {
+            assert!((o - d).abs() < 1e-4, "Expected {o}, got {d}");
+        }
+    }
+
+    #[test]
+    fn test_popart_denormalize_all_players() {
+        let mut norm = PopArtNormalizer::new(2);
+        // Player 0: samples [0, 10] -> mean=5, var=50, std~=7.07
+        // Player 1: samples [100, 200] -> mean=150, var=5000, std~=70.7
+        norm.update(&[0.0, 10.0, 100.0, 200.0], &[0, 0, 1, 1]);
+
+        // Normalized value 0.0 should denormalize to the mean
+        // values for [env0_p0, env0_p1, env1_p0, env1_p1]
+        let mut values = vec![0.0, 0.0, 0.0, 0.0];
+        norm.denormalize_all_players(&mut values, 2);
+
+        // Should recover means: [5.0, 150.0, 5.0, 150.0]
+        assert!(
+            (values[0] - 5.0).abs() < 1e-4,
+            "Expected 5.0, got {}",
+            values[0]
+        );
+        assert!(
+            (values[1] - 150.0).abs() < 1e-4,
+            "Expected 150.0, got {}",
+            values[1]
+        );
+        assert!(
+            (values[2] - 5.0).abs() < 1e-4,
+            "Expected 5.0, got {}",
+            values[2]
+        );
+        assert!(
+            (values[3] - 150.0).abs() < 1e-4,
+            "Expected 150.0, got {}",
+            values[3]
+        );
+    }
+
+    #[test]
+    fn test_popart_denormalize_before_initialized() {
+        let mut norm = PopArtNormalizer::new(1);
+
+        // Only one sample - not initialized
+        norm.update(&[10.0], &[0]);
+        assert!(!norm.is_initialized());
+
+        // Should return identity (unmodified)
+        let result = norm.denormalize(&[5.0], &[0]);
+        assert_eq!(result[0], 5.0);
+    }
+
+    #[test]
+    fn test_popart_denormalize_all_players_partial_init() {
+        let mut norm = PopArtNormalizer::new(2);
+        // Only initialize player 0
+        norm.update(&[0.0, 10.0], &[0, 0]);
+        // Player 1 has no samples
+
+        // Player 0: mean=5, player 1: not initialized
+        let mut values = vec![0.0, 42.0]; // env with both players
+        norm.denormalize_all_players(&mut values, 2);
+
+        // Player 0 should be denormalized (0 -> mean=5)
+        assert!(
+            (values[0] - 5.0).abs() < 1e-4,
+            "Expected 5.0, got {}",
+            values[0]
+        );
+        // Player 1 should be unchanged (not initialized)
+        assert_eq!(values[1], 42.0);
     }
 }

@@ -20,7 +20,7 @@ use rand::Rng;
 use crate::config::Config;
 use crate::env::{Environment, EpisodeStats, VecEnv};
 use crate::network::ActorCritic;
-use crate::normalization::{ObsNormalizer, ReturnNormalizer};
+use crate::normalization::{ObsNormalizer, PopArtNormalizer, ReturnNormalizer};
 use crate::opponent_pool::{EnvState, OpponentPool};
 use crate::profile::{profile_function, profile_scope};
 use crate::utils::{
@@ -205,6 +205,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     rng: &mut impl Rng,
     mut normalizer: Option<&mut ObsNormalizer>,
     mut return_normalizer: Option<&mut ReturnNormalizer>,
+    popart: Option<&PopArtNormalizer>,
 ) -> Vec<EpisodeStats> {
     profile_function!();
     let num_envs = vec_env.num_envs();
@@ -301,7 +302,13 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
                 .collect();
 
             // Get all player values [num_envs * num_players]
-            let values_all_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+            let mut values_all_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+
+            // Denormalize values if PopArt is active
+            // After rescaling, model outputs normalized values - convert back to raw for GAE
+            if let Some(popart_norm) = popart {
+                popart_norm.denormalize_all_players(&mut values_all_data, num_players);
+            }
 
             // Extract acting player's value for each env
             let acting_values_data: Vec<f32> = current_players
@@ -482,6 +489,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     mut normalizer: Option<&mut ObsNormalizer>,
     mut return_normalizer: Option<&mut ReturnNormalizer>,
     _current_step: usize,
+    popart: Option<&PopArtNormalizer>,
 ) -> (Vec<EpisodeStats>, Vec<OpponentEpisodeCompletion>) {
     profile_function!();
     let num_envs = vec_env.num_envs();
@@ -629,9 +637,15 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 .into_iter()
                 .map(|x| x as i64)
                 .collect();
-            let values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+            let mut values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
             let log_probs_data: Vec<f32> =
                 log_probs.into_data().to_vec().expect("log_probs to vec");
+
+            // Denormalize values if PopArt is active
+            // After rescaling, model outputs normalized values - convert back to raw for GAE
+            if let Some(popart_norm) = popart {
+                popart_norm.denormalize_all_players(&mut values_data, num_players);
+            }
 
             // Scatter results back to env arrays
             for (batch_idx, &env_idx) in learner_env_indices.iter().enumerate() {
@@ -1198,6 +1212,10 @@ pub struct UpdateMetrics {
     pub value_error_mean: f32,
     pub value_error_std: f32,
     pub value_error_max: f32,
+    // Value normalization metrics (only set when normalize_values enabled)
+    pub value_norm_target_mean: Option<f32>,
+    pub value_norm_target_std: Option<f32>,
+    pub value_norm_rescale_mag: Option<f32>,
 }
 
 /// Compute PPO loss with minimal autodiff scope
@@ -1387,6 +1405,72 @@ where
     }
 }
 
+/// Rescale value head weights for value normalization
+///
+/// When normalization statistics change, we rescale the value head to preserve
+/// output semantics. This ensures value predictions when denormalized remain
+/// consistent, preventing catastrophic forgetting when normalization statistics shift.
+pub fn rescale_value_head_for_popart<B: Backend>(
+    model: ActorCritic<B>,
+    old_means: &[f64],
+    old_stds: &[f64],
+    new_means: &[f64],
+    new_stds: &[f64],
+    num_players: usize,
+) -> ActorCritic<B> {
+    let value_head = model.value_head();
+    let device = value_head.weight.device();
+
+    // Get weight shape and data
+    // weight shape: [input_dim, num_players]
+    let weight = value_head.weight.val();
+    let weight_shape = weight.shape();
+    let input_dim = weight_shape.dims[0];
+    let weight_data: Vec<f32> = weight.into_data().to_vec().expect("weight data");
+
+    // Compute scale factors per player: σ_old / σ_new
+    let scales: Vec<f64> = (0..num_players)
+        .map(|p| old_stds[p] / new_stds[p])
+        .collect();
+
+    // Rescale weights: W_new[i, p] = W_old[i, p] * scale[p]
+    // Data is stored row-major: [row0_col0, row0_col1, ..., row1_col0, ...]
+    let new_weight_data: Vec<f32> = weight_data
+        .chunks(num_players)
+        .flat_map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(p, &w)| (f64::from(w) * scales[p]) as f32)
+        })
+        .collect();
+
+    // Compute new biases: b_new = (b_old * σ_old + μ_old - μ_new) / σ_new
+    let bias_data: Vec<f32> = value_head.bias.as_ref().map_or_else(
+        || vec![0.0; num_players],
+        |b| b.val().into_data().to_vec().expect("bias data"),
+    );
+
+    let new_bias_data: Vec<f32> = (0..num_players)
+        .map(|p| {
+            let b_old = bias_data.get(p).copied().unwrap_or(0.0);
+            ((f64::from(b_old) * old_stds[p] + old_means[p] - new_means[p]) / new_stds[p]) as f32
+        })
+        .collect();
+
+    // Create fresh tensors from the computed data (these are leaf tensors)
+    let new_weight_1d: Tensor<B, 1> = Tensor::from_floats(new_weight_data.as_slice(), &device);
+    let new_weight: Tensor<B, 2> = new_weight_1d.reshape([input_dim, num_players]);
+    let new_bias: Tensor<B, 1> = Tensor::from_floats(new_bias_data.as_slice(), &device);
+
+    // Create new linear layer with Param-wrapped tensors
+    let new_value_head = burn::nn::Linear {
+        weight: burn::module::Param::from_tensor(new_weight),
+        bias: Some(burn::module::Param::from_tensor(new_bias)),
+    };
+
+    model.with_value_head(new_value_head)
+}
+
 /// Perform PPO update on collected rollouts
 ///
 /// Implements clipped surrogate objective with value clipping.
@@ -1402,6 +1486,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     entropy_coef: f64,
     num_actions: usize,
     rng: &mut impl Rng,
+    popart: Option<&mut PopArtNormalizer>,
 ) -> (ActorCritic<B>, UpdateMetrics)
 where
     B::FloatElem: Into<f32>,
@@ -1504,6 +1589,56 @@ where
 
     let mut model = model;
 
+    // PopArt: Update statistics and rescale value head before training
+    let mut popart = popart;
+    let mut value_norm_rescale_mag: Option<f32> = None;
+    let mut value_norm_target_sum = 0.0f64;
+    let mut value_norm_target_sq_sum = 0.0f64;
+    let mut value_norm_target_count = 0usize;
+
+    if let Some(popart_norm) = popart.as_mut() {
+        // Extract returns and acting players from flattened buffer
+        let returns_data: Vec<f32> = returns_inner
+            .clone()
+            .into_data()
+            .to_vec()
+            .expect("returns data");
+        let acting_players_data: Vec<usize> = acting_players_inner
+            .clone()
+            .into_data()
+            .to_vec::<i64>()
+            .expect("acting_players data")
+            .into_iter()
+            .map(|x| usize::try_from(x).expect("non-negative player index"))
+            .collect();
+
+        // Update statistics (returns old values for rescaling)
+        let (old_means, old_stds) = popart_norm.update(&returns_data, &acting_players_data);
+
+        // Rescale value head if initialized
+        if popart_norm.is_initialized() {
+            let new_means: Vec<f64> = (0..num_players).map(|p| popart_norm.mean(p)).collect();
+            let new_stds: Vec<f64> = (0..num_players).map(|p| popart_norm.std(p)).collect();
+
+            // Compute rescale magnitude (max ratio of old_std/new_std)
+            let max_rescale = old_stds
+                .iter()
+                .zip(new_stds.iter())
+                .map(|(&old, &new)| (old / new).abs())
+                .fold(0.0f64, f64::max);
+            value_norm_rescale_mag = Some(max_rescale as f32);
+
+            model = rescale_value_head_for_popart(
+                model,
+                &old_means,
+                &old_stds,
+                &new_means,
+                &new_stds,
+                num_players,
+            );
+        }
+    }
+
     // Epoch loop (labeled for KL early stopping)
     'epoch_loop: for _epoch in 0..config.num_epochs {
         profile_scope!("ppo_epoch");
@@ -1544,11 +1679,59 @@ where
                 .clone()
                 .select(0, mb_indices_inner.clone());
             let mb_advantages_inner = advantages_inner.clone().select(0, mb_indices_inner.clone());
-            let mb_returns_inner = returns_inner.clone().select(0, mb_indices_inner.clone());
+            let mb_returns_inner_raw = returns_inner.clone().select(0, mb_indices_inner.clone());
             let mb_acting_players_inner = acting_players_inner
                 .clone()
                 .select(0, mb_indices_inner.clone());
             let mb_old_values_inner = old_values_inner.clone().select(0, mb_indices_inner.clone());
+
+            // PopArt: Normalize returns and old_values for value loss computation
+            // Buffer stores RAW values (denormalized during collection), but value loss
+            // should be computed in normalized space for stability
+            let (mb_returns_inner, mb_old_values_inner) = if let Some(ref popart_norm) = popart {
+                let returns_vec: Vec<f32> = mb_returns_inner_raw
+                    .clone()
+                    .into_data()
+                    .to_vec()
+                    .expect("returns data");
+                let old_values_vec: Vec<f32> = mb_old_values_inner
+                    .clone()
+                    .into_data()
+                    .to_vec()
+                    .expect("old_values data");
+                let players_vec: Vec<usize> = mb_acting_players_inner
+                    .clone()
+                    .into_data()
+                    .to_vec::<i64>()
+                    .expect("players data")
+                    .into_iter()
+                    .map(|x| usize::try_from(x).expect("non-negative player index"))
+                    .collect();
+
+                let normalized_returns = popart_norm.normalize(&returns_vec, &players_vec);
+                let normalized_old_values = popart_norm.normalize(&old_values_vec, &players_vec);
+
+                // Track normalized target statistics
+                for &v in &normalized_returns {
+                    value_norm_target_sum += f64::from(v);
+                    value_norm_target_sq_sum += f64::from(v) * f64::from(v);
+                    value_norm_target_count += 1;
+                }
+
+                let device = mb_returns_inner_raw.device();
+                (
+                    Tensor::<B::InnerBackend, 1>::from_floats(
+                        normalized_returns.as_slice(),
+                        &device,
+                    ),
+                    Tensor::<B::InnerBackend, 1>::from_floats(
+                        normalized_old_values.as_slice(),
+                        &device,
+                    ),
+                )
+            } else {
+                (mb_returns_inner_raw, mb_old_values_inner)
+            };
 
             // Select minibatch action masks (if present)
             let mb_action_masks_inner: Option<Tensor<B::InnerBackend, 2>> = action_masks_inner
@@ -1704,6 +1887,16 @@ where
         compute_explained_variance(&values_data, &returns_data)
     };
 
+    // Compute value normalization target stats
+    let (value_norm_target_mean, value_norm_target_std) = if value_norm_target_count > 0 {
+        let mean = value_norm_target_sum / value_norm_target_count as f64;
+        let variance = value_norm_target_sq_sum / value_norm_target_count as f64 - mean * mean;
+        let std = variance.max(0.0).sqrt();
+        (Some(mean as f32), Some(std as f32))
+    } else {
+        (None, None)
+    };
+
     // Average metrics
     let entropy = total_entropy / num_updates as f32;
     let max_entropy = (num_actions as f32).ln();
@@ -1725,6 +1918,9 @@ where
         value_error_mean: total_value_error_mean / num_updates as f32,
         value_error_std: total_value_error_std / num_updates as f32,
         value_error_max: total_value_error_max,
+        value_norm_target_mean,
+        value_norm_target_std,
+        value_norm_rescale_mag,
     };
 
     // Cleanup memory in hopes of avoiding any leaks.

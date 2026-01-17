@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::network::{ActorCritic, ActorCriticNetwork, MlpActorCritic};
-use crate::normalization::{ObsNormalizer, ReturnNormalizer};
+use crate::normalization::{ObsNormalizer, PopArtNormalizer, ReturnNormalizer};
 
 /// Training metadata saved alongside model weights
 ///
@@ -443,6 +443,31 @@ pub fn load_return_normalizer(checkpoint_dir: &Path) -> Result<Option<ReturnNorm
 
     let json = fs::read_to_string(&normalizer_path).context("Failed to read return normalizer")?;
     let normalizer: ReturnNormalizer = serde_json::from_str(&json)?;
+    Ok(Some(normalizer))
+}
+
+/// Save value normalizer to a checkpoint directory
+///
+/// The normalizer is saved as JSON for easy inspection and portability.
+pub fn save_popart_normalizer(normalizer: &PopArtNormalizer, checkpoint_dir: &Path) -> Result<()> {
+    let normalizer_path = checkpoint_dir.join("popart_normalizer.json");
+    let json = serde_json::to_string_pretty(normalizer)?;
+    fs::write(normalizer_path, json)?;
+    Ok(())
+}
+
+/// Load value normalizer from a checkpoint directory
+///
+/// Returns None if no value normalizer was saved (older checkpoint or value normalization disabled).
+/// For backward compatibility, missing value normalizer is not an error.
+pub fn load_popart_normalizer(checkpoint_dir: &Path) -> Result<Option<PopArtNormalizer>> {
+    let normalizer_path = checkpoint_dir.join("popart_normalizer.json");
+    if !normalizer_path.exists() {
+        return Ok(None);
+    }
+
+    let json = fs::read_to_string(&normalizer_path).context("Failed to read PopArt normalizer")?;
+    let normalizer: PopArtNormalizer = serde_json::from_str(&json)?;
     Ok(Some(normalizer))
 }
 

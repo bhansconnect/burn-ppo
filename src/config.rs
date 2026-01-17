@@ -217,6 +217,9 @@ pub struct TrainArgs {
     #[arg(long, action = clap::ArgAction::Set, help = "Enable return normalization (default: true)")]
     pub normalize_returns: Option<bool>,
 
+    #[arg(long, action = clap::ArgAction::Set, help = "Enable value normalization (default: true)")]
+    pub normalize_values: Option<bool>,
+
     // --- Training ---
     #[arg(long, help = "PPO epochs per update (default: 4)")]
     pub num_epochs: Option<usize>,
@@ -320,6 +323,7 @@ impl TrainArgs {
         // Normalization
         push_opt!(self.normalize_obs, "--normalize-obs");
         push_opt!(self.normalize_returns, "--normalize-returns");
+        push_opt!(self.normalize_values, "--normalize-values");
 
         // Training
         push_opt!(self.num_epochs, "--num-epochs");
@@ -587,6 +591,12 @@ pub struct Config {
     /// Normalized rewards are clamped to [-clip, +clip]
     #[serde(default = "default_return_clip")]
     pub return_clip: f32,
+    /// Whether to normalize value targets during critic training.
+    /// Maintains running statistics of value targets and rescales
+    /// the value head to preserve output semantics when statistics change.
+    /// Orthogonal to `normalize_returns` (both can be enabled independently).
+    #[serde(default = "default_normalize_values")]
+    pub normalize_values: bool,
 
     // Training
     #[serde(default = "default_total_steps")]
@@ -707,6 +717,9 @@ const fn default_max_grad_norm() -> f64 {
 const fn default_return_clip() -> f32 {
     10.0 // Standard VecNormalize default
 }
+const fn default_normalize_values() -> bool {
+    true
+}
 const fn default_total_steps() -> usize {
     1_000_000
 }
@@ -792,6 +805,7 @@ impl Default for Config {
             normalize_obs: false,
             normalize_returns: None, // Smart default: on for single-player, off for multiplayer
             return_clip: default_return_clip(),
+            normalize_values: true,
             total_steps: default_total_steps(),
             num_epochs: default_num_epochs(),
             num_minibatches: default_num_minibatches(),
@@ -934,6 +948,9 @@ impl Config {
         }
         if let Some(v) = args.normalize_returns {
             self.normalize_returns = Some(v);
+        }
+        if let Some(v) = args.normalize_values {
+            self.normalize_values = v;
         }
         if let Some(v) = args.num_steps {
             self.num_steps = v;
@@ -1086,6 +1103,9 @@ impl Config {
         }
         if args.normalize_returns.is_some() {
             ignored.push("--normalize-returns");
+        }
+        if args.normalize_values.is_some() {
+            ignored.push("--normalize-values");
         }
         if args.num_steps.is_some() {
             ignored.push("--num-steps");

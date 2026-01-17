@@ -90,6 +90,33 @@ impl<B: Backend> ActorCriticNetwork<B> {
     pub const fn is_mlp(&self) -> bool {
         matches!(self, Self::Mlp(_))
     }
+
+    /// Get a reference to the value head linear layer
+    ///
+    /// Used by value normalization for weight rescaling.
+    pub fn value_head(&self) -> &burn::nn::Linear<B> {
+        match self {
+            Self::Mlp(mlp) => &mlp.value_head,
+            Self::Cnn(cnn) => &cnn.value_head,
+        }
+    }
+
+    /// Replace the value head with a new one
+    ///
+    /// Used by value normalization to rescale weights when statistics change.
+    /// Returns a new network with the updated value head.
+    pub fn with_value_head(self, new_value_head: burn::nn::Linear<B>) -> Self {
+        match self {
+            Self::Mlp(mut mlp) => {
+                mlp.value_head = new_value_head;
+                Self::Mlp(mlp)
+            }
+            Self::Cnn(mut cnn) => {
+                cnn.value_head = new_value_head;
+                Self::Cnn(cnn)
+            }
+        }
+    }
 }
 
 // Re-export the old name for backward compatibility during transition
