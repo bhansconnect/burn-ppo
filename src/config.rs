@@ -59,6 +59,10 @@ pub enum Command {
 
 /// Arguments for training
 #[derive(Parser, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CLI args naturally use bool flags"
+)]
 pub struct TrainArgs {
     /// Path to TOML config file
     #[arg(short, long, default_value = "configs/cartpole.toml")]
@@ -129,8 +133,13 @@ pub struct TrainArgs {
     pub network_type: Option<String>,
 
     /// Use separate actor and critic networks instead of shared backbone
-    #[arg(long, action = clap::ArgAction::Set, help = "Use separate actor/critic networks (default: false)")]
-    pub split_networks: Option<bool>,
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_split_networks",
+          help = "Use separate actor/critic networks")]
+    pub split_networks: bool,
+
+    #[arg(long = "no-split-networks", action = clap::ArgAction::SetTrue, hide = true,
+          overrides_with = "split_networks")]
+    pub no_split_networks: bool,
 
     #[arg(long, help = "Hidden layer size (default: 64)")]
     pub hidden_size: Option<usize>,
@@ -172,8 +181,13 @@ pub struct TrainArgs {
     #[arg(long, help = "PPO clipping epsilon (default: 0.2)")]
     pub clip_epsilon: Option<f64>,
 
-    #[arg(long, help = "Enable value clipping (default: false)")]
-    pub clip_value: Option<bool>,
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_clip_value",
+          help = "Enable value clipping")]
+    pub clip_value: bool,
+
+    #[arg(long = "no-clip-value", action = clap::ArgAction::SetTrue, hide = true,
+          overrides_with = "clip_value")]
+    pub no_clip_value: bool,
 
     #[arg(
         long,
@@ -211,14 +225,29 @@ pub struct TrainArgs {
     )]
     pub target_kl: Option<f64>,
 
-    #[arg(long, action = clap::ArgAction::Set, help = "Enable observation normalization (default: false)")]
-    pub normalize_obs: Option<bool>,
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_normalize_obs",
+          help = "Enable observation normalization")]
+    pub normalize_obs: bool,
 
-    #[arg(long, action = clap::ArgAction::Set, help = "Enable return normalization (default: true)")]
-    pub normalize_returns: Option<bool>,
+    #[arg(long = "no-normalize-obs", action = clap::ArgAction::SetTrue, hide = true,
+          overrides_with = "normalize_obs")]
+    pub no_normalize_obs: bool,
 
-    #[arg(long, action = clap::ArgAction::Set, help = "Enable value normalization (default: true)")]
-    pub normalize_values: Option<bool>,
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_normalize_returns",
+          help = "Enable return normalization")]
+    pub normalize_returns: bool,
+
+    #[arg(long = "no-normalize-returns", action = clap::ArgAction::SetTrue, hide = true,
+          overrides_with = "normalize_returns")]
+    pub no_normalize_returns: bool,
+
+    #[arg(long, action = clap::ArgAction::SetTrue, overrides_with = "no_normalize_values",
+          help = "Enable value normalization")]
+    pub normalize_values: bool,
+
+    #[arg(long = "no-normalize-values", action = clap::ArgAction::SetTrue, hide = true,
+          overrides_with = "normalize_values")]
+    pub no_normalize_values: bool,
 
     // --- Training ---
     #[arg(long, help = "PPO epochs per update (default: 4)")]
@@ -258,6 +287,43 @@ pub struct TrainArgs {
 }
 
 impl TrainArgs {
+    /// Convert a bool flag pair to Option<bool>
+    ///
+    /// Returns None if neither flag set, Some(true) if positive flag set,
+    /// Some(false) if negative flag set.
+    fn bool_override(flag: bool, no_flag: bool) -> Option<bool> {
+        match (flag, no_flag) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Get `split_networks` override
+    pub fn split_networks_override(&self) -> Option<bool> {
+        Self::bool_override(self.split_networks, self.no_split_networks)
+    }
+
+    /// Get `clip_value` override
+    pub fn clip_value_override(&self) -> Option<bool> {
+        Self::bool_override(self.clip_value, self.no_clip_value)
+    }
+
+    /// Get `normalize_obs` override
+    pub fn normalize_obs_override(&self) -> Option<bool> {
+        Self::bool_override(self.normalize_obs, self.no_normalize_obs)
+    }
+
+    /// Get `normalize_returns` override
+    pub fn normalize_returns_override(&self) -> Option<bool> {
+        Self::bool_override(self.normalize_returns, self.no_normalize_returns)
+    }
+
+    /// Get `normalize_values` override
+    pub fn normalize_values_override(&self) -> Option<bool> {
+        Self::bool_override(self.normalize_values, self.no_normalize_values)
+    }
+
     /// Generate CLI args for passthrough to subprocess
     ///
     /// Returns all override arguments that should be passed to a subprocess.
@@ -266,12 +332,23 @@ impl TrainArgs {
     pub fn to_passthrough_args(&self) -> Vec<String> {
         let mut args = Vec::new();
 
-        // Helper macro to reduce boilerplate
+        // Helper macro to reduce boilerplate for Option fields
         macro_rules! push_opt {
             ($field:expr, $flag:literal) => {
                 if let Some(v) = &$field {
                     args.push($flag.to_string());
                     args.push(v.to_string());
+                }
+            };
+        }
+
+        // Helper macro for bool flag pairs (--flag / --no-flag)
+        macro_rules! push_bool {
+            ($flag_val:expr, $no_flag_val:expr, $flag:literal, $no_flag:literal) => {
+                if $flag_val {
+                    args.push($flag.to_string());
+                } else if $no_flag_val {
+                    args.push($no_flag.to_string());
                 }
             };
         }
@@ -283,7 +360,12 @@ impl TrainArgs {
 
         // Network
         push_opt!(self.network_type, "--network-type");
-        push_opt!(self.split_networks, "--split-networks");
+        push_bool!(
+            self.split_networks,
+            self.no_split_networks,
+            "--split-networks",
+            "--no-split-networks"
+        );
         push_opt!(self.hidden_size, "--hidden-size");
         push_opt!(self.num_hidden, "--num-hidden");
         push_opt!(self.activation, "--activation");
@@ -298,7 +380,12 @@ impl TrainArgs {
         push_opt!(self.gamma, "--gamma");
         push_opt!(self.gae_lambda, "--gae-lambda");
         push_opt!(self.clip_epsilon, "--clip-epsilon");
-        push_opt!(self.clip_value, "--clip-value");
+        push_bool!(
+            self.clip_value,
+            self.no_clip_value,
+            "--clip-value",
+            "--no-clip-value"
+        );
         push_opt!(self.entropy_coef, "--entropy-coef");
         push_opt!(self.value_coef, "--value-coef");
         push_opt!(self.max_grad_norm, "--max-grad-norm");
@@ -321,9 +408,24 @@ impl TrainArgs {
         push_opt!(self.adaptive_entropy_delta, "--adaptive-entropy-delta");
 
         // Normalization
-        push_opt!(self.normalize_obs, "--normalize-obs");
-        push_opt!(self.normalize_returns, "--normalize-returns");
-        push_opt!(self.normalize_values, "--normalize-values");
+        push_bool!(
+            self.normalize_obs,
+            self.no_normalize_obs,
+            "--normalize-obs",
+            "--no-normalize-obs"
+        );
+        push_bool!(
+            self.normalize_returns,
+            self.no_normalize_returns,
+            "--normalize-returns",
+            "--no-normalize-returns"
+        );
+        push_bool!(
+            self.normalize_values,
+            self.no_normalize_values,
+            "--normalize-values",
+            "--no-normalize-values"
+        );
 
         // Training
         push_opt!(self.num_epochs, "--num-epochs");
@@ -905,7 +1007,7 @@ impl Config {
         if let Some(v) = args.clip_epsilon {
             self.clip_epsilon = v;
         }
-        if let Some(v) = args.clip_value {
+        if let Some(v) = args.clip_value_override() {
             self.clip_value = v;
         }
         if let Some(ref v) = args.entropy_coef {
@@ -943,13 +1045,13 @@ impl Config {
         if let Some(v) = args.target_kl {
             self.target_kl = Some(v);
         }
-        if let Some(v) = args.normalize_obs {
+        if let Some(v) = args.normalize_obs_override() {
             self.normalize_obs = v;
         }
-        if let Some(v) = args.normalize_returns {
+        if let Some(v) = args.normalize_returns_override() {
             self.normalize_returns = Some(v);
         }
-        if let Some(v) = args.normalize_values {
+        if let Some(v) = args.normalize_values_override() {
             self.normalize_values = v;
         }
         if let Some(v) = args.num_steps {
@@ -986,7 +1088,7 @@ impl Config {
         if let Some(activation) = &args.activation {
             self.activation.clone_from(activation);
         }
-        if let Some(v) = args.split_networks {
+        if let Some(v) = args.split_networks_override() {
             self.split_networks = v;
         }
         // CNN parameters
@@ -1071,8 +1173,8 @@ impl Config {
         if args.clip_epsilon.is_some() {
             ignored.push("--clip-epsilon");
         }
-        if args.clip_value.is_some() {
-            ignored.push("--clip-value");
+        if args.clip_value_override().is_some() {
+            ignored.push("--clip-value or --no-clip-value");
         }
         if args.entropy_coef.is_some() {
             ignored.push("--entropy-coef");
@@ -1098,14 +1200,14 @@ impl Config {
         if args.target_kl.is_some() {
             ignored.push("--target-kl");
         }
-        if args.normalize_obs.is_some() {
-            ignored.push("--normalize-obs");
+        if args.normalize_obs_override().is_some() {
+            ignored.push("--normalize-obs or --no-normalize-obs");
         }
-        if args.normalize_returns.is_some() {
-            ignored.push("--normalize-returns");
+        if args.normalize_returns_override().is_some() {
+            ignored.push("--normalize-returns or --no-normalize-returns");
         }
-        if args.normalize_values.is_some() {
-            ignored.push("--normalize-values");
+        if args.normalize_values_override().is_some() {
+            ignored.push("--normalize-values or --no-normalize-values");
         }
         if args.num_steps.is_some() {
             ignored.push("--num-steps");
@@ -1132,8 +1234,8 @@ impl Config {
         if args.activation.is_some() {
             ignored.push("--activation");
         }
-        if args.split_networks.is_some() {
-            ignored.push("--split-networks");
+        if args.split_networks_override().is_some() {
+            ignored.push("--split-networks or --no-split-networks");
         }
 
         // Checkpointing/Logging
