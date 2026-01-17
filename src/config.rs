@@ -888,7 +888,7 @@ const fn default_opponent_select_alpha() -> f64 {
     0.1 // EMA smoothing: last ~10 rotations matter
 }
 const fn default_opponent_select_exponent() -> f64 {
-    1.0 // Linear focus on hard opponents (4:1 hard:easy ratio)
+    2.0 // Quadratic focus on hard opponents
 }
 
 impl Default for Config {

@@ -1,58 +1,23 @@
 # PPO configuration for Connect Four
-# Two-player board game with self-play against random opponent
 
-# Environment
 env = "connect_four"
 num_envs = 128
 num_steps = 64
 
-# PPO hyperparameters
-learning_rate = [[0.001, 0], [0.0001, 40_000_000]]  # Higher LR with slower decay
-gamma = 0.99             # Discount factor
-gae_lambda = 0.95        # GAE smoothing
-clip_epsilon = 0.1       # PPO clip range
-clip_value = false       # Value function clipping disabled
-entropy_coef = 0.05      # Higher entropy = more robust play in tournaments
+learning_rate = [[0.001, 0], [0.0001, 40_000_000]]
+gamma = 0.99
+gae_lambda = 0.95
+clip_epsilon = 0.1
+entropy_coef = 0.05
+value_coef = 0.5
+max_grad_norm = 0.5
+target_kl = 0.02
 
-# Opponent pool: train against historical versions (0.0 = disabled)
-# 25% of envs play against historical checkpoints, 75% self-play
-opponent_pool_fraction = 0.25
-opponent_select_alpha = 0.1      # EMA smoothing for win rate tracking (batch per rotation)
-opponent_select_exponent = 1.0   # P(select) ∝ (1-win_rate)^p, higher = focus on hard opponents
-
-value_coef = 0.5         # Value loss weight
-max_grad_norm = 0.5      # Gradient clipping
-target_kl = 0.02         # KL early stopping
-normalize_obs = false    # Board state doesn't need normalization
-
-# Training - board games need more samples
 total_steps = 20_000_000
 num_epochs = 6
-num_minibatches = 4
-adam_epsilon = 1e-5
 
-# Network - MLP
-# 2 layers of 512 hidden units (~284k MACs)
 hidden_size = 512
-num_hidden = 2
 activation = "relu"
 
-# CNN Alternative - E3a architecture (~45k MACs, matches MLP compute)
-# 3x3 same padding, 3 layers: 8→6→8 filters, 7×7 receptive field (full board width)
-# To use CNN instead of MLP, uncomment network_type below:
-# network_type = "cnn"
-num_conv_layers = 3
-conv_channels = [8, 6, 8]
-kernel_size = 3
-cnn_fc_hidden_size = 64    # FC layer after conv: 336 (8×6×7) → 64 → heads
-cnn_num_fc_layers = 1
-
-# Checkpointing
-run_dir = "runs"
 checkpoint_freq = 50_000
-
-# Logging
 log_freq = 5_000
-
-# Experiment
-seed = 42
