@@ -276,11 +276,11 @@ pub struct TrainArgs {
     )]
     pub opponent_pool_fraction: Option<f32>,
 
-    #[arg(
-        long,
-        help = "qi score learning rate for opponent sampling (default: 0.01)"
-    )]
-    pub qi_eta: Option<f64>,
+    #[arg(long, help = "EMA alpha for win rate tracking (default: 0.1)")]
+    pub opponent_select_alpha: Option<f64>,
+
+    #[arg(long, help = "Exponent p for (1-win_rate)^p selection (default: 1.0)")]
+    pub opponent_select_exponent: Option<f64>,
 
     #[arg(long, help = "Print selected opponents during training and evaluation")]
     pub debug_opponents: bool,
@@ -442,7 +442,8 @@ impl TrainArgs {
 
         // Opponent pool training
         push_opt!(self.opponent_pool_fraction, "--opponent-pool-fraction");
-        push_opt!(self.qi_eta, "--qi-eta");
+        push_opt!(self.opponent_select_alpha, "--opponent-select-alpha");
+        push_opt!(self.opponent_select_exponent, "--opponent-select-exponent");
 
         // Note: These are handled specially by supervisor and excluded:
         // - total_steps, max_training_time, seed, debug_opponents
@@ -755,14 +756,19 @@ pub struct Config {
     #[serde(default = "default_log_freq")]
     pub log_freq: usize,
 
-    // Opponent Pool Training (OpenAI Five-style historical opponent training)
+    // Opponent Pool Training (historical opponent sampling)
     /// Fraction of environments dedicated to opponent games (0.0 = disabled, 0.0-1.0)
     /// When > 0, that fraction of training games are played against historical checkpoints
     #[serde(default = "default_opponent_pool_fraction")]
     pub opponent_pool_fraction: f32,
-    /// qi score learning rate for opponent sampling
-    #[serde(default = "default_qi_eta")]
-    pub qi_eta: f64,
+    /// EMA smoothing factor for win rate tracking (default: 0.1)
+    /// Applied once per rotation (not per game). Higher = more responsive to recent results.
+    #[serde(default = "default_opponent_select_alpha")]
+    pub opponent_select_alpha: f64,
+    /// Exponent for (1-win_rate)^p opponent selection probability (default: 1.0)
+    /// Higher values focus more on opponents you lose to. 1.0 = linear, 2.0 = quadratic.
+    #[serde(default = "default_opponent_select_exponent")]
+    pub opponent_select_exponent: f64,
     /// Print selected opponents during training and evaluation
     #[serde(default)]
     pub debug_opponents: bool,
@@ -878,8 +884,11 @@ const fn default_seed() -> u64 {
 const fn default_opponent_pool_fraction() -> f32 {
     0.25 // 25% of envs play against opponents (0.0 = disabled)
 }
-const fn default_qi_eta() -> f64 {
-    0.01 // OpenAI Five default
+const fn default_opponent_select_alpha() -> f64 {
+    0.1 // EMA smoothing: last ~10 rotations matter
+}
+const fn default_opponent_select_exponent() -> f64 {
+    1.0 // Linear focus on hard opponents (4:1 hard:easy ratio)
 }
 
 impl Default for Config {
@@ -927,7 +936,8 @@ impl Default for Config {
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
             opponent_pool_fraction: default_opponent_pool_fraction(),
-            qi_eta: default_qi_eta(),
+            opponent_select_alpha: default_opponent_select_alpha(),
+            opponent_select_exponent: default_opponent_select_exponent(),
             debug_opponents: false,
             seed: default_seed(),
             run_name: None,
@@ -1120,8 +1130,11 @@ impl Config {
         if let Some(v) = args.opponent_pool_fraction {
             self.opponent_pool_fraction = v;
         }
-        if let Some(v) = args.qi_eta {
-            self.qi_eta = v;
+        if let Some(v) = args.opponent_select_alpha {
+            self.opponent_select_alpha = v;
+        }
+        if let Some(v) = args.opponent_select_exponent {
+            self.opponent_select_exponent = v;
         }
         if args.debug_opponents {
             self.debug_opponents = true;
@@ -1253,8 +1266,11 @@ impl Config {
         if args.opponent_pool_fraction.is_some() {
             ignored.push("--opponent-pool-fraction");
         }
-        if args.qi_eta.is_some() {
-            ignored.push("--qi-eta");
+        if args.opponent_select_alpha.is_some() {
+            ignored.push("--opponent-select-alpha");
+        }
+        if args.opponent_select_exponent.is_some() {
+            ignored.push("--opponent-select-exponent");
         }
 
         // Experiment
@@ -1390,8 +1406,13 @@ impl Config {
         if self.opponent_pool_fraction < 0.0 || self.opponent_pool_fraction > 1.0 {
             bail!("opponent_pool_fraction must be in [0.0, 1.0]");
         }
-        if self.opponent_pool_fraction > 0.0 && self.qi_eta <= 0.0 {
-            bail!("qi_eta must be > 0 when opponent pool is enabled");
+        if self.opponent_pool_fraction > 0.0 {
+            if self.opponent_select_alpha <= 0.0 || self.opponent_select_alpha > 1.0 {
+                bail!("opponent_select_alpha must be in (0.0, 1.0]");
+            }
+            if self.opponent_select_exponent <= 0.0 {
+                bail!("opponent_select_exponent must be > 0");
+            }
         }
 
         Ok(())

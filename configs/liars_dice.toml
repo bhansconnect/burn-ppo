@@ -10,6 +10,8 @@ reward_shaping_coef = 0.05  # Per-round survival bonus (0.0 for pure zero-sum)
 # Opponent pool: train against historical versions (0.0 = disabled)
 # 25% of envs play against historical checkpoints, 75% self-play
 opponent_pool_fraction = 0.25
+opponent_select_alpha = 0.1      # EMA smoothing for win rate tracking (batch per rotation)
+opponent_select_exponent = 1.0   # P(select) ∝ (1-win_rate)^p, higher = focus on hard opponents
 
 # PPO hyperparameters
 learning_rate = 0.001

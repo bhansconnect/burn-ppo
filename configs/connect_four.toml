@@ -17,6 +17,8 @@ entropy_coef = 0.05      # Higher entropy = more robust play in tournaments
 # Opponent pool: train against historical versions (0.0 = disabled)
 # 25% of envs play against historical checkpoints, 75% self-play
 opponent_pool_fraction = 0.25
+opponent_select_alpha = 0.1      # EMA smoothing for win rate tracking (batch per rotation)
+opponent_select_exponent = 1.0   # P(select) ∝ (1-win_rate)^p, higher = focus on hard opponents
 
 value_coef = 0.5         # Value loss weight
 max_grad_norm = 0.5      # Gradient clipping

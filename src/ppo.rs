@@ -460,6 +460,10 @@ pub struct OpponentEpisodeCompletion {
     pub rating_placements: Vec<usize>,
     /// Whether this env was playing against opponents (vs self-play)
     pub is_opponent_game: bool,
+    /// Learner's seat position (captured before shuffle for win rate tracking)
+    pub learner_position: usize,
+    /// Map from seat position to opponent pool index (captured before shuffle)
+    pub position_to_opponent: Vec<Option<usize>>,
 }
 
 /// Collect rollouts with opponent pool training
@@ -762,6 +766,9 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                         opponent_pool_indices: opponent_indices,
                         rating_placements,
                         is_opponent_game: true,
+                        // Capture position state BEFORE shuffle for win rate tracking
+                        learner_position: env_state.learner_position,
+                        position_to_opponent: env_state.position_to_opponent.clone(),
                     });
                 }
 

@@ -533,7 +533,8 @@ where
             match OpponentPool::new(
                 checkpoints_dir,
                 num_players_usize,
-                config.qi_eta,
+                config.opponent_select_alpha,
+                config.opponent_select_exponent,
                 config.clone(),
                 device.clone(),
                 config.seed,
@@ -706,15 +707,14 @@ where
                 popart_normalizer.as_ref(),
             );
 
-            // Queue opponent completions for batched qi updates and record for rating
-            for completion in opponent_completions {
+            // Queue opponent completions for batched win rate updates and record for rating
+            for completion in &opponent_completions {
                 if !completion.placements.is_empty() {
-                    let env_state = &env_states[completion.env_idx];
-                    pool.queue_game_for_qi_update(
+                    // Use position values stored in completion (captured before shuffle)
+                    pool.queue_game_result(
                         &completion.placements,
-                        env_state.learner_position,
-                        env_state,
-                        global_step,
+                        completion.learner_position,
+                        &completion.position_to_opponent,
                     );
 
                     // Record game for rating history
@@ -746,9 +746,9 @@ where
                 }
             }
 
-            // Apply pending qi updates and refresh opponent selection
+            // Apply pending win rate updates and refresh opponent selection
             // Note: new checkpoints are added via pool.add_checkpoint() when saved
-            pool.apply_pending_qi_updates();
+            pool.apply_pending_win_rate_updates();
             pool.refresh_current_opponents();
 
             // Debug output for opponent selection (to stderr for debug output)
@@ -1218,9 +1218,9 @@ where
             // Add checkpoint to opponent pool
             if let Some(ref mut pool) = opponent_pool {
                 pool.add_checkpoint(checkpoint_path.clone(), metadata.step);
-                // Save qi scores periodically
-                if let Err(e) = pool.save_qi_scores() {
-                    progress.eprintln(&format!("Warning: Failed to save qi scores: {e}"));
+                // Save opponent stats periodically
+                if let Err(e) = pool.save_opponent_stats() {
+                    progress.eprintln(&format!("Warning: Failed to save opponent stats: {e}"));
                 }
             }
 
@@ -1300,11 +1300,13 @@ where
             };
             progress.println(&checkpoint_msg);
 
-            // Save qi probability graph to checkpoint directory
+            // Save selection probability graph to checkpoint directory
             if let Some(ref pool) = opponent_pool {
                 if pool.has_opponents() {
-                    if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
-                        progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
+                    if let Err(e) = pool.save_selection_probability_graph(&checkpoint_path) {
+                        progress.eprintln(&format!(
+                            "Warning: Failed to save selection probability graph: {e}"
+                        ));
                     }
                 }
             }
@@ -1402,13 +1404,15 @@ where
         // Add checkpoint to opponent pool
         if let Some(ref mut pool) = opponent_pool {
             pool.add_checkpoint(checkpoint_path.clone(), metadata.step);
-            // Save qi scores
-            if let Err(e) = pool.save_qi_scores() {
-                progress.eprintln(&format!("Warning: Failed to save qi scores: {e}"));
+            // Save opponent stats
+            if let Err(e) = pool.save_opponent_stats() {
+                progress.eprintln(&format!("Warning: Failed to save opponent stats: {e}"));
             }
-            // Save qi probability graph
-            if let Err(e) = pool.save_qi_probability_graph(&checkpoint_path) {
-                progress.eprintln(&format!("Warning: Failed to save qi graph: {e}"));
+            // Save selection probability graph
+            if let Err(e) = pool.save_selection_probability_graph(&checkpoint_path) {
+                progress.eprintln(&format!(
+                    "Warning: Failed to save selection probability graph: {e}"
+                ));
             }
         }
 
