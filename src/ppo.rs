@@ -1462,10 +1462,14 @@ pub fn rescale_value_head_for_popart<B: Backend>(
     let new_weight: Tensor<B, 2> = new_weight_1d.reshape([input_dim, num_players]);
     let new_bias: Tensor<B, 1> = Tensor::from_floats(new_bias_data.as_slice(), &device);
 
-    // Create new linear layer with Param-wrapped tensors
+    // Use map() to preserve ParamIds - this keeps optimizer momentum/velocity state
+    // intact instead of creating orphaned entries that accumulate over training
+    let new_weight_param = value_head.weight.clone().map(|_| new_weight);
+    let new_bias_param = value_head.bias.clone().map(|p| p.map(|_| new_bias));
+
     let new_value_head = burn::nn::Linear {
-        weight: burn::module::Param::from_tensor(new_weight),
-        bias: Some(burn::module::Param::from_tensor(new_bias)),
+        weight: new_weight_param,
+        bias: new_bias_param,
     };
 
     model.with_value_head(new_value_head)
