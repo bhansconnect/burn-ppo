@@ -1182,6 +1182,7 @@ pub struct UpdateMetrics {
     pub policy_loss: f32,
     pub value_loss: f32,
     pub entropy: f32,
+    pub entropy_scaled: f32,
     pub approx_kl: f32,
     pub clip_fraction: f32,
     // Additional metrics for debugging
@@ -1399,6 +1400,7 @@ pub fn ppo_update<B: burn::tensor::backend::AutodiffBackend>(
     config: &Config,
     learning_rate: f64,
     entropy_coef: f64,
+    num_actions: usize,
     rng: &mut impl Rng,
 ) -> (ActorCritic<B>, UpdateMetrics)
 where
@@ -1703,10 +1705,13 @@ where
     };
 
     // Average metrics
+    let entropy = total_entropy / num_updates as f32;
+    let max_entropy = (num_actions as f32).ln();
     let metrics = UpdateMetrics {
         policy_loss: total_policy_loss / num_updates as f32,
         value_loss: total_value_loss / num_updates as f32,
-        entropy: total_entropy / num_updates as f32,
+        entropy,
+        entropy_scaled: entropy / max_entropy,
         approx_kl: total_approx_kl / num_updates as f32,
         clip_fraction: total_clip_fraction / num_updates as f32,
         explained_variance,

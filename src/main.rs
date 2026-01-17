@@ -840,6 +840,7 @@ where
             config,
             lr,
             ent_coef,
+            action_count,
             &mut rng,
         );
         update_time_acc += update_start.elapsed();
@@ -907,6 +908,7 @@ where
             logger.log_scalar("train/policy_loss", metrics.policy_loss, global_step)?;
             logger.log_scalar("train/value_loss", metrics.value_loss, global_step)?;
             logger.log_scalar("train/entropy", metrics.entropy, global_step)?;
+            logger.log_scalar("train/entropy_scaled", metrics.entropy_scaled, global_step)?;
             logger.log_scalar("train/entropy_coef", ent_coef as f32, global_step)?;
             // Log adaptive entropy target when enabled
             if config.adaptive_entropy.is_some() {
