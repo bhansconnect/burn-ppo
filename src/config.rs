@@ -579,9 +579,10 @@ pub struct Config {
     pub normalize_obs: bool,
     /// Whether to normalize rewards using running statistics of discounted returns.
     /// Divides rewards by `sqrt(running_return_variance)` for stable training.
-    /// **Enabled by default** - set to false for sparse reward environments.
-    #[serde(default = "default_true")]
-    pub normalize_returns: bool,
+    /// **Default behavior**: ON for single-player, OFF for multiplayer.
+    /// Set explicitly to `true` or `false` to override.
+    #[serde(default)]
+    pub normalize_returns: Option<bool>,
     /// Clipping range for normalized rewards (default: 10.0)
     /// Normalized rewards are clamped to [-clip, +clip]
     #[serde(default = "default_return_clip")]
@@ -672,9 +673,6 @@ const fn default_reward_shaping_coef() -> f32 {
 }
 fn default_learning_rate() -> Schedule {
     Schedule::constant(2.5e-4)
-}
-const fn default_true() -> bool {
-    true
 }
 const fn default_gamma() -> f64 {
     0.99
@@ -792,7 +790,7 @@ impl Default for Config {
             max_grad_norm: default_max_grad_norm(),
             target_kl: None,
             normalize_obs: false,
-            normalize_returns: true, // Enabled by default
+            normalize_returns: None, // Smart default: on for single-player, off for multiplayer
             return_clip: default_return_clip(),
             total_steps: default_total_steps(),
             num_epochs: default_num_epochs(),
@@ -935,7 +933,7 @@ impl Config {
             self.normalize_obs = v;
         }
         if let Some(v) = args.normalize_returns {
-            self.normalize_returns = v;
+            self.normalize_returns = Some(v);
         }
         if let Some(v) = args.num_steps {
             self.num_steps = v;

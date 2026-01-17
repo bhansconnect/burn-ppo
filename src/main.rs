@@ -215,8 +215,10 @@ where
         None
     };
 
-    // Create return normalizer if enabled (default: true)
-    let mut return_normalizer: Option<ReturnNormalizer> = if config.normalize_returns {
+    // Resolve normalize_returns: None means smart default (on for single-player, off for multiplayer)
+    let normalize_returns = config.normalize_returns.unwrap_or(num_players == 1);
+
+    let mut return_normalizer: Option<ReturnNormalizer> = if normalize_returns {
         Some(ReturnNormalizer::new(
             num_envs,
             num_players as usize,
@@ -309,7 +311,7 @@ where
             }
 
             // Load return normalizer if it was saved (backward compatible - old checkpoints won't have it)
-            if config.normalize_returns {
+            if normalize_returns {
                 match load_return_normalizer(checkpoint_dir) {
                     Ok(Some(loaded_norm)) => {
                         return_normalizer = Some(loaded_norm);
