@@ -1257,7 +1257,23 @@ fn format_step(step: usize) -> String {
 
 /// Assign consistent colors to run names (sorted alphabetically)
 fn assign_run_colors(run_names: &[String]) -> Vec<(String, RGBColor)> {
-    let colors = [BLUE, RED, GREEN, MAGENTA, CYAN];
+    let colors = [
+        BLUE,
+        RED,
+        GREEN,
+        MAGENTA,
+        CYAN,
+        RGBColor(255, 165, 0),  // Orange
+        RGBColor(128, 0, 128),  // Purple
+        RGBColor(0, 128, 0),    // Dark Green
+        RGBColor(255, 20, 147), // Deep Pink
+        RGBColor(139, 69, 19),  // Saddle Brown
+        RGBColor(0, 0, 139),    // Dark Blue
+        RGBColor(184, 134, 11), // Dark Goldenrod
+        RGBColor(0, 139, 139),  // Dark Cyan
+        RGBColor(85, 107, 47),  // Dark Olive Green
+        RGBColor(199, 21, 133), // Medium Violet Red
+    ];
     let mut sorted_names: Vec<_> = run_names.to_vec();
     sorted_names.sort();
     sorted_names
