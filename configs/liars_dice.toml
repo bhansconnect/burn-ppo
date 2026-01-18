@@ -1,25 +1,29 @@
-# PPO configuration for Liar's Dice
+# Default PPO configuration for Liar's Dice
 
 env = "liars_dice"
-num_envs = 128
-num_steps = 64
+num_envs = 256
+num_steps = 128
 reward_shaping_coef = 0.05
 
-learning_rate = 0.001
-gamma = 0.99
-gae_lambda = 0.95
-clip_epsilon = 0.1
+learning_rate = 0.0003
+gamma = 0.97
+gae_lambda = 0.90
+clip_epsilon = 0.2
 entropy_coef = 0.05
 value_coef = 1.0
 max_grad_norm = 0.5
-target_kl = 0.02
+target_kl = 0.025
 
-total_steps = 30_000_000
-num_epochs = 6
+total_steps = 20_000_000
+num_epochs = 4
+num_minibatches = 8
 
 hidden_size = 512
 num_hidden = 3
 activation = "relu"
+
+opponent_pool_fraction = 0.25
+opponent_select_exponent = 2.0
 
 checkpoint_freq = 100_000
 log_freq = 10_000

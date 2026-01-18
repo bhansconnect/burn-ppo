@@ -237,20 +237,6 @@ impl LiarsDice {
         next
     }
 
-    /// Resolve a "call liar" action and return who lost
-    fn resolve_call(&self) -> usize {
-        let (quantity, face) = self.current_bid.expect("Call with no bid");
-        let actual_count = self.count_dice(face);
-
-        if actual_count >= quantity {
-            // Bid was true - caller loses
-            self.current_player
-        } else {
-            // Bid was false - bidder loses
-            self.last_bidder.expect("No last bidder")
-        }
-    }
-
     /// Start a new round after a call resolution
     fn start_new_round(&mut self, loser: usize) {
         // Remove a die from loser
@@ -437,7 +423,7 @@ impl Environment for LiarsDice {
     const EVAL_TEMP: f32 = 1.0; // Stochastic play essential for bluffing
 
     fn new(seed: u64) -> Self {
-        Self::new_with_config(seed, 0.0) // Default: no reward shaping (pure zero-sum)
+        Self::new_with_config(seed, 0.0) // Default: no reward shaping
     }
 
     fn reset(&mut self) -> Vec<f32> {
@@ -495,33 +481,31 @@ impl Environment for LiarsDice {
                     return (self.get_observation(), rewards, true);
                 }
 
-                // Resolve the call
-                let loser = self.resolve_call();
+                // Resolve the call - determine if caller was correct
+                let (bid_qty, bid_face) = self.current_bid.expect("Call with no bid");
+                let actual_count = self.count_dice(bid_face);
+                let caller_correct = actual_count < bid_qty;
+                let caller = self.current_player;
+                let bidder = self.last_bidder.expect("No last bidder");
+                let loser = if caller_correct { bidder } else { caller };
 
-                // Start new round FIRST (handles elimination and game end)
-                // This updates dice_count before we assign rewards
+                // Start new round (handles elimination and game end)
                 self.start_new_round(loser);
 
-                // Assign rewards based on post-round state:
-                // 1. Survival reward to all players still in game (reward shaping)
+                // Placement-based rewards
+                // Survival shaping during game
                 for (p, reward) in rewards.iter_mut().enumerate() {
                     if self.dice_count[p] > 0 {
-                        *reward = self.reward_shaping_coef;
+                        *reward += self.reward_shaping_coef;
                     }
                 }
-
-                // 2. Elimination penalty (overrides survival reward)
-                if self.dice_count[loser] == 0 {
-                    rewards[loser] = -1.0 / (NUM_PLAYERS - 1) as f32;
-                }
-
-                // 3. Winner bonus (added to survival reward)
+                // Final placement rewards at game end
                 if self.game_over {
-                    for (reward, &dice) in rewards.iter_mut().zip(self.dice_count.iter()) {
-                        if dice > 0 {
-                            *reward += 1.0;
-                            break;
-                        }
+                    // [1st, 2nd, 3rd, 4th] = [+1.0, +0.33, -0.33, -1.0]
+                    let placement_rewards = [1.0_f32, 0.33, -0.33, -1.0];
+                    for (order, &player) in self.elimination_order.iter().enumerate() {
+                        let placement = NUM_PLAYERS - order; // order 0->4th, 3->1st
+                        rewards[player] = placement_rewards[placement - 1];
                     }
                 }
 
@@ -1249,7 +1233,8 @@ mod tests {
 
     #[test]
     fn test_two_player_endgame() {
-        let mut env = LiarsDice::new(42);
+        // Test placement-based rewards at game end
+        let mut env = LiarsDice::new_with_config(42, 0.0);
         env.reset();
 
         // Eliminate P0 and P1
@@ -1275,13 +1260,20 @@ mod tests {
         assert!(done, "Game should be over");
         assert_eq!(env.dice_count[2], 0, "P2 eliminated");
         assert_eq!(env.dice_count[3], 1, "P3 still has dice");
-        // Zero-sum rewards: P2 eliminated gets -1/3, P3 wins gets +1
-        assert_eq!(rewards[3], 1.0, "P3 gets winner reward");
+        // Placement rewards: [1st, 2nd, 3rd, 4th] = [+1.0, +0.33, -0.33, -1.0]
+        // P0=4th(-1.0), P1=3rd(-0.33), P2=2nd(+0.33), P3=1st(+1.0)
+        assert_eq!(rewards[3], 1.0, "P3 gets 1st place reward");
         assert!(
-            (rewards[2] - (-1.0 / 3.0)).abs() < 0.001,
-            "P2 gets elimination penalty: {:?}",
+            (rewards[2] - 0.33).abs() < 0.001,
+            "P2 gets 2nd place: {:?}",
             rewards[2]
         );
+        assert!(
+            (rewards[1] - (-0.33)).abs() < 0.001,
+            "P1 gets 3rd place: {:?}",
+            rewards[1]
+        );
+        assert_eq!(rewards[0], -1.0, "P0 gets 4th place reward");
     }
 
     #[test]
@@ -1384,9 +1376,10 @@ mod tests {
     }
 
     #[test]
-    fn test_elimination_reward() {
-        // Test elimination gives -1/(N-1) penalty
-        let mut env = LiarsDice::new(42);
+    fn test_mid_game_elimination() {
+        // Test placement rewards: mid-game eliminations give no immediate reward
+        // (only survival shaping if enabled, final rewards at game end)
+        let mut env = LiarsDice::new_with_config(42, 0.0);
         env.reset();
 
         // Set P0 to 1 die so they'll be eliminated
@@ -1403,13 +1396,9 @@ mod tests {
         // P0 eliminated
         assert!(!done, "Game not over yet (3 players remain)");
         assert_eq!(env.dice_count[0], 0, "P0 eliminated");
-        // P0 gets elimination penalty: -1/3
-        assert!(
-            (rewards[0] - (-1.0 / 3.0)).abs() < 0.001,
-            "P0 elimination penalty: {:?}",
-            rewards[0]
-        );
-        // Others get default reward shaping (0.0)
+        // With placement rewards, no immediate penalty - rewards come at game end
+        // With reward_shaping_coef=0.0, all rewards are 0 during mid-game
+        assert_eq!(rewards[0], 0.0, "P0 no immediate penalty");
         assert_eq!(rewards[1], 0.0, "P1 survives with 0 shaping");
         assert_eq!(rewards[2], 0.0, "P2 survives with 0 shaping");
         assert_eq!(rewards[3], 0.0, "P3 survives with 0 shaping");

@@ -876,6 +876,7 @@ const fn default_cnn_fc_hidden_size() -> usize {
 const fn default_cnn_num_fc_layers() -> usize {
     1
 }
+
 const fn default_checkpoint_freq() -> usize {
     10_000
 }

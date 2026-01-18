@@ -743,6 +743,14 @@ pub fn load_model_from_checkpoint<B: Backend>(
     let config = Config {
         hidden_size: metadata.hidden_size,
         num_hidden: metadata.num_hidden,
+        activation: metadata.activation.clone(),
+        split_networks: metadata.split_networks,
+        network_type: metadata.network_type.clone(),
+        num_conv_layers: metadata.num_conv_layers,
+        conv_channels: metadata.conv_channels.clone(),
+        kernel_size: metadata.kernel_size,
+        cnn_fc_hidden_size: metadata.cnn_fc_hidden_size,
+        cnn_num_fc_layers: metadata.cnn_num_fc_layers,
         ..Config::default()
     };
 
