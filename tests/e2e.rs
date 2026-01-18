@@ -9,11 +9,10 @@ use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::tempdir;
 
-/// Run the burn-ppo binary with given args and a custom `run_dir`
-fn run_binary(args: &[&str], run_dir: &Path) -> Output {
-    // Create a modified config with the temp run_dir
-    let config_content = format!(
-        r#"
+/// Run the burn-ppo binary with given args and a custom run directory
+fn run_binary(args: &[&str], base_dir: &Path) -> Output {
+    // Create a test config (run_dir is now specified via CLI, not config)
+    let config_content = r#"
 env = "cartpole"
 num_envs = 2
 num_steps = 8
@@ -34,17 +33,23 @@ adam_epsilon = 1e-5
 checkpoint_freq = 32
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        run_dir.display()
-    );
+"#;
 
-    let config_path = run_dir.join("test_config.toml");
+    let config_path = base_dir.join("test_config.toml");
     fs::write(&config_path, config_content).expect("Failed to write test config");
 
-    // Build args with train subcommand and temp config
+    // Build args with train subcommand, temp config, and --run-dir pointing to base_dir/cartpole_001
+    // The --run-dir specifies the full path to the run directory
     let config_str = config_path.to_str().unwrap().to_string();
-    let mut full_args: Vec<String> = vec!["train".to_string(), "--config".to_string(), config_str];
+    let run_dir = base_dir.join("cartpole_001");
+    let run_dir_str = run_dir.to_str().unwrap().to_string();
+    let mut full_args: Vec<String> = vec![
+        "train".to_string(),
+        "--config".to_string(),
+        config_str,
+        "--run-dir".to_string(),
+        run_dir_str,
+    ];
     full_args.extend(args.iter().copied().map(String::from));
 
     Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
@@ -61,14 +66,21 @@ fn run_binary_raw(args: &[&str]) -> Output {
         .expect("Failed to execute binary")
 }
 
-/// Get the first run directory created in the given `run_dir`
-fn get_first_run_dir(run_dir: &Path) -> Option<std::path::PathBuf> {
-    fs::read_dir(run_dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|e| e.path().is_dir())
-        .map(|e| e.path())
-        .next()
+/// Get the run directory created in the given base directory.
+/// Since we use --run-dir to specify the exact path, this returns `base_dir/cartpole_001` if it exists.
+fn get_first_run_dir(base_dir: &Path) -> Option<std::path::PathBuf> {
+    let run_dir = base_dir.join("cartpole_001");
+    if run_dir.exists() {
+        Some(run_dir)
+    } else {
+        // Fallback: search for any directory (for tests that don't use run_binary helper)
+        fs::read_dir(base_dir)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|e| e.path().is_dir() && e.file_name() != "test_config.toml")
+            .map(|e| e.path())
+            .next()
+    }
 }
 
 // ============================================================================
@@ -568,8 +580,7 @@ fn test_training_with_normalize_obs() {
     let dir = tempdir().unwrap();
 
     // Create config with normalize_obs enabled
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "cartpole"
 num_envs = 2
 num_steps = 8
@@ -591,16 +602,20 @@ checkpoint_freq = 32
 log_freq = 1000
 seed = 42
 normalize_obs = true
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("norm_config.toml");
     fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("cartpole_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 
@@ -611,7 +626,6 @@ run_dir = "{}"
     );
 
     // Verify normalizer was saved
-    let run_dir = get_first_run_dir(dir.path()).unwrap();
     let checkpoints_dir = run_dir.join("checkpoints");
 
     let step_dir = fs::read_dir(&checkpoints_dir)
@@ -640,8 +654,7 @@ fn test_connect_four_training() {
     let dir = tempdir().unwrap();
 
     // Create config for connect four
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "connect_four"
 num_envs = 2
 num_steps = 8
@@ -662,16 +675,20 @@ adam_epsilon = 1e-5
 checkpoint_freq = 32
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("c4_config.toml");
     fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("connect_four_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 
@@ -687,8 +704,7 @@ fn test_liars_dice_training() {
     let dir = tempdir().unwrap();
 
     // Create config for Liar's Dice
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "liars_dice"
 num_envs = 2
 num_steps = 8
@@ -709,16 +725,20 @@ adam_epsilon = 1e-5
 checkpoint_freq = 32
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("ld_config.toml");
     fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("liars_dice_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 
@@ -738,8 +758,7 @@ fn test_cnn_training_connect_four() {
     let dir = tempdir().unwrap();
 
     // Create config for connect four with CNN
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "connect_four"
 num_envs = 2
 num_steps = 8
@@ -764,16 +783,20 @@ adam_epsilon = 1e-5
 checkpoint_freq = 16
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("cnn_config.toml");
-    fs::write(&config_path, &config_content).unwrap();
+    fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("connect_four_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 
@@ -784,7 +807,6 @@ run_dir = "{}"
     );
 
     // Verify checkpoint created
-    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
     let checkpoints = run_dir.join("checkpoints");
     assert!(checkpoints.exists(), "Checkpoints directory should exist");
 }
@@ -794,8 +816,7 @@ fn test_cnn_checkpoint_resume() {
     let dir = tempdir().unwrap();
 
     // Phase 1: Train CNN model
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "connect_four"
 num_envs = 2
 num_steps = 8
@@ -820,16 +841,20 @@ adam_epsilon = 1e-5
 checkpoint_freq = 16
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("cnn_config.toml");
-    fs::write(&config_path, &config_content).unwrap();
+    fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("connect_four_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 
@@ -840,7 +865,6 @@ run_dir = "{}"
     );
 
     // Phase 2: Resume training from checkpoint
-    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
     let run_dir_str = run_dir.to_str().unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
@@ -860,8 +884,7 @@ fn test_cnn_checkpoint_metadata() {
     let dir = tempdir().unwrap();
 
     // Train CNN model
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "connect_four"
 num_envs = 2
 num_steps = 8
@@ -886,23 +909,26 @@ adam_epsilon = 1e-5
 checkpoint_freq = 16
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("cnn_config.toml");
-    fs::write(&config_path, &config_content).unwrap();
+    fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("connect_four_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 
     assert!(output.status.success(), "CNN training failed");
 
     // Verify metadata contains CNN fields
-    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
     let latest_checkpoint = run_dir.join("checkpoints/latest");
     let metadata_path = latest_checkpoint.join("metadata.json");
 
@@ -948,8 +974,7 @@ fn test_cnn_eval() {
     let dir = tempdir().unwrap();
 
     // Train CNN model
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "connect_four"
 num_envs = 2
 num_steps = 8
@@ -974,23 +999,26 @@ adam_epsilon = 1e-5
 checkpoint_freq = 16
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("cnn_config.toml");
-    fs::write(&config_path, &config_content).unwrap();
+    fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("connect_four_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 
     assert!(output.status.success(), "CNN training failed");
 
     // Run eval on the trained model
-    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
     let checkpoint_path = run_dir.join("checkpoints/latest");
     let checkpoint_str = checkpoint_path.to_str().unwrap();
 
@@ -1027,8 +1055,7 @@ fn test_reload_every_n_checkpoints() {
     let dir = tempdir().unwrap();
 
     // Create config for cartpole with small checkpoint_freq
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "cartpole"
 num_envs = 2
 num_steps = 8
@@ -1049,20 +1076,20 @@ adam_epsilon = 1e-5
 checkpoint_freq = 32
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("reload_config.toml");
     fs::write(&config_path, config_content).unwrap();
 
     // Run with reload every 2 checkpoints
+    let run_dir = dir.path().join("cartpole_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
         .args([
             "train",
             "--config",
             config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
             "--reload-every-n-checkpoints",
             "2",
         ])
@@ -1076,7 +1103,6 @@ run_dir = "{}"
     );
 
     // Verify checkpoints were created
-    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
     let checkpoints = run_dir.join("checkpoints");
     assert!(checkpoints.exists(), "Checkpoints directory should exist");
 
@@ -1097,8 +1123,7 @@ fn test_reload_resume_with_extended_steps() {
     let dir = tempdir().unwrap();
 
     // Phase 1: Initial training with reload
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "cartpole"
 num_envs = 2
 num_steps = 8
@@ -1119,20 +1144,20 @@ adam_epsilon = 1e-5
 checkpoint_freq = 32
 log_freq = 1000
 seed = 42
-run_dir = "{}"
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("reload_resume_config.toml");
-    fs::write(&config_path, &config_content).unwrap();
+    fs::write(&config_path, config_content).unwrap();
 
     // Run initial training with reload every 2 checkpoints
+    let run_dir = dir.path().join("cartpole_001");
     let output1 = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
         .args([
             "train",
             "--config",
             config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
             "--reload-every-n-checkpoints",
             "1",
         ])
@@ -1145,7 +1170,6 @@ run_dir = "{}"
         String::from_utf8_lossy(&output1.stderr)
     );
 
-    let run_dir = get_first_run_dir(dir.path()).expect("Run directory should exist");
     let run_dir_str = run_dir.to_str().unwrap();
 
     // Read initial checkpoint step
@@ -1190,8 +1214,7 @@ fn test_connect_four_training_with_debug_opponents() {
     let dir = tempdir().unwrap();
 
     // Create config for connect four with opponent pool and debug-opponents enabled
-    let config_content = format!(
-        r#"
+    let config_content = r#"
 env = "connect_four"
 num_envs = 4
 num_steps = 8
@@ -1212,19 +1235,23 @@ adam_epsilon = 1e-5
 checkpoint_freq = 32
 log_freq = 1000
 seed = 42
-run_dir = "{}"
 opponent_pool_enabled = true
 opponent_pool_rotation_steps = 32
 debug_opponents = true
-"#,
-        dir.path().display()
-    );
+"#;
 
     let config_path = dir.path().join("c4_debug_opponents_config.toml");
     fs::write(&config_path, config_content).unwrap();
 
+    let run_dir = dir.path().join("connect_four_001");
     let output = Command::new(env!("CARGO_BIN_EXE_burn-ppo"))
-        .args(["train", "--config", config_path.to_str().unwrap()])
+        .args([
+            "train",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--run-dir",
+            run_dir.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute");
 

@@ -121,7 +121,11 @@ pub struct TrainArgs {
     #[arg(long, help = "Random seed (default: 42)")]
     pub seed: Option<u64>,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        conflicts_with = "run_dir",
+        help = "Run name (uses 'runs' as base directory)"
+    )]
     pub run_name: Option<String>,
 
     #[arg(long, help = "Activation function (default: tanh)")]
@@ -260,7 +264,11 @@ pub struct TrainArgs {
     pub adam_epsilon: Option<f64>,
 
     // --- Checkpointing/Logging ---
-    #[arg(long, help = "Directory for run outputs (default: runs)")]
+    #[arg(
+        long,
+        conflicts_with = "run_name",
+        help = "Full path to run directory (extracts last component as run name)"
+    )]
     pub run_dir: Option<PathBuf>,
 
     #[arg(long, help = "Checkpoint save frequency in steps (default: 10000)")]
@@ -747,8 +755,9 @@ pub struct Config {
     pub cnn_num_fc_layers: usize,
 
     // Checkpointing
-    #[serde(default = "default_run_dir")]
-    pub run_dir: PathBuf,
+    /// Full path to the run directory (computed from CLI args, not in TOML)
+    #[serde(skip)]
+    pub(crate) run_path: Option<PathBuf>,
     #[serde(default = "default_checkpoint_freq")]
     pub checkpoint_freq: usize,
 
@@ -867,9 +876,6 @@ const fn default_cnn_fc_hidden_size() -> usize {
 const fn default_cnn_num_fc_layers() -> usize {
     1
 }
-fn default_run_dir() -> PathBuf {
-    PathBuf::from("runs")
-}
 const fn default_checkpoint_freq() -> usize {
     10_000
 }
@@ -932,7 +938,7 @@ impl Default for Config {
             kernel_size: default_kernel_size(),
             cnn_fc_hidden_size: default_cnn_fc_hidden_size(),
             cnn_num_fc_layers: default_cnn_num_fc_layers(),
-            run_dir: default_run_dir(),
+            run_path: None,
             checkpoint_freq: default_checkpoint_freq(),
             log_freq: default_log_freq(),
             opponent_pool_fraction: default_opponent_pool_fraction(),
@@ -964,18 +970,40 @@ impl Config {
         // Store forked_from relationship
         config.forked_from = forked_from.map(String::from);
 
-        // For fork mode, always generate child name (ignore --run-name if specified)
-        if forked_from.is_some() {
-            if config.run_name.is_some() {
+        // Determine base_dir and run_name based on CLI args
+        // --run-dir and --run-name are mutually exclusive (enforced by clap)
+        let default_base = PathBuf::from("runs");
+        let (base_dir, run_name) = if let Some(full_path) = &args.run_dir {
+            // --run-dir specifies full path: extract parent as base, file_name as run_name
+            let base = full_path.parent().unwrap_or(&default_base).to_path_buf();
+            let name = full_path.file_name().and_then(|s| s.to_str()).map_or_else(
+                || generate_run_name(&base, &config.env, forked_from),
+                String::from,
+            );
+            (base, name)
+        } else if let Some(name) = &args.run_name {
+            // --run-name specifies just the name, use default base
+            (default_base, name.clone())
+        } else {
+            // Neither specified: auto-generate name
+            let name = generate_run_name(&default_base, &config.env, forked_from);
+            (default_base, name)
+        };
+
+        // For fork mode, always generate child name (ignore user-specified name)
+        let final_run_name = if forked_from.is_some() {
+            if args.run_name.is_some() || args.run_dir.is_some() {
                 eprintln!(
-                    "Warning: --run-name is ignored when forking; using auto-generated child name"
+                    "Warning: --run-name/--run-dir ignored when forking; using auto-generated child name"
                 );
             }
-            config.run_name = Some(generate_run_name(&config, forked_from));
-        } else if config.run_name.is_none() {
-            // Generate run name if not specified (fresh training)
-            config.run_name = Some(generate_run_name(&config, None));
-        }
+            generate_run_name(&base_dir, &config.env, forked_from)
+        } else {
+            run_name
+        };
+
+        config.run_name = Some(final_run_name.clone());
+        config.run_path = Some(base_dir.join(&final_run_name));
 
         Ok(config)
     }
@@ -1116,9 +1144,7 @@ impl Config {
         }
 
         // Checkpointing/Logging
-        if let Some(v) = &args.run_dir {
-            self.run_dir.clone_from(v);
-        }
+        // Note: run_dir/run_path is handled separately in Config::load()
         if let Some(v) = args.checkpoint_freq {
             self.checkpoint_freq = v;
         }
@@ -1301,13 +1327,11 @@ impl Config {
     /// Get the full path to the run directory
     ///
     /// # Panics
-    /// Panics if `run_name` is None (should be set during `load()`)
+    /// Panics if `run_path` is None (should be set during `Config::load()`)
     pub fn run_path(&self) -> PathBuf {
-        self.run_dir.join(
-            self.run_name
-                .as_ref()
-                .expect("run_name should be set during Config::load()"),
-        )
+        self.run_path
+            .clone()
+            .expect("run_path should be set during Config::load()")
     }
 
     /// Get resolved number of environments
@@ -1491,13 +1515,13 @@ fn find_next_child_counter(run_dir: &std::path::Path, parent_name: &str) -> u32 
 ///
 /// Fresh runs: `{env}_{counter:03}` (e.g., `cartpole_001`)
 /// Child runs: `{parent_name}_child_{counter:03}` (e.g., `cartpole_003_child_001`)
-fn generate_run_name(config: &Config, forked_from: Option<&str>) -> String {
+fn generate_run_name(base_dir: &std::path::Path, env: &str, forked_from: Option<&str>) -> String {
     if let Some(parent_name) = forked_from {
-        let child_counter = find_next_child_counter(&config.run_dir, parent_name);
+        let child_counter = find_next_child_counter(base_dir, parent_name);
         format!("{parent_name}_child_{child_counter:03}")
     } else {
-        let counter = find_next_global_counter(&config.run_dir, &config.env);
-        format!("{}_{:03}", config.env, counter)
+        let counter = find_next_global_counter(base_dir, env);
+        format!("{env}_{counter:03}")
     }
 }
 
@@ -1623,12 +1647,7 @@ mod tests {
     #[test]
     fn test_generate_run_name_fresh() {
         let dir = tempfile::tempdir().unwrap();
-        let config = Config {
-            env: "cartpole".to_string(),
-            run_dir: dir.path().to_path_buf(),
-            ..Config::default()
-        };
-        let name = generate_run_name(&config, None);
+        let name = generate_run_name(dir.path(), "cartpole", None);
         assert_eq!(name, "cartpole_001");
     }
 
@@ -1636,12 +1655,7 @@ mod tests {
     fn test_generate_run_name_child() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("cartpole_003")).unwrap();
-        let config = Config {
-            env: "cartpole".to_string(),
-            run_dir: dir.path().to_path_buf(),
-            ..Config::default()
-        };
-        let name = generate_run_name(&config, Some("cartpole_003"));
+        let name = generate_run_name(dir.path(), "cartpole", Some("cartpole_003"));
         assert_eq!(name, "cartpole_003_child_001");
     }
 }

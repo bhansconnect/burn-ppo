@@ -1660,7 +1660,6 @@ fn run_as_supervisor(args: &CliArgs) -> Result<()> {
             args.max_training_time.clone(),
             running,
             args.config.clone(),
-            run_name,
             args.seed,
             args.debug_opponents,
             args.to_passthrough_args(),

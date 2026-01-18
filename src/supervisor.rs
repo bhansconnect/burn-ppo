@@ -33,8 +33,6 @@ pub struct TrainingSupervisor {
     is_fresh_run: bool,
     /// Config path for fresh runs
     config_path: Option<PathBuf>,
-    /// Run name for fresh runs
-    run_name: Option<String>,
     /// Seed override (pass through to subprocess)
     seed_override: Option<u64>,
     /// Enable opponent debug output (pass through to subprocess)
@@ -63,7 +61,6 @@ impl TrainingSupervisor {
             running,
             is_fresh_run: false,
             config_path: None,
-            run_name: None,
             seed_override: None, // Seed not overridable for resume
             debug_opponents,
             cli_overrides: Vec::new(), // CLI overrides not applied for resume
@@ -79,7 +76,6 @@ impl TrainingSupervisor {
         max_training_time_override: Option<String>,
         running: Arc<AtomicBool>,
         config_path: PathBuf,
-        run_name: String,
         seed_override: Option<u64>,
         debug_opponents: bool,
         cli_overrides: Vec<String>,
@@ -93,7 +89,6 @@ impl TrainingSupervisor {
             running,
             is_fresh_run: true,
             config_path: Some(config_path),
-            run_name: Some(run_name),
             seed_override,
             debug_opponents,
             cli_overrides,
@@ -179,15 +174,22 @@ impl TrainingSupervisor {
                     .to_string_lossy()
                     .to_string(),
             );
-            args.push("--run-name".to_string());
-            args.push(
-                self.run_name
-                    .as_ref()
-                    .expect("run_name set for fresh run")
-                    .clone(),
-            );
-            // Pass through CLI overrides for fresh run
-            args.extend(self.cli_overrides.clone());
+            args.push("--run-dir".to_string());
+            args.push(self.run_dir.to_string_lossy().to_string());
+            // Pass through CLI overrides for fresh run, filtering out run-dir/run-name
+            // to avoid conflict with the --run-dir we just added
+            let mut skip_next = false;
+            for arg in &self.cli_overrides {
+                if skip_next {
+                    skip_next = false;
+                    continue;
+                }
+                if arg == "--run-dir" || arg == "--run-name" {
+                    skip_next = true;
+                    continue;
+                }
+                args.push(arg.clone());
+            }
         } else {
             // Resume mode
             args.push("--resume".to_string());
