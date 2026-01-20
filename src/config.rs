@@ -532,6 +532,12 @@ pub struct EvalArgs {
         help = "Gradually decay temperature over cutoff (default: false)"
     )]
     pub temp_decay: bool,
+
+    #[arg(
+        long,
+        help = "Number of players for variable-player games like skull (default: env specific)"
+    )]
+    pub players: Option<usize>,
 }
 
 /// Arguments for tournament mode
@@ -595,6 +601,12 @@ pub struct TournamentArgs {
         help = "Force round-robin format (default: auto-select based on matchup count)"
     )]
     pub round_robin: bool,
+
+    #[arg(
+        long,
+        help = "Number of players per game for variable-player games like skull (required for skull)"
+    )]
+    pub players: Option<usize>,
 }
 
 /// Legacy alias for backward compatibility
@@ -606,6 +618,82 @@ pub type CliArgs = TrainArgs;
 pub enum NumEnvs {
     Auto(String), // "auto"
     Explicit(usize),
+}
+
+/// Player count configuration for multi-player games like Skull
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PlayerCountMode {
+    /// Fixed player count for all games
+    Fixed { count: usize },
+    /// Uniform random from min to max (inclusive)
+    UniformRandom { min: usize, max: usize },
+    /// Weighted random selection (weights for player counts 2-6, indices 0-4)
+    WeightedRandom { weights: [f32; 5] },
+    /// Curriculum: start at min, increase as training progresses
+    Curriculum {
+        min: usize,
+        max: usize,
+        /// Training steps to reach max player count
+        warmup_steps: usize,
+    },
+}
+
+impl Default for PlayerCountMode {
+    fn default() -> Self {
+        // Default to 4 players (good middle ground for Skull)
+        Self::Fixed { count: 4 }
+    }
+}
+
+impl PlayerCountMode {
+    /// Get the initial/fixed player count for training setup
+    pub fn get_fixed_count(&self) -> usize {
+        match self {
+            Self::Fixed { count } => *count,
+            Self::UniformRandom { min, .. } | Self::Curriculum { min, .. } => *min,
+            Self::WeightedRandom { .. } => 4, // Default
+        }
+    }
+
+    /// Sample a player count based on the mode and current training step
+    #[expect(
+        dead_code,
+        reason = "Will be used when ppo.rs adds dynamic player count support"
+    )]
+    pub fn sample(&self, rng: &mut impl rand::Rng, current_step: usize) -> usize {
+        use rand::distributions::{Distribution, WeightedIndex};
+
+        match self {
+            Self::Fixed { count } => *count,
+            Self::UniformRandom { min, max } => rng.gen_range(*min..=*max),
+            Self::WeightedRandom { weights } => {
+                // weights[0] = P(2 players), weights[4] = P(6 players)
+                let dist =
+                    WeightedIndex::new(weights).expect("Invalid weights for PlayerCountMode");
+                2 + dist.sample(rng)
+            }
+            Self::Curriculum {
+                min,
+                max,
+                warmup_steps,
+            } => {
+                if current_step >= *warmup_steps {
+                    *max
+                } else {
+                    let progress = current_step as f32 / *warmup_steps as f32;
+                    let range = (*max - *min) as f32;
+                    #[expect(
+                        clippy::cast_sign_loss,
+                        reason = "progress and range are both non-negative"
+                    )]
+                    {
+                        *min + (progress * range).round() as usize
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Default for NumEnvs {
@@ -639,10 +727,16 @@ pub struct Config {
     /// Reward shaping coefficient for dense rewards (default 0.0).
     /// Used differently by each environment:
     /// - Liar's Dice: per-round survival bonus.
+    /// - Skull: per-round survival/challenge bonus.
     ///
     /// Set to 0.0 for pure zero-sum/sparse rewards.
     #[serde(default = "default_reward_shaping_coef")]
     pub reward_shaping_coef: f32,
+
+    /// Player count mode for games supporting variable player counts (e.g., Skull).
+    /// Only used by environments that support variable player counts.
+    #[serde(default)]
+    pub player_count: PlayerCountMode,
 
     // PPO hyperparameters
     /// Learning rate - can be static value or schedule with milestones.
@@ -907,6 +1001,7 @@ impl Default for Config {
             num_envs: NumEnvs::default(),
             num_steps: default_num_steps(),
             reward_shaping_coef: default_reward_shaping_coef(),
+            player_count: PlayerCountMode::default(),
             learning_rate: default_learning_rate(),
             gamma: default_gamma(),
             gae_lambda: default_gae_lambda(),
@@ -1345,9 +1440,9 @@ impl Config {
         use anyhow::bail;
 
         // Validate environment name
-        if !["cartpole", "connect_four", "liars_dice"].contains(&self.env.as_str()) {
+        if !["cartpole", "connect_four", "liars_dice", "skull"].contains(&self.env.as_str()) {
             bail!(
-                "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice",
+                "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice, skull",
                 self.env
             );
         }

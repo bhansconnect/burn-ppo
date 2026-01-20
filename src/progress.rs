@@ -140,12 +140,14 @@ impl TrainingProgress {
     /// Update with multiplayer statistics
     ///
     /// Shows per-player returns and average Swiss points.
+    /// Only displays players that participated in at least one game (`game_counts[p] > 0`).
     /// Format: `elapsed/eta | SPS: N | P0: ret (pts) | P1: ret (pts) | ... | D%`
     pub fn update_multiplayer(
         &self,
         step: u64,
         returns_per_player: &[f32],
         avg_points: &[f32],
+        game_counts: &[usize],
         draw_rate: f32,
     ) {
         self.main_bar.set_position(step);
@@ -168,12 +170,14 @@ impl TrainingProgress {
         };
         let total_estimated = elapsed + remaining_time;
 
-        // Unified format for all N-player games
+        // Only show players that participated in at least one game
         let stats_str: String = returns_per_player
             .iter()
             .zip(avg_points.iter())
+            .zip(game_counts.iter())
             .enumerate()
-            .map(|(i, (r, pts))| format!("P{i}: {r:.2} ({pts:.2}pts)"))
+            .filter(|(_, ((_, _), &count))| count > 0)
+            .map(|(i, ((r, pts), _))| format!("P{i}: {r:.2} ({pts:.2}pts)"))
             .collect::<Vec<_>>()
             .join(" | ");
 
@@ -244,8 +248,8 @@ mod tests {
     #[test]
     fn test_training_progress_update_multiplayer_no_panic() {
         let progress = TrainingProgress::new_with_players(1000, 2);
-        // Should not panic: returns=[0.5, 0.5], avg_points=[0.45, 0.45], draw_rate=0.1
-        progress.update_multiplayer(500, &[0.5, 0.5], &[0.45, 0.45], 0.1);
+        // Should not panic: returns=[0.5, 0.5], avg_points=[0.45, 0.45], game_counts=[10, 10], draw_rate=0.1
+        progress.update_multiplayer(500, &[0.5, 0.5], &[0.45, 0.45], &[10, 10], 0.1);
         progress.finish();
     }
 
@@ -253,7 +257,27 @@ mod tests {
     fn test_training_progress_update_multiplayer_3player_no_panic() {
         let progress = TrainingProgress::new_with_players(1000, 3);
         // Should not panic: returns, avg_points for 3 players
-        progress.update_multiplayer(500, &[0.33, 0.33, 0.34], &[1.0, 1.0, 1.0], 0.1);
+        progress.update_multiplayer(
+            500,
+            &[0.33, 0.33, 0.34],
+            &[1.0, 1.0, 1.0],
+            &[10, 10, 10],
+            0.1,
+        );
+        progress.finish();
+    }
+
+    #[test]
+    fn test_training_progress_update_multiplayer_filters_inactive_players() {
+        let progress = TrainingProgress::new_with_players(1000, 4);
+        // Only players 0, 1 have games - players 2, 3 should not appear in output
+        progress.update_multiplayer(
+            500,
+            &[0.5, 0.6, 0.0, 0.0],
+            &[1.0, 1.0, 0.0, 0.0],
+            &[10, 10, 0, 0],
+            0.1,
+        );
         progress.finish();
     }
 }

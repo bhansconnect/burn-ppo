@@ -1798,14 +1798,14 @@ fn run_pod<B: Backend, E: Environment>(
     temp_schedule: &TempSchedule,
     rng: &mut StdRng,
     device: &B::Device,
+    num_players: usize,
 ) -> MatchupGames {
     use std::collections::HashMap;
 
-    let num_players = E::NUM_PLAYERS;
     assert_eq!(
         pod.len(),
         num_players,
-        "Pod size {} must match NUM_PLAYERS {}",
+        "Pod size {} must match num_players {}",
         pod.len(),
         num_players
     );
@@ -1853,6 +1853,7 @@ fn run_pod<B: Backend, E: Environment>(
         rng,
         device,
         true, // silent
+        num_players,
     );
 
     // Convert game_outcomes to GamePlacement
@@ -2010,8 +2011,20 @@ fn run_tournament_env<B: Backend, E: Environment>(
 
     println!("Loaded {} unique models", models.len());
 
+    // Determine player count
+    let num_players = if E::VARIABLE_PLAYER_COUNT {
+        args.players.ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} supports variable player counts. Use --players N to specify (e.g., --players 4)",
+                E::NAME
+            )
+        })?
+    } else {
+        E::NUM_PLAYERS
+    };
+
     // Determine tournament format based on matchup count
-    let matchups = (0..n).combinations(E::NUM_PLAYERS).count();
+    let matchups = (0..n).combinations(num_players).count();
     let use_swiss = matchups > 50 && !args.round_robin;
     let num_rounds = if use_swiss {
         args.rounds.unwrap_or_else(|| {
@@ -2061,7 +2074,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
     // Progress bar setup
     let multi_progress = MultiProgress::new();
 
-    let pod_size = E::NUM_PLAYERS;
+    let pod_size = num_players;
 
     if use_swiss {
         // Swiss tournament
@@ -2149,6 +2162,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
                     &temp_schedule,
                     &mut rng,
                     device,
+                    num_players,
                 );
 
                 // Suspend progress bars to print result
@@ -2209,6 +2223,7 @@ fn run_tournament_env<B: Backend, E: Environment>(
                 &temp_schedule,
                 &mut rng,
                 device,
+                num_players,
             );
 
             // Suspend progress bar to print result
@@ -3005,6 +3020,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let results = build_results(
@@ -3054,6 +3070,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let results = build_results(&contestants, &ratings, &[], 1, false, &args, "cartpole");
@@ -3089,6 +3106,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let results = build_results(&contestants, &ratings, &[], 3, true, &args, "connect_four");
@@ -3121,6 +3139,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3155,6 +3174,7 @@ mod tests {
             random: true, // Add random player
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3190,6 +3210,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3224,6 +3245,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3251,6 +3273,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let result = discover_contestants(&args);
@@ -3283,6 +3306,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         // Empty dir isn't a valid checkpoint or checkpoints dir
@@ -3387,6 +3411,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3453,6 +3478,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let contestants = discover_contestants(&args).unwrap();
@@ -3560,6 +3586,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let results = build_results(&contestants, &ratings, &[], 1, false, &args, "test_env");
@@ -3676,6 +3703,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let results = build_results(&contestants, &ratings, &pods, 2, true, &args, "test");
@@ -4437,6 +4465,7 @@ mod tests {
             random: false,
             graph: false,
             round_robin: false,
+            players: None,
         };
 
         let contestants = discover_contestants(&args).unwrap();

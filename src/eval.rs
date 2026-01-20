@@ -1017,8 +1017,20 @@ fn run_interactive_evaluation<B: Backend>(
         let temp_schedule = TempSchedule::from_args_with_env_defaults::<E>(args)?;
         println!("Temperature: {}", temp_schedule.describe());
 
-        // Verify player count matches
-        let expected_players = E::NUM_PLAYERS;
+        // Determine expected player count
+        let expected_players = if E::VARIABLE_PLAYER_COUNT {
+            // Variable-player games require --players flag
+            args.players.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} supports variable player counts. Use --players N to specify (e.g., --players 4)",
+                    E::NAME
+                )
+            })?
+        } else {
+            // Fixed-player games use their constant
+            E::NUM_PLAYERS
+        };
+
         if player_sources.len() != expected_players {
             anyhow::bail!(
                 "{} requires {} players, but {} were specified.\n\
@@ -1039,6 +1051,7 @@ fn run_interactive_evaluation<B: Backend>(
             &mut rng,
             device,
             watch,
+            expected_players,
         );
         Ok(())
     })
@@ -1066,6 +1079,18 @@ fn run_watch_mode<B: Backend>(
         let temp_schedule = TempSchedule::from_args_with_env_defaults::<E>(args)?;
         println!("Temperature: {}", temp_schedule.describe());
 
+        // Determine player count
+        let num_players = if E::VARIABLE_PLAYER_COUNT {
+            args.players.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} supports variable player counts. Use --players N to specify (e.g., --players 4)",
+                    E::NAME
+                )
+            })?
+        } else {
+            E::NUM_PLAYERS
+        };
+
         run_watch_mode_env::<B, E>(
             models,
             normalizers,
@@ -1078,6 +1103,7 @@ fn run_watch_mode<B: Backend>(
             args.fps,
             &mut rng,
             device,
+            num_players,
         );
         Ok(())
     })
@@ -1098,9 +1124,10 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
     fps: u32,
     rng: &mut StdRng,
     device: &B::Device,
+    num_players: usize,
 ) {
     use rand::RngCore;
-    let mut stats = EvalStats::new(E::NUM_PLAYERS);
+    let mut stats = EvalStats::new(num_players);
 
     for game_idx in 0..num_games {
         println!("\n=== Game {} ===", game_idx + 1);
@@ -1110,8 +1137,9 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
         println!();
 
         let mut env = E::new(rng.next_u64());
+        env.set_num_players(num_players);
         let mut obs = env.reset();
-        let mut total_rewards = vec![0.0f32; E::NUM_PLAYERS];
+        let mut total_rewards = vec![0.0f32; num_players];
         let mut move_num = 0;
         let mut is_first_frame = true;
         let mut last_frame_lines = 0usize;
@@ -1260,10 +1288,10 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
     rng: &mut StdRng,
     device: &B::Device,
     watch: bool,
+    num_players: usize,
 ) {
     use rand::RngCore;
 
-    let num_players = E::NUM_PLAYERS;
     assert_eq!(
         player_sources.len(),
         num_players,
@@ -1305,6 +1333,8 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
         }
 
         let mut env = E::new(rng.next_u64());
+        // Set player count for variable-player games (no-op for fixed-player games)
+        env.set_num_players(num_players);
         let obs = env.reset();
         let mut total_rewards = vec![0.0f32; num_players];
         let mut move_num = 0;
@@ -1505,6 +1535,18 @@ fn run_stats_mode<B: Backend>(
         let temp_schedule = TempSchedule::from_args_with_env_defaults::<E>(args)?;
         println!("Temperature: {}", temp_schedule.describe());
 
+        // Determine player count
+        let num_players = if E::VARIABLE_PLAYER_COUNT {
+            args.players.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} supports variable player counts. Use --players N to specify (e.g., --players 4)",
+                    E::NAME
+                )
+            })?
+        } else {
+            E::NUM_PLAYERS
+        };
+
         run_stats_mode_env::<B, E>(
             models,
             normalizers,
@@ -1516,6 +1558,7 @@ fn run_stats_mode<B: Backend>(
             &mut rng,
             device,
             false, // not silent - print progress and summary
+            num_players,
         );
         Ok(())
     })
@@ -1563,9 +1606,9 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
     rng: &mut StdRng,
     device: &B::Device,
     silent: bool,
+    num_players: usize,
 ) -> EvalStats {
     use rand::RngCore;
-    let num_players = E::NUM_PLAYERS;
     let num_checkpoints = checkpoint_to_model.len();
     let obs_dim = E::OBSERVATION_DIM;
     let action_count = E::ACTION_COUNT;
@@ -1580,6 +1623,8 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
     let base_seed = rng.next_u64();
     let mut vec_env: VecEnv<E> =
         VecEnv::new(num_envs, |i| E::new(base_seed.wrapping_add(i as u64)));
+    // Set player count for variable-player games (no-op for fixed-player games)
+    vec_env.set_all_num_players(num_players);
     let mut stats = EvalStats::new(num_checkpoints);
 
     // Track move counts per environment (for temperature schedule)
@@ -1891,6 +1936,7 @@ mod tests {
             temp_cutoff: None,
             no_temp_cutoff: false,
             temp_decay: false,
+            players: None,
         };
         let schedule = TempSchedule::from_args_with_default(&args, 0.3).unwrap();
         assert_eq!(schedule.get_temp(0), 0.5);
@@ -1929,6 +1975,7 @@ mod tests {
             temp_cutoff: None,
             no_temp_cutoff: false,
             temp_decay: false,
+            players: None,
         };
         let result = TempSchedule::from_args_with_default(&args, 0.3);
         assert!(result.is_err());
@@ -1960,6 +2007,7 @@ mod tests {
             temp_cutoff: None,
             no_temp_cutoff: false,
             temp_decay: true, // decay without cutoff = error
+            players: None,
         };
         let result = TempSchedule::from_args_with_default(&args, 0.3);
         assert!(result.is_err());

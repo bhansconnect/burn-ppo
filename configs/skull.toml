@@ -1,0 +1,49 @@
+# PPO configuration for Skull
+
+env = "skull"
+num_envs = 128
+num_steps = 128
+
+# Enable reward shaping for intermediate learning signals
+reward_shaping_coef = 0.05
+learning_rate = 0.0001
+
+# GAE parameters for multi-player imperfect info game
+gamma = 0.95
+gae_lambda = 0.92
+
+# PPO hyperparameters
+clip_epsilon = 0.15    # Lower threshold to trigger more clipping
+entropy_coef = 0.1    # High exploration for bluffing
+value_coef = 0.5       # Strong value function learning
+max_grad_norm = 0.5
+target_kl = 0.02       # Early stopping if KL exceeds this
+
+# Training duration
+total_steps = 20_000_000
+
+# More update iterations per rollout
+num_epochs = 6
+num_minibatches = 8
+
+# Larger network for bluffing complexity
+hidden_size = 256
+num_hidden = 3
+activation = "relu"
+
+# Self-play settings
+opponent_pool_fraction = 0.3
+opponent_select_exponent = 2.0
+
+checkpoint_freq = 100_000
+log_freq = 10_000
+
+# Player count configuration (2-6 supported) - MUST BE AT END
+# Options:
+#   type = "Fixed", count = 4
+#   type = "UniformRandom", min = 3, max = 6
+#   type = "WeightedRandom", weights = [0.05, 0.2, 0.3, 0.3, 0.15]  # for 2-6 players
+#   type = "Curriculum", min = 3, max = 6, warmup_steps = 5000000
+[player_count]
+type = "Fixed"
+count = 4

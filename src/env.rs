@@ -57,6 +57,10 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// None = use constant temperature throughout.
     const EVAL_TEMP_CUTOFF: Option<(usize, f32)> = None;
 
+    /// Whether this environment supports variable player counts at runtime.
+    /// If true, `set_num_players` and `active_player_count` should be implemented.
+    const VARIABLE_PLAYER_COUNT: bool = false;
+
     /// Create a new environment with the given seed.
     /// For deterministic games, the seed may be ignored.
     fn new(seed: u64) -> Self;
@@ -109,6 +113,23 @@ pub trait Environment: Send + Sync + Sized + 'static {
             .parse::<usize>()
             .map_err(|_| format!("Enter action number 0-{}", Self::ACTION_COUNT - 1))
     }
+
+    /// Set the number of active players for the next reset.
+    /// Only meaningful for environments with `VARIABLE_PLAYER_COUNT = true`.
+    /// Call this before `reset()` to change player count.
+    fn set_num_players(&mut self, _num_players: usize) {
+        // Default: no-op for fixed-player environments
+    }
+
+    /// Get the current number of active players.
+    /// For fixed-player environments, returns `NUM_PLAYERS`.
+    #[expect(
+        dead_code,
+        reason = "Part of trait API for variable-player environments"
+    )]
+    fn active_player_count(&self) -> usize {
+        Self::NUM_PLAYERS
+    }
 }
 
 /// Episode statistics for completed episodes
@@ -137,14 +158,23 @@ impl EpisodeStats {
 /// - 4-player: 1st=3.0, 2nd=2.0, 3rd=1.0, 4th=0.0
 /// - Ties: shared positions get averaged points
 ///
-/// Returns (`avg_points[player]`, `draw_rate`) where draw = all tied for 1st
-pub fn compute_avg_points(outcomes: &VecDeque<GameOutcome>, num_players: usize) -> (Vec<f32>, f32) {
-    let total = outcomes.len() as f32;
-    if total == 0.0 {
-        return (vec![0.0; num_players], 0.0);
+/// Supports variable-length outcomes: each outcome may have different player counts.
+/// Players are tracked by participation count - a player with no games gets 0 points.
+///
+/// Returns (`avg_points[player]`, `game_counts[player]`, `draw_rate`) where:
+/// - `avg_points[p]` = average Swiss points for player p (0.0 if no games)
+/// - `game_counts[p]` = number of games player p participated in
+/// - `draw_rate` = fraction of games that were draws (all tied for 1st)
+pub fn compute_avg_points(
+    outcomes: &VecDeque<GameOutcome>,
+    max_players: usize,
+) -> (Vec<f32>, Vec<usize>, f32) {
+    if outcomes.is_empty() {
+        return (vec![0.0; max_players], vec![0; max_players], 0.0);
     }
 
-    let mut total_points = vec![0.0f64; num_players];
+    let mut total_points = vec![0.0f64; max_players];
+    let mut game_counts = vec![0usize; max_players];
     let mut draws = 0usize;
 
     for outcome in outcomes {
@@ -156,26 +186,38 @@ pub fn compute_avg_points(outcomes: &VecDeque<GameOutcome>, num_players: usize) 
         }
 
         // Calculate Swiss points using fractional ranking
-        // points = num_players - avg_position_for_that_rank
+        // points = num_players_in_game - avg_position_for_that_rank
         let n = placements.len();
         for (player, &place) in placements.iter().enumerate() {
+            if player >= max_players {
+                break; // Safety bound for outcomes larger than max_players
+            }
             // Count how many players share this placement
             let tied_count = placements.iter().filter(|&&p| p == place).count();
             // Average position for tied players: place, place+1, ..., place+tied-1
             // avg = place + (tied_count - 1) / 2
             let avg_position = place as f64 + (tied_count as f64 - 1.0) / 2.0;
-            // Points = num_players - avg_position
+            // Points = num_players_in_game - avg_position
             let points = n as f64 - avg_position;
             total_points[player] += points;
+            game_counts[player] += 1;
         }
     }
 
+    // Average based on games participated, not total games
     let avg_points: Vec<f32> = total_points
         .iter()
-        .map(|&p| (p / f64::from(total)) as f32)
+        .zip(game_counts.iter())
+        .map(|(&pts, &count)| {
+            if count > 0 {
+                (pts / count as f64) as f32
+            } else {
+                0.0
+            }
+        })
         .collect();
-    let draw_rate = draws as f32 / total;
-    (avg_points, draw_rate)
+    let draw_rate = draws as f32 / outcomes.len() as f32;
+    (avg_points, game_counts, draw_rate)
 }
 
 /// Vectorized environment wrapper for parallel execution
@@ -222,6 +264,25 @@ impl<E: Environment> VecEnv<E> {
     /// Number of parallel environments
     pub const fn num_envs(&self) -> usize {
         self.envs.len()
+    }
+
+    /// Set player count on all environments (for variable-player games)
+    ///
+    /// This sets the player count and resets all environments.
+    /// For fixed-player games, this is a no-op.
+    pub fn set_all_num_players(&mut self, num_players: usize) {
+        for (i, env) in self.envs.iter_mut().enumerate() {
+            env.set_num_players(num_players);
+            let obs = env.reset();
+            let offset = i * E::OBSERVATION_DIM;
+            self.obs_buffer[offset..offset + E::OBSERVATION_DIM].copy_from_slice(&obs);
+        }
+        // Reset episode tracking
+        for rewards in &mut self.episode_rewards {
+            rewards.fill(0.0);
+        }
+        self.episode_lengths.fill(0);
+        self.terminal.fill(false);
     }
 
     /// Get current observations as flat array [`num_envs` * `obs_dim`]
@@ -456,9 +517,10 @@ mod tests {
     #[test]
     fn test_compute_avg_points_empty() {
         let outcomes: VecDeque<GameOutcome> = VecDeque::new();
-        let (avg_points, draw_rate) = compute_avg_points(&outcomes, 2);
+        let (avg_points, game_counts, draw_rate) = compute_avg_points(&outcomes, 2);
 
         assert_eq!(avg_points, vec![0.0, 0.0]);
+        assert_eq!(game_counts, vec![0, 0]);
         assert_eq!(draw_rate, 0.0);
     }
 
@@ -468,11 +530,12 @@ mod tests {
         for _ in 0..10 {
             outcomes.push_back(GameOutcome(vec![1, 2])); // P0 wins
         }
-        let (avg_points, draw_rate) = compute_avg_points(&outcomes, 2);
+        let (avg_points, game_counts, draw_rate) = compute_avg_points(&outcomes, 2);
 
         // P0 always gets 1st (1.0 pts), P1 always gets 2nd (0.0 pts)
         assert!((avg_points[0] - 1.0).abs() < 0.001);
         assert!((avg_points[1] - 0.0).abs() < 0.001);
+        assert_eq!(game_counts, vec![10, 10]);
         assert_eq!(draw_rate, 0.0);
     }
 
@@ -482,11 +545,12 @@ mod tests {
         for _ in 0..10 {
             outcomes.push_back(GameOutcome(vec![1, 1])); // Tie
         }
-        let (avg_points, draw_rate) = compute_avg_points(&outcomes, 2);
+        let (avg_points, game_counts, draw_rate) = compute_avg_points(&outcomes, 2);
 
         // Both tied for 1st, avg position = 1.5, points = 2 - 1.5 = 0.5
         assert!((avg_points[0] - 0.5).abs() < 0.001);
         assert!((avg_points[1] - 0.5).abs() < 0.001);
+        assert_eq!(game_counts, vec![10, 10]);
         assert_eq!(draw_rate, 1.0);
     }
 
@@ -503,12 +567,13 @@ mod tests {
         for _ in 0..2 {
             outcomes.push_back(GameOutcome(vec![1, 1])); // Tie
         }
-        let (avg_points, draw_rate) = compute_avg_points(&outcomes, 2);
+        let (avg_points, game_counts, draw_rate) = compute_avg_points(&outcomes, 2);
 
         // P0: 4 wins (4.0 pts) + 4 losses (0.0 pts) + 2 draws (1.0 pts) = 5.0 / 10 = 0.5
         // P1: 4 losses (0.0 pts) + 4 wins (4.0 pts) + 2 draws (1.0 pts) = 5.0 / 10 = 0.5
         assert!((avg_points[0] - 0.5).abs() < 0.001);
         assert!((avg_points[1] - 0.5).abs() < 0.001);
+        assert_eq!(game_counts, vec![10, 10]);
         assert!((draw_rate - 0.2).abs() < 0.001);
     }
 
@@ -518,7 +583,7 @@ mod tests {
         // 4-player game: P0 always wins, P1 2nd, P2 3rd, P3 4th
         outcomes.push_back(GameOutcome(vec![1, 2, 3, 4]));
 
-        let (avg_points, draw_rate) = compute_avg_points(&outcomes, 4);
+        let (avg_points, game_counts, draw_rate) = compute_avg_points(&outcomes, 4);
 
         // 4-player: max_points = 3.0 (1st place)
         // P0: 1st = 4-1 = 3.0 pts
@@ -529,6 +594,7 @@ mod tests {
         assert!((avg_points[1] - 2.0).abs() < 0.001);
         assert!((avg_points[2] - 1.0).abs() < 0.001);
         assert!((avg_points[3] - 0.0).abs() < 0.001);
+        assert_eq!(game_counts, vec![1, 1, 1, 1]);
         assert_eq!(draw_rate, 0.0);
     }
 
@@ -538,7 +604,7 @@ mod tests {
         // P0 wins, P1 and P2 tied for 2nd, P3 4th
         outcomes.push_back(GameOutcome(vec![1, 2, 2, 4]));
 
-        let (avg_points, draw_rate) = compute_avg_points(&outcomes, 4);
+        let (avg_points, game_counts, draw_rate) = compute_avg_points(&outcomes, 4);
 
         // P0: 1st = 4-1 = 3.0 pts
         // P1: tied 2nd, avg position = (2+3)/2 = 2.5, pts = 4-2.5 = 1.5
@@ -548,6 +614,7 @@ mod tests {
         assert!((avg_points[1] - 1.5).abs() < 0.001);
         assert!((avg_points[2] - 1.5).abs() < 0.001);
         assert!((avg_points[3] - 0.0).abs() < 0.001);
+        assert_eq!(game_counts, vec![1, 1, 1, 1]);
         assert_eq!(draw_rate, 0.0);
     }
 
@@ -557,13 +624,47 @@ mod tests {
         // All 4 players tied for 1st
         outcomes.push_back(GameOutcome(vec![1, 1, 1, 1]));
 
-        let (avg_points, draw_rate) = compute_avg_points(&outcomes, 4);
+        let (avg_points, game_counts, draw_rate) = compute_avg_points(&outcomes, 4);
 
         // All tied for 1st, avg position = (1+2+3+4)/4 = 2.5, pts = 4-2.5 = 1.5
         for pts in &avg_points {
             assert!((pts - 1.5).abs() < 0.001);
         }
+        assert_eq!(game_counts, vec![1, 1, 1, 1]);
         assert_eq!(draw_rate, 1.0);
+    }
+
+    #[test]
+    fn test_compute_avg_points_variable_lengths() {
+        let mut outcomes: VecDeque<GameOutcome> = VecDeque::new();
+        // 4-player game
+        outcomes.push_back(GameOutcome(vec![1, 2, 3, 4]));
+        // 2-player game
+        outcomes.push_back(GameOutcome(vec![1, 2]));
+
+        let (avg_points, game_counts, _draw_rate) = compute_avg_points(&outcomes, 6);
+
+        // P0 and P1 participated in both games
+        assert_eq!(game_counts[0], 2);
+        assert_eq!(game_counts[1], 2);
+        // P2 and P3 only in first game
+        assert_eq!(game_counts[2], 1);
+        assert_eq!(game_counts[3], 1);
+        // P4 and P5 never participated
+        assert_eq!(game_counts[4], 0);
+        assert_eq!(game_counts[5], 0);
+
+        // P0: 4-player win (3.0) + 2-player win (1.0) = 4.0 / 2 = 2.0 avg
+        assert!((avg_points[0] - 2.0).abs() < 0.001);
+        // P1: 4-player 2nd (2.0) + 2-player loss (0.0) = 2.0 / 2 = 1.0 avg
+        assert!((avg_points[1] - 1.0).abs() < 0.001);
+        // P2: 4-player 3rd (1.0) = 1.0 / 1 = 1.0 avg
+        assert!((avg_points[2] - 1.0).abs() < 0.001);
+        // P3: 4-player 4th (0.0) = 0.0 / 1 = 0.0 avg
+        assert!((avg_points[3] - 0.0).abs() < 0.001);
+        // Non-participants should have 0 points
+        assert_eq!(avg_points[4], 0.0);
+        assert_eq!(avg_points[5], 0.0);
     }
 
     // =========================================

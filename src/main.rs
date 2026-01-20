@@ -57,7 +57,7 @@ use crate::checkpoint::{
 };
 use crate::config::{Cli, CliArgs, Command, Config};
 use crate::env::{compute_avg_points, Environment, GameOutcome, VecEnv};
-use crate::envs::{CartPole, ConnectFour, LiarsDice};
+use crate::envs::{CartPole, ConnectFour, LiarsDice, Skull};
 use crate::metrics::MetricsLogger;
 use crate::network::ActorCritic;
 use crate::normalization::{ObsNormalizer, PopArtNormalizer, ReturnNormalizer};
@@ -173,6 +173,7 @@ fn run_training<TB, E, F>(
     elapsed_time_offset_ms: u64,
     max_checkpoints_this_run: usize,
     env_factory: F,
+    actual_player_count: Option<usize>,
 ) -> Result<()>
 where
     TB: burn::tensor::backend::AutodiffBackend,
@@ -513,7 +514,9 @@ where
     let mut exited_for_reload = false;
 
     // Multiplayer tracking (only used when num_players > 1)
-    let num_players_usize = num_players as usize;
+    // Use actual_player_count if provided (for variable player count envs like Skull),
+    // otherwise fall back to compile-time E::NUM_PLAYERS
+    let num_players_usize = actual_player_count.unwrap_or(num_players as usize);
     // Per-player rolling returns (last 100 episodes)
     let mut recent_returns_per_player: Vec<VecDeque<f32>> = (0..num_players_usize)
         .map(|_| VecDeque::with_capacity(100))
@@ -705,6 +708,7 @@ where
                 return_normalizer.as_mut(),
                 global_step,
                 popart_normalizer.as_ref(),
+                actual_player_count,
             );
 
             // Queue opponent completions for batched win rate updates and record for rating
@@ -924,11 +928,13 @@ where
                     }
                 })
                 .collect();
-            let (avg_points, draw_rate) = compute_avg_points(&recent_outcomes, num_players_usize);
+            let (avg_points, game_counts, draw_rate) =
+                compute_avg_points(&recent_outcomes, num_players_usize);
             progress.update_multiplayer(
                 global_step as u64,
                 &returns_per_player,
                 &avg_points,
+                &game_counts,
                 draw_rate,
             );
         } else {
@@ -1114,14 +1120,20 @@ where
                         .iter()
                         .filter_map(|(_, o)| o.clone())
                         .collect();
-                    let (avg_points, draw_rate) = compute_avg_points(&outcomes, num_players_usize);
+                    let (avg_points, game_counts, draw_rate) =
+                        compute_avg_points(&outcomes, num_players_usize);
 
-                    for (player, &pts) in avg_points.iter().enumerate() {
-                        logger.log_scalar(
-                            &format!("episode/avg_points_p{player}"),
-                            pts,
-                            global_step,
-                        )?;
+                    // Only log points for players that participated in at least one game
+                    for (player, (&pts, &count)) in
+                        avg_points.iter().zip(game_counts.iter()).enumerate()
+                    {
+                        if count > 0 {
+                            logger.log_scalar(
+                                &format!("episode/avg_points_p{player}"),
+                                pts,
+                                global_step,
+                            )?;
+                        }
                     }
 
                     logger.log_scalar("episode/draw_rate", draw_rate, global_step)?;
@@ -1272,7 +1284,7 @@ where
                 .to_string_lossy();
             let checkpoint_msg = if num_players > 1 {
                 // Multiplayer: show Swiss points and training metrics
-                let (avg_points, _draw_rate) =
+                let (avg_points, _game_counts, _draw_rate) =
                     compute_avg_points(&recent_outcomes, num_players_usize);
                 let p0_points = avg_points.first().copied().unwrap_or(0.0);
                 if let Some(ref m) = last_metrics {
@@ -1464,7 +1476,8 @@ where
             .to_string_lossy();
         let checkpoint_msg = if num_players > 1 {
             // Multiplayer: show Swiss points and training metrics
-            let (avg_points, _draw_rate) = compute_avg_points(&recent_outcomes, num_players_usize);
+            let (avg_points, _game_counts, _draw_rate) =
+                compute_avg_points(&recent_outcomes, num_players_usize);
             let p0_points = avg_points.first().copied().unwrap_or(0.0);
             if let Some(ref m) = last_metrics {
                 format!(
@@ -1848,6 +1861,7 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                 elapsed_time_offset_ms,
                 max_checkpoints_this_run,
                 move |i| CartPole::new(seed + i as u64),
+                None, // Single player, no actual_player_count needed
             ),
             "connect_four" => run_training::<TB, ConnectFour, _>(
                 &mode,
@@ -1859,6 +1873,7 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                 elapsed_time_offset_ms,
                 max_checkpoints_this_run,
                 move |i| ConnectFour::new(seed + i as u64),
+                None, // Fixed 2 players
             ),
             "liars_dice" => {
                 let reward_shaping_coef = config.reward_shaping_coef;
@@ -1872,10 +1887,29 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                     elapsed_time_offset_ms,
                     max_checkpoints_this_run,
                     move |i| LiarsDice::new_with_config(seed + i as u64, reward_shaping_coef),
+                    None, // Fixed 2 players
+                )
+            }
+            "skull" => {
+                let reward_shaping_coef = config.reward_shaping_coef;
+                let player_count = config.player_count.get_fixed_count();
+                run_training::<TB, Skull, _>(
+                    &mode,
+                    &config,
+                    &run_dir,
+                    resumed_metadata.as_ref(),
+                    &device,
+                    &running,
+                    elapsed_time_offset_ms,
+                    max_checkpoints_this_run,
+                    move |i| {
+                        Skull::new_with_players(player_count, reward_shaping_coef, seed + i as u64)
+                    },
+                    Some(player_count), // Variable player count from config
                 )
             }
             _ => bail!(
-                "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice",
+                "Unknown environment '{}'. Supported: cartpole, connect_four, liars_dice, skull",
                 config.env
             ),
         }

@@ -1,10 +1,12 @@
 pub mod cartpole;
 pub mod connect_four;
 pub mod liars_dice;
+pub mod skull;
 
 pub use cartpole::CartPole;
 pub use connect_four::ConnectFour;
 pub use liars_dice::LiarsDice;
+pub use skull::Skull;
 
 /// Dispatch to the correct environment type based on `env_name`.
 /// Uses compile-time monomorphization for zero runtime overhead.
@@ -33,9 +35,13 @@ macro_rules! dispatch_env {
                 type E = $crate::envs::LiarsDice;
                 $callback
             }
+            "skull" => {
+                type E = $crate::envs::Skull;
+                $callback
+            }
             _ => {
                 anyhow::bail!(
-                    "Unknown environment: '{}'. Supported: cartpole, connect_four, liars_dice",
+                    "Unknown environment: '{}'. Supported: cartpole, connect_four, liars_dice, skull",
                     name
                 )
             }
@@ -62,9 +68,13 @@ macro_rules! dispatch_env_ok {
                 type E = $crate::envs::LiarsDice;
                 Ok($callback)
             }
+            "skull" => {
+                type E = $crate::envs::Skull;
+                Ok($callback)
+            }
             _ => {
                 anyhow::bail!(
-                    "Unknown environment: '{}'. Supported: cartpole, connect_four, liars_dice",
+                    "Unknown environment: '{}'. Supported: cartpole, connect_four, liars_dice, skull",
                     name
                 )
             }
@@ -97,6 +107,11 @@ mod tests {
 
     fn dispatch_liars_dice() -> anyhow::Result<&'static str> {
         let name = "liars_dice".to_string();
+        crate::dispatch_env!(name, Ok(get_env_name::<E>()))
+    }
+
+    fn dispatch_skull() -> anyhow::Result<&'static str> {
+        let name = "skull".to_string();
         crate::dispatch_env!(name, Ok(get_env_name::<E>()))
     }
 
@@ -134,10 +149,17 @@ mod tests {
     }
 
     #[test]
+    fn test_dispatch_env_skull() {
+        let result = dispatch_skull();
+        assert_eq!(result.unwrap(), "skull");
+    }
+
+    #[test]
     fn test_dispatch_env_gets_correct_obs_dim() {
         assert_eq!(dispatch_get_obs_dim("cartpole").unwrap(), 5); // CartPole: [x, x_dot, theta, theta_dot, time]
         assert_eq!(dispatch_get_obs_dim("connect_four").unwrap(), 86); // ConnectFour: 42*2 + 2
         assert_eq!(dispatch_get_obs_dim("liars_dice").unwrap(), 270); // LiarsDice: 78 base + 192 bid history
+        assert_eq!(dispatch_get_obs_dim("skull").unwrap(), 135); // Skull: 71 base + 64 bid history
     }
 
     #[test]

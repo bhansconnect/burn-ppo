@@ -494,11 +494,14 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     mut return_normalizer: Option<&mut ReturnNormalizer>,
     _current_step: usize,
     popart: Option<&PopArtNormalizer>,
+    actual_player_count: Option<usize>,
 ) -> (Vec<EpisodeStats>, Vec<OpponentEpisodeCompletion>) {
     profile_function!();
     let num_envs = vec_env.num_envs();
     let obs_dim = E::OBSERVATION_DIM;
     let num_players = E::NUM_PLAYERS;
+    // Use actual_player_count for game logic (e.g., opponent positions) when available
+    let game_num_players = actual_player_count.unwrap_or(num_players);
     let mut all_completed = Vec::new();
     let mut opponent_completions = Vec::new();
 
@@ -776,7 +779,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 env_states[env_idx].assigned_opponents = opponent_pool.sample_all_slots();
 
                 // Shuffle positions for next episode with new opponents
-                env_states[env_idx].shuffle_positions(num_players, rng);
+                env_states[env_idx].shuffle_positions(game_num_players, rng);
             }
         }
         all_completed.extend(completed);
