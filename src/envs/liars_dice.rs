@@ -19,14 +19,15 @@ const ACTION_COUNT: usize = MAX_TOTAL_DICE * DICE_FACES + 1; // 49
 const CALL_LIAR_ACTION: usize = ACTION_COUNT - 1; // 48
 
 // Observation space layout
+// NOTE: Per-player arrays use RELATIVE indexing (0 = current player, 1 = next clockwise, etc.)
 const OBS_OWN_DICE: usize = DICE_PER_PLAYER * DICE_FACES; // 12: own dice one-hot
-const OBS_DICE_COUNTS: usize = NUM_PLAYERS; // 4: dice remaining per player
-const OBS_ALIVE_FLAGS: usize = NUM_PLAYERS; // 4: player alive flags
-const OBS_CURRENT_PLAYER: usize = NUM_PLAYERS; // 4: current player one-hot
+const OBS_DICE_COUNTS: usize = NUM_PLAYERS; // 4: dice remaining per player (relative)
+const OBS_ALIVE_FLAGS: usize = NUM_PLAYERS; // 4: player alive flags (relative)
+const OBS_SEAT_POSITION: usize = NUM_PLAYERS; // 4: absolute seat position one-hot
 const OBS_CURRENT_BID: usize = MAX_TOTAL_DICE * DICE_FACES; // 48: bid one-hot (qty × face)
 const OBS_HAS_BID: usize = 1; // 1: has active bid flag
 const OBS_BID_COUNT: usize = 1; // 1: bid count this round
-const OBS_LAST_BIDDER: usize = NUM_PLAYERS; // 4: last bidder one-hot
+const OBS_LAST_BIDDER: usize = NUM_PLAYERS; // 4: last bidder one-hot (relative)
 
 // Bid history: last N bids, each encoded as bidder (4) + quantity (1) + face (6) + valid flag (1) = 12
 const BID_HISTORY_SIZE: usize = 16; // Store last 16 bids
@@ -36,7 +37,7 @@ const OBS_BID_HISTORY: usize = BID_HISTORY_SIZE * BID_HISTORY_ENTRY_SIZE; // 192
 const OBSERVATION_DIM: usize = OBS_OWN_DICE
     + OBS_DICE_COUNTS
     + OBS_ALIVE_FLAGS
-    + OBS_CURRENT_PLAYER
+    + OBS_SEAT_POSITION
     + OBS_CURRENT_BID
     + OBS_HAS_BID
     + OBS_BID_COUNT
@@ -91,15 +92,17 @@ impl BidHistory {
         self.history.clear();
     }
 
-    /// Convert to observation vector (192 floats: 16 bids × 12 floats each)
-    fn to_observation(&self) -> Vec<f32> {
+    /// Convert to observation vector with relative player indices (192 floats: 16 bids × 12 floats each)
+    /// Bidder indices are converted to relative: 0 = current player, 1 = next clockwise, etc.
+    fn to_observation_relative(&self, current_player: usize) -> Vec<f32> {
         let mut obs = vec![0.0; OBS_BID_HISTORY];
 
         for (i, &(bidder, quantity, face)) in self.history.iter().enumerate() {
             let base = i * BID_HISTORY_ENTRY_SIZE;
 
-            // Bidder one-hot (4 floats)
-            obs[base + bidder] = 1.0;
+            // Bidder one-hot (4 floats) - RELATIVE index
+            let rel_bidder = (bidder + NUM_PLAYERS - current_player) % NUM_PLAYERS;
+            obs[base + rel_bidder] = 1.0;
 
             // Quantity normalized (1 float): qty / 8
             obs[base + NUM_PLAYERS] = quantity as f32 / MAX_TOTAL_DICE as f32;
@@ -280,28 +283,33 @@ impl LiarsDice {
     }
 
     /// Generate observation vector for current state
+    /// Uses RELATIVE player indexing: 0 = current player, 1 = next clockwise, etc.
     fn get_observation(&self) -> Vec<f32> {
         let mut obs = vec![0.0; OBSERVATION_DIM];
         let mut idx = 0;
+        let current = self.current_player;
 
         // Own dice one-hot (12 floats: 2 dice × 6 faces)
-        for die_idx in 0..self.dice_count[self.current_player] {
-            let face = self.dice[self.current_player][die_idx] as usize;
+        for die_idx in 0..self.dice_count[current] {
+            let face = self.dice[current][die_idx] as usize;
             obs[idx + (face - 1)] = 1.0;
             idx += DICE_FACES;
         }
         // Skip remaining slots if player has fewer dice
         idx = OBS_OWN_DICE;
 
-        // Dice counts per player, normalized to 0-1 (4 floats)
-        for player in 0..NUM_PLAYERS {
-            obs[idx] = self.dice_count[player] as f32 / DICE_PER_PLAYER as f32;
+        // Dice counts per player, normalized to 0-1 (4 floats) - RELATIVE indexing
+        // Index 0 = current player, 1 = next clockwise, etc.
+        for rel_idx in 0..NUM_PLAYERS {
+            let abs_idx = (rel_idx + current) % NUM_PLAYERS;
+            obs[idx] = self.dice_count[abs_idx] as f32 / DICE_PER_PLAYER as f32;
             idx += 1;
         }
 
-        // Player alive flags (4 floats)
-        for player in 0..NUM_PLAYERS {
-            obs[idx] = if self.dice_count[player] > 0 {
+        // Player alive flags (4 floats) - RELATIVE indexing
+        for rel_idx in 0..NUM_PLAYERS {
+            let abs_idx = (rel_idx + current) % NUM_PLAYERS;
+            obs[idx] = if self.dice_count[abs_idx] > 0 {
                 1.0
             } else {
                 0.0
@@ -309,9 +317,9 @@ impl LiarsDice {
             idx += 1;
         }
 
-        // Current player one-hot (4 floats)
-        obs[idx + self.current_player] = 1.0;
-        idx += OBS_CURRENT_PLAYER;
+        // Seat position one-hot (4 floats) - ABSOLUTE (for position awareness)
+        obs[idx + current] = 1.0;
+        idx += OBS_SEAT_POSITION;
 
         // Current bid one-hot (48 floats)
         if let Some((quantity, face)) = self.current_bid {
@@ -329,14 +337,15 @@ impl LiarsDice {
         obs[idx] = (self.bid_count as f32 / 20.0).min(1.0);
         idx += OBS_BID_COUNT;
 
-        // Last bidder one-hot (4 floats)
+        // Last bidder one-hot (4 floats) - RELATIVE indexing
         if let Some(bidder) = self.last_bidder {
-            obs[idx + bidder] = 1.0;
+            let rel_bidder = (bidder + NUM_PLAYERS - current) % NUM_PLAYERS;
+            obs[idx + rel_bidder] = 1.0;
         }
         idx += OBS_LAST_BIDDER;
 
-        // Bid history (192 floats)
-        let history_obs = self.bid_history.to_observation();
+        // Bid history (192 floats) - uses relative bidder indices
+        let history_obs = self.bid_history.to_observation_relative(current);
         obs[idx..idx + OBS_BID_HISTORY].copy_from_slice(&history_obs);
 
         obs
@@ -1063,8 +1072,14 @@ mod tests {
         // Bid count (index 73) = 1/20 = 0.05
         assert!((obs[73] - 0.05).abs() < 0.01, "Bid count should be ~0.05");
 
-        // Last bidder one-hot (indices 74-77)
-        assert_eq!(obs[74], 1.0, "Last bidder is P0");
+        // Last bidder one-hot (indices 74-77) - RELATIVE indexing
+        // Current player is now P1, so P0 (last bidder) is at relative index 3
+        // relative_idx = (0 + 4 - 1) % 4 = 3
+        assert_eq!(
+            obs[74 + 3],
+            1.0,
+            "Last bidder is P0 (relative idx 3 from P1)"
+        );
     }
 
     #[test]
@@ -1086,11 +1101,12 @@ mod tests {
         let obs = env.get_observation();
 
         // First bid entry at index 78 (history_start)
-        // Bidder P0 one-hot: indices 78-81, expect [1, 0, 0, 0]
-        assert_eq!(obs[78], 1.0, "First bid by P0");
+        // Bidder P0 one-hot: indices 78-81 - RELATIVE indexing
+        // Current player is P1, so P0 is at relative index (0 + 4 - 1) % 4 = 3
+        assert_eq!(obs[78], 0.0);
         assert_eq!(obs[79], 0.0);
         assert_eq!(obs[80], 0.0);
-        assert_eq!(obs[81], 0.0);
+        assert_eq!(obs[81], 1.0, "First bid by P0 (relative idx 3 from P1)");
 
         // Quantity normalized: index 82, expect 2/8 = 0.25
         assert!((obs[82] - 0.25).abs() < 0.01, "Quantity should be 0.25");
@@ -1125,8 +1141,13 @@ mod tests {
 
         let obs = env.get_observation();
 
-        // Second bid entry: P1 bid "3 fours"
-        assert_eq!(obs[second_entry_start + 1], 1.0, "Second bid by P1");
+        // Second bid entry: P1 bid "3 fours" - RELATIVE indexing
+        // Current player is P2, so P1 is at relative index (1 + 4 - 2) % 4 = 3
+        assert_eq!(
+            obs[second_entry_start + 3],
+            1.0,
+            "Second bid by P1 (relative idx 3 from P2)"
+        );
         assert!(
             (obs[second_entry_start + 4] - 0.375).abs() < 0.01,
             "Quantity 3/8"
