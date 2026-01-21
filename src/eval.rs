@@ -597,9 +597,11 @@ impl EvalStats {
             })
             .collect();
 
+        // Use first checkpoint as anchor (arbitrary choice for eval)
         let rating_result = plackett_luce::compute_ratings(
             num_checkpoints,
             &pl_games,
+            0, // Anchor first checkpoint
             &PlackettLuceConfig::default(),
         );
         let ratings = &rating_result.ratings;

@@ -300,7 +300,8 @@ impl RatingHistory {
 
         // Compute ratings
         let config = PlackettLuceConfig::default();
-        let result = plackett_luce::compute_ratings(num_checkpoints, &pl_games, &config);
+        // Use first checkpoint as anchor (arbitrary choice for rating history)
+        let result = plackett_luce::compute_ratings(num_checkpoints, &pl_games, 0, &config);
 
         // Extract raw ratings
         let raw_ratings: Vec<f64> = result.ratings.iter().map(|r| r.rating).collect();

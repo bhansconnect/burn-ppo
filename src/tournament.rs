@@ -1040,14 +1040,12 @@ fn compute_ratings(contestants: &[Contestant], all_games: &[SingleGameResult]) -
         .collect();
 
     // Determine anchor player for consistent cross-tournament comparison
-    let anchor_idx = find_anchor_index(contestants);
+    // Fallback to last player if no Random or step_ found (typically weakest in tests)
+    let anchor_idx =
+        find_anchor_index(contestants).unwrap_or_else(|| contestants.len().saturating_sub(1));
+    let config = PlackettLuceConfig::default();
 
-    let config = PlackettLuceConfig {
-        anchor_player_index: anchor_idx,
-        ..PlackettLuceConfig::default()
-    };
-
-    plackett_luce::compute_ratings(contestants.len(), &pl_games, &config)
+    plackett_luce::compute_ratings(contestants.len(), &pl_games, anchor_idx, &config)
 }
 
 /// Print a quick guide to interpreting Plackett-Luce ratings (Elo scale)
