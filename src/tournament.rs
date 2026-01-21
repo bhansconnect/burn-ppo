@@ -1473,10 +1473,10 @@ fn generate_rating_graph(contestants: &[Contestant], ratings: &[PlayerRating]) -
     // 11. Draw rating guide text in bottom-right corner
     let guide_text = [
         "Rating Δ Guide:",
-        "+4 pts → 67% win",
-        "+8 pts → 82% win",
-        "+12 pts → 90% win",
-        "+16 pts → 95% win",
+        "+100 pts → 64% win",
+        "+200 pts → 76% win",
+        "+300 pts → 85% win",
+        "+400 pts → 91% win",
         "Shaded: 95% CI (±2σ)",
     ];
 
