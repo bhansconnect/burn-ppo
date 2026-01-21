@@ -113,7 +113,8 @@ pub struct Skull {
     // Reveal state
     revealed: [usize; MAX_PLAYERS], // how many cards revealed per stack
     roses_found: usize,
-    must_reveal_own: bool, // bidder must reveal own stack first
+    must_reveal_own: bool,           // bidder must reveal own stack first
+    last_skull_owner: Option<usize>, // player whose skull was last revealed (for next round starter)
 
     // Game state
     elimination_order: Vec<usize>,
@@ -147,6 +148,7 @@ impl Skull {
             revealed: [0; MAX_PLAYERS],
             roses_found: 0,
             must_reveal_own: false,
+            last_skull_owner: None,
             elimination_order: Vec::new(),
             game_over: false,
             winner: None,
@@ -303,6 +305,7 @@ impl Skull {
         self.bid_history.clear();
         self.roses_found = 0;
         self.must_reveal_own = false;
+        self.last_skull_owner = None;
 
         // Find next alive player from starter
         if self.is_alive(starter) {
@@ -313,34 +316,42 @@ impl Skull {
         self.round_starter = self.current_player;
     }
 
-    /// Calculate terminal rewards based on placement
+    /// Calculate terminal rewards based on placement.
+    /// Uses `compute_placements()` for proper ordering by wins/coasters/elimination.
+    /// Handles ties by averaging rewards for tied positions.
     fn calculate_final_rewards(&self) -> Vec<f32> {
-        let mut rewards = vec![0.0; self.num_players];
+        use std::collections::HashMap;
 
-        // Winner gets +1.0
-        if let Some(winner) = self.winner {
-            rewards[winner] = 1.0;
+        let n = self.num_players;
+        let placements = self.compute_placements();
+        let mut rewards = vec![0.0; n];
+
+        // Group players by placement for tie handling
+        let mut placement_groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (player, &placement) in placements.iter().enumerate() {
+            placement_groups.entry(placement).or_default().push(player);
         }
 
-        // Others get placement-based rewards
-        // elimination_order[0] = first eliminated = last place = worst reward
-        let n = self.num_players;
-        for (order, &player) in self.elimination_order.iter().enumerate() {
-            if Some(player) == self.winner {
-                continue; // Skip winner
-            }
-            // order 0 = first eliminated = placement n (last place)
-            // order 1 = second eliminated = placement n-1
-            // etc.
-            let placement = n - order; // n, n-1, ..., 2
+        // Calculate reward for each placement, averaging for ties
+        // reward(p) = 1.0 - 2.0 * (p - 1) / (n - 1)
+        for (&placement, players) in &placement_groups {
+            let group_size = players.len();
 
-            // Linear scale from +1 (1st place) to -1 (last place)
-            // reward = 1 - 2*(placement-1)/(n-1)
-            // For 4 players: 1st=+1, 2nd=+0.33, 3rd=-0.33, 4th=-1
-            if n > 1 {
-                rewards[player] = 1.0 - 2.0 * (placement as f32 - 1.0) / (n as f32 - 1.0);
-            } else {
-                rewards[player] = 0.0;
+            // Average the rewards for positions [placement, placement + group_size - 1]
+            let total_reward: f32 = (0..group_size)
+                .map(|offset| {
+                    let effective_placement = placement + offset;
+                    if n > 1 {
+                        1.0 - 2.0 * (effective_placement as f32 - 1.0) / (n as f32 - 1.0)
+                    } else {
+                        0.0
+                    }
+                })
+                .sum();
+            let avg_reward = total_reward / group_size as f32;
+
+            for &player in players {
+                rewards[player] = avg_reward;
             }
         }
 
@@ -355,7 +366,7 @@ impl Skull {
             // Small survival bonus for alive players
             for (p, reward) in rewards.iter_mut().enumerate().take(self.num_players) {
                 if self.is_alive(p) {
-                    *reward += self.reward_shaping_coef;
+                    *reward += 0.25 * self.reward_shaping_coef;
                 }
             }
             // Extra bonus/penalty for bidder
@@ -367,6 +378,73 @@ impl Skull {
         }
 
         rewards
+    }
+
+    /// Compute placements for all players using competition ranking (1224).
+    /// Returns Vec<usize> where index = player, value = placement (1-indexed).
+    ///
+    /// Ordering criteria (best to worst):
+    /// 1. Winner (always 1st)
+    /// 2. More wins
+    /// 3. More coasters remaining
+    /// 4. Later in elimination order (non-eliminated > eliminated)
+    fn compute_placements(&self) -> Vec<usize> {
+        let n = self.num_players;
+        let elim_len = self.elimination_order.len();
+
+        // Build sortable entries: (player_idx, is_winner, wins, coasters, elimination_rank)
+        // elimination_rank: higher = better
+        //   - Not eliminated: elim_len (highest possible)
+        //   - Eliminated: position in elimination_order (0 = first out = worst)
+        let mut entries: Vec<(usize, bool, usize, usize, usize)> = (0..n)
+            .map(|p| {
+                let is_winner = self.winner == Some(p);
+                let elim_rank =
+                    if let Some(pos) = self.elimination_order.iter().position(|&x| x == p) {
+                        pos // First eliminated (pos=0) = worst, later = better
+                    } else {
+                        elim_len // Not eliminated = best
+                    };
+                (p, is_winner, self.wins[p], self.coaster_count(p), elim_rank)
+            })
+            .collect();
+
+        // Sort by criteria (descending for all - higher is better)
+        entries.sort_by(|a, b| {
+            b.1.cmp(&a.1) // is_winner (true > false)
+                .then(b.2.cmp(&a.2)) // wins
+                .then(b.3.cmp(&a.3)) // coasters
+                .then(b.4.cmp(&a.4)) // elimination_rank
+        });
+
+        // Assign placements with competition ranking (1224)
+        let mut placements = vec![0; n];
+        let mut current_placement = 1;
+        let mut i = 0;
+
+        while i < n {
+            // Find all players tied with entries[i]
+            let mut j = i + 1;
+            while j < n
+                && entries[j].1 == entries[i].1
+                && entries[j].2 == entries[i].2
+                && entries[j].3 == entries[i].3
+                && entries[j].4 == entries[i].4
+            {
+                j += 1;
+            }
+
+            // All players from i to j-1 are tied, give them the same placement
+            for k in i..j {
+                placements[entries[k].0] = current_placement;
+            }
+
+            // Next placement skips the tied positions (competition ranking)
+            current_placement += j - i;
+            i = j;
+        }
+
+        placements
     }
 
     /// Encode current state as observation vector
@@ -601,6 +679,7 @@ impl Environment for Skull {
         self.bid_history.clear();
         self.roses_found = 0;
         self.must_reveal_own = false;
+        self.last_skull_owner = None;
         self.elimination_order.clear();
         self.game_over = false;
         self.winner = None;
@@ -718,6 +797,9 @@ impl Environment for Skull {
                 }
 
                 if is_skull {
+                    // Track whose skull was revealed (for determining next round starter if bidder is eliminated)
+                    self.last_skull_owner = Some(target);
+
                     // Bidder loses a coaster
                     self.lose_coaster(bidder);
                     rewards = self.calculate_round_rewards(false, bidder);
@@ -729,8 +811,21 @@ impl Environment for Skull {
                         self.winner = (0..self.num_players).find(|&p| self.is_alive(p));
                         rewards = self.calculate_final_rewards();
                     } else {
-                        // Loser starts next round
-                        self.start_new_round(bidder);
+                        // Determine next round starter based on rules:
+                        // - If bidder is still alive, they start next round
+                        // - If bidder is eliminated, the person whose skull was revealed becomes first player
+                        let next_starter = if self.is_alive(bidder) {
+                            bidder
+                        } else {
+                            // Bidder was eliminated - skull owner becomes first player
+                            // (if skull owner is also eliminated somehow, fall back to next alive)
+                            if self.is_alive(target) {
+                                target
+                            } else {
+                                self.next_alive_player(target)
+                            }
+                        };
+                        self.start_new_round(next_starter);
                     }
                 } else if self.roses_found >= self.current_bid {
                     // Success! Bidder gains a win
@@ -745,14 +840,6 @@ impl Environment for Skull {
                         // Game won!
                         self.game_over = true;
                         self.winner = Some(bidder);
-                        // Add remaining players to elimination order (in reverse of their coaster counts)
-                        let mut remaining: Vec<_> = (0..self.num_players)
-                            .filter(|&p| self.is_alive(p) && p != bidder)
-                            .collect();
-                        remaining.sort_by_key(|&p| self.coaster_count(p));
-                        for p in remaining {
-                            self.elimination_order.push(p);
-                        }
                         rewards = self.calculate_final_rewards();
                     } else {
                         // Winner starts next round
@@ -848,30 +935,7 @@ impl Environment for Skull {
         if !self.game_over {
             return None;
         }
-
-        // Build placements: 1 = first, 2 = second, etc.
-        // Use actual player count, not MAX_PLAYERS, to support variable player counts
-        let n = self.num_players;
-        let mut placements = vec![0; n];
-
-        // Winner gets 1st place
-        if let Some(winner) = self.winner {
-            placements[winner] = 1;
-        }
-
-        // Others get placement based on elimination order (first eliminated = last place)
-        for (order, &player) in self.elimination_order.iter().enumerate() {
-            placements[player] = n - order; // first eliminated = nth place
-        }
-
-        // Any remaining unplaced players (shouldn't happen) get middle placement
-        for placement in &mut placements {
-            if *placement == 0 {
-                *placement = n / 2 + 1;
-            }
-        }
-
-        Some(GameOutcome(placements))
+        Some(GameOutcome(self.compute_placements()))
     }
 
     fn render(&self) -> Option<String> {
@@ -1815,5 +1879,659 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Diagnostic test: Play many games with random agents to check for positional bias
+    /// This helps determine if seat bias is inherent to game implementation vs trained behavior
+    #[test]
+    fn test_positional_returns_with_random_agents() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let num_games = 10_000;
+        let mut returns_by_seat = [0.0f64; 4];
+        let mut wins_by_seat = [0u32; 4];
+        let mut first_player_counts = [0u32; 4];
+
+        for game_seed in 0..num_games {
+            let mut env = Skull::new_with_players(4, 0.0, game_seed);
+            env.reset();
+            let mut rng = StdRng::seed_from_u64(game_seed + 1_000_000);
+            let mut total_rewards = [0.0f32; 4];
+
+            // Track who starts the game
+            first_player_counts[env.current_player] += 1;
+
+            let mut steps = 0;
+            while !env.game_over && steps < 10000 {
+                let mask = env.action_mask().unwrap();
+                let valid: Vec<usize> = mask
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &v)| v)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if valid.is_empty() {
+                    break;
+                }
+
+                let action = valid[rng.gen_range(0..valid.len())];
+                let (_, rewards, _) = env.step(action);
+
+                for (i, &r) in rewards.iter().enumerate().take(4) {
+                    total_rewards[i] += r;
+                }
+                steps += 1;
+            }
+
+            // Record results
+            for i in 0..4 {
+                returns_by_seat[i] += f64::from(total_rewards[i]);
+            }
+            if let Some(winner) = env.winner {
+                wins_by_seat[winner] += 1;
+            }
+        }
+
+        // Report results
+        println!("\n=== Positional Baseline Test ({num_games} games) ===");
+        println!("First player distribution: {first_player_counts:?}");
+        println!("\nResults by seat:");
+        for i in 0..4 {
+            let avg_return = returns_by_seat[i] / num_games as f64;
+            let win_rate = f64::from(wins_by_seat[i]) / num_games as f64 * 100.0;
+            println!(
+                "  Seat {}: avg_return = {:.4}, wins = {} ({:.1}%)",
+                i, avg_return, wins_by_seat[i], win_rate
+            );
+        }
+
+        // Check for severe bias (warn but don't fail - this is diagnostic)
+        let max_return = returns_by_seat.iter().copied().fold(f64::MIN, f64::max);
+        let min_return = returns_by_seat.iter().copied().fold(f64::MAX, f64::min);
+        let spread = (max_return - min_return) / num_games as f64;
+
+        println!("\nSpread (max - min avg return): {spread:.4}");
+        if spread > 0.1 {
+            println!(
+                "WARNING: Large positional spread detected - may indicate game implementation bias"
+            );
+        }
+    }
+
+    /// Diagnostic test: Evaluate trained agent from each seat position against random opponents
+    /// This tests whether the agent learned position-specific strategies
+    ///
+    /// Run with: cargo test `test_trained_agent_by_position` --release -- --ignored --nocapture
+    #[test]
+    #[ignore = "Requires trained checkpoint - run manually"]
+    fn test_trained_agent_by_position() {
+        use burn::backend::NdArray;
+        use burn::prelude::*;
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::path::Path;
+
+        use crate::eval::load_model_from_checkpoint;
+        use crate::utils::{apply_action_mask, sample_categorical};
+
+        type B = NdArray<f32>;
+        let device = Default::default();
+
+        // Try to load checkpoint - skip test if not available
+        let checkpoint_path = Path::new("runs/skull_009/checkpoints/latest");
+        if !checkpoint_path.exists() {
+            println!("Checkpoint not found at {checkpoint_path:?}, skipping test");
+            return;
+        }
+
+        let (model, metadata, normalizer) =
+            match load_model_from_checkpoint::<B>(checkpoint_path, &device) {
+                Ok(result) => result,
+                Err(e) => {
+                    println!("Failed to load checkpoint: {e}, skipping test");
+                    return;
+                }
+            };
+
+        println!("\n=== Trained Agent Position Test ===");
+        println!("Loaded checkpoint: {checkpoint_path:?}");
+        println!(
+            "Model: {} hidden, {} layers",
+            metadata.hidden_size, metadata.num_hidden
+        );
+
+        let num_games = 1000;
+
+        for agent_seat in 0..4 {
+            let mut wins = 0u32;
+            let mut total_return = 0.0f64;
+
+            for game_seed in 0..num_games {
+                let mut env = Skull::new_with_players(4, 0.0, game_seed);
+                env.reset();
+                let mut rng = StdRng::seed_from_u64(game_seed + 1_000_000);
+                let mut agent_return = 0.0f32;
+
+                let mut steps = 0;
+                while !env.game_over && steps < 10000 {
+                    let current = env.current_player;
+
+                    let action = if current == agent_seat {
+                        // Use trained model
+                        let mut obs = env.get_observation();
+                        if let Some(ref norm) = normalizer {
+                            let obs_len = obs.len();
+                            norm.normalize_batch(&mut obs, obs_len);
+                        }
+                        let obs_tensor: Tensor<B, 2> =
+                            Tensor::<B, 1>::from_floats(obs.as_slice(), &device)
+                                .reshape([1, Skull::OBSERVATION_DIM]);
+
+                        let (logits, _) = model.forward(obs_tensor);
+
+                        // Apply action mask
+                        let mask = env.action_mask();
+                        let masked_logits = apply_action_mask(logits, mask);
+
+                        // Sample action
+                        let action_tensor = sample_categorical(masked_logits, &mut rng, &device);
+                        let action: i64 = action_tensor.into_scalar();
+                        usize::try_from(action).expect("action should be non-negative")
+                    } else {
+                        // Random action for other players
+                        let mask = env.action_mask().unwrap();
+                        let valid: Vec<usize> = mask
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, &v)| v)
+                            .map(|(i, _)| i)
+                            .collect();
+                        if valid.is_empty() {
+                            break;
+                        }
+                        valid[rng.gen_range(0..valid.len())]
+                    };
+
+                    let (_, rewards, _) = env.step(action);
+                    agent_return += rewards[agent_seat];
+                    steps += 1;
+                }
+
+                if env.winner == Some(agent_seat) {
+                    wins += 1;
+                }
+                total_return += f64::from(agent_return);
+            }
+
+            let win_rate = f64::from(wins) / num_games as f64 * 100.0;
+            let avg_return = total_return / num_games as f64;
+            println!(
+                "Agent at seat {agent_seat}: wins = {wins} ({win_rate:.1}%), avg_return = {avg_return:.4}"
+            );
+        }
+
+        println!("\nInterpretation:");
+        println!(
+            "- If wins are similar across seats: bias is in training metrics, not learned policy"
+        );
+        println!("- If agent wins more from seat 3: agent learned position-specific strategies");
+    }
+
+    // ============================================================================
+    // PLACEMENT AND TIE HANDLING TESTS
+    // ============================================================================
+
+    /// Helper to create a game state for testing placements
+    fn setup_test_game(
+        num_players: usize,
+        wins: &[usize],
+        coasters: &[(bool, usize)], // (has_trap, rose_count) per player
+        elimination_order: &[usize],
+        winner: Option<usize>,
+    ) -> Skull {
+        let mut env = Skull::new_with_players(num_players, 0.0, 42);
+        env.reset();
+
+        for (p, &w) in wins.iter().enumerate().take(num_players) {
+            env.wins[p] = w;
+        }
+        for (p, &(has_trap, roses)) in coasters.iter().enumerate().take(num_players) {
+            env.has_trap[p] = has_trap;
+            env.rose_count[p] = roses;
+        }
+        env.elimination_order = elimination_order.to_vec();
+        env.winner = winner;
+        env.game_over = true;
+
+        env
+    }
+
+    #[test]
+    fn test_placement_ordering_by_wins() {
+        // P0: winner (2 wins), 3 coasters
+        // P1: 1 win, 4 coasters (more coasters but fewer wins)
+        // P2: 0 wins, 4 coasters
+        // P3: 0 wins, 3 coasters
+        let env = setup_test_game(
+            4,
+            &[2, 1, 0, 0],
+            &[(true, 2), (true, 3), (true, 3), (true, 2)], // 3, 4, 4, 3 coasters
+            &[],
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[1], 2, "1 win should be 2nd");
+        assert_eq!(placements[2], 3, "0 wins, 4 coasters should be 3rd");
+        assert_eq!(placements[3], 4, "0 wins, 3 coasters should be 4th");
+    }
+
+    #[test]
+    fn test_placement_ordering_by_coasters() {
+        // P0: winner (2 wins), 4 coasters
+        // P1: 0 wins, 4 coasters
+        // P2: 0 wins, 3 coasters
+        // P3: 0 wins, 2 coasters
+        let env = setup_test_game(
+            4,
+            &[2, 0, 0, 0],
+            &[(true, 3), (true, 3), (true, 2), (true, 1)], // 4, 4, 3, 2 coasters
+            &[],
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[1], 2, "4 coasters should be 2nd");
+        assert_eq!(placements[2], 3, "3 coasters should be 3rd");
+        assert_eq!(placements[3], 4, "2 coasters should be 4th");
+    }
+
+    #[test]
+    fn test_placement_ordering_by_elimination() {
+        // P0: winner, 4 coasters
+        // P1: 0 wins, 0 coasters (eliminated 2nd)
+        // P2: 0 wins, 0 coasters (eliminated 1st - worst)
+        // P3: 0 wins, 0 coasters (not eliminated - best among non-winners)
+        let env = setup_test_game(
+            4,
+            &[2, 0, 0, 0],
+            &[(true, 3), (false, 0), (false, 0), (false, 0)],
+            &[2, 1], // P2 first out, P1 second out
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[3], 2, "Not eliminated should be 2nd");
+        assert_eq!(placements[1], 3, "Eliminated 2nd should be 3rd");
+        assert_eq!(placements[2], 4, "Eliminated 1st should be 4th");
+    }
+
+    #[test]
+    fn test_true_tie_same_placement() {
+        // P0: winner (2 wins), 4 coasters
+        // P1: 0 wins, 4 coasters, not eliminated
+        // P2: 0 wins, 4 coasters, not eliminated (true tie with P1)
+        // P3: 0 wins, 3 coasters
+        let env = setup_test_game(
+            4,
+            &[2, 0, 0, 0],
+            &[(true, 3), (true, 3), (true, 3), (true, 2)], // 4, 4, 4, 3 coasters
+            &[],
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[1], 2, "P1 should tie for 2nd");
+        assert_eq!(placements[2], 2, "P2 should tie for 2nd");
+        assert_eq!(placements[3], 4, "P3 should be 4th (skip 3)");
+    }
+
+    #[test]
+    fn test_true_tie_rewards_split() {
+        // Same setup as test_true_tie_same_placement
+        let env = setup_test_game(
+            4,
+            &[2, 0, 0, 0],
+            &[(true, 3), (true, 3), (true, 3), (true, 2)],
+            &[],
+            Some(0),
+        );
+
+        let rewards = env.calculate_final_rewards();
+
+        // P0: +1.0 (winner)
+        assert!((rewards[0] - 1.0).abs() < 0.001, "Winner should get +1.0");
+
+        // P1 and P2 should have same reward (avg of 2nd and 3rd place)
+        // 2nd place: 1 - 2*(2-1)/(4-1) = 1 - 2/3 = 0.333
+        // 3rd place: 1 - 2*(3-1)/(4-1) = 1 - 4/3 = -0.333
+        // Average: 0.0
+        assert!(
+            (rewards[1] - rewards[2]).abs() < 0.001,
+            "Tied players should have equal rewards"
+        );
+        assert!(
+            rewards[1].abs() < 0.001,
+            "P1 should get ~0.0 (avg of +0.33 and -0.33)"
+        );
+
+        // P3: -1.0 (4th place)
+        assert!(
+            (rewards[3] - (-1.0)).abs() < 0.001,
+            "P3 should get -1.0 (4th place)"
+        );
+
+        // Verify zero-sum
+        let sum: f32 = rewards.iter().sum();
+        assert!(sum.abs() < 0.001, "Rewards should sum to 0, got {sum}");
+    }
+
+    #[test]
+    fn test_three_way_tie() {
+        // P0: winner
+        // P1, P2, P3: all 0 wins, 4 coasters, not eliminated
+        let env = setup_test_game(
+            4,
+            &[2, 0, 0, 0],
+            &[(true, 3), (true, 3), (true, 3), (true, 3)], // all 4 coasters
+            &[],
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[1], 2, "P1 should tie for 2nd");
+        assert_eq!(placements[2], 2, "P2 should tie for 2nd");
+        assert_eq!(placements[3], 2, "P3 should tie for 2nd");
+
+        let rewards = env.calculate_final_rewards();
+        // P0: +1.0
+        assert!((rewards[0] - 1.0).abs() < 0.001, "Winner should get +1.0");
+
+        // P1/P2/P3: avg(+0.33, -0.33, -1.0) = -0.33 each
+        let expected_tied_reward = (1.0 / 3.0 - 1.0 / 3.0 - 1.0) / 3.0; // -0.333...
+        for (p, reward) in rewards.iter().enumerate().skip(1).take(3) {
+            assert!(
+                (reward - expected_tied_reward).abs() < 0.001,
+                "P{p} should get {expected_tied_reward}, got {reward}"
+            );
+        }
+
+        // Verify zero-sum
+        let sum: f32 = rewards.iter().sum();
+        assert!(sum.abs() < 0.001, "Rewards should sum to 0, got {sum}");
+    }
+
+    #[test]
+    fn test_elimination_beats_non_elimination() {
+        // P0: winner
+        // P1: 0 wins, 2 coasters, not eliminated
+        // P2: 0 wins, 0 coasters, eliminated (even though had coasters before)
+        // P3: 0 wins, 4 coasters, not eliminated
+        let env = setup_test_game(
+            4,
+            &[2, 0, 0, 0],
+            &[(true, 3), (true, 1), (false, 0), (true, 3)], // 4, 2, 0, 4 coasters
+            &[2],                                           // Only P2 eliminated
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[3], 2, "P3 (4 coasters, not elim) should be 2nd");
+        assert_eq!(placements[1], 3, "P1 (2 coasters, not elim) should be 3rd");
+        assert_eq!(placements[2], 4, "P2 (eliminated) should be 4th");
+    }
+
+    #[test]
+    fn test_game_outcome_matches_rewards() {
+        // Test that game_outcome placements align with reward ordering
+        let env = setup_test_game(
+            4,
+            &[2, 1, 0, 0],
+            &[(true, 3), (true, 2), (true, 3), (true, 1)],
+            &[3], // P3 eliminated
+            Some(0),
+        );
+
+        let outcome = env.game_outcome().unwrap();
+        let rewards = env.calculate_final_rewards();
+
+        // Lower placement = higher reward
+        for i in 0..4 {
+            for j in 0..4 {
+                if outcome.0[i] < outcome.0[j] {
+                    assert!(
+                        rewards[i] >= rewards[j],
+                        "P{i} (placement {}) should have >= reward than P{j} (placement {})",
+                        outcome.0[i],
+                        outcome.0[j]
+                    );
+                } else if outcome.0[i] == outcome.0[j] {
+                    assert!(
+                        (rewards[i] - rewards[j]).abs() < 0.001,
+                        "Tied players should have equal rewards"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_two_player_game_placements() {
+        let env = setup_test_game(2, &[2, 0], &[(true, 3), (true, 3)], &[], Some(0));
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[1], 2, "Loser should be 2nd");
+
+        let rewards = env.calculate_final_rewards();
+        assert!((rewards[0] - 1.0).abs() < 0.001, "Winner gets +1.0");
+        assert!((rewards[1] - (-1.0)).abs() < 0.001, "Loser gets -1.0");
+
+        let sum: f32 = rewards.iter().sum();
+        assert!(sum.abs() < 0.001, "Rewards should sum to 0");
+    }
+
+    #[test]
+    fn test_six_player_game_placements() {
+        // 6 players with various states
+        let env = setup_test_game(
+            6,
+            &[2, 1, 1, 0, 0, 0],
+            &[
+                (true, 3),  // P0: 4 coasters
+                (true, 2),  // P1: 3 coasters
+                (true, 3),  // P2: 4 coasters (ties with P1 on wins but more coasters)
+                (true, 3),  // P3: 4 coasters
+                (true, 2),  // P4: 3 coasters
+                (false, 0), // P5: 0 coasters (eliminated)
+            ],
+            &[5],
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner should be 1st");
+        assert_eq!(placements[2], 2, "P2 (1 win, 4 coasters) should be 2nd");
+        assert_eq!(placements[1], 3, "P1 (1 win, 3 coasters) should be 3rd");
+        // P3, P4 have 0 wins but different coasters
+        assert_eq!(placements[3], 4, "P3 (0 wins, 4 coasters) should be 4th");
+        assert_eq!(placements[4], 5, "P4 (0 wins, 3 coasters) should be 5th");
+        assert_eq!(placements[5], 6, "P5 (eliminated) should be 6th");
+
+        let rewards = env.calculate_final_rewards();
+        let sum: f32 = rewards.iter().sum();
+        assert!(sum.abs() < 0.001, "Rewards should sum to 0, got {sum}");
+    }
+
+    #[test]
+    fn test_zero_sum_with_various_ties() {
+        // Test multiple tie configurations
+        let test_cases = [
+            // (wins, coasters, elimination_order, winner)
+            (
+                vec![2, 0, 0, 0],
+                vec![(true, 3), (true, 3), (true, 3), (true, 3)],
+                vec![],
+                Some(0),
+            ), // 3-way tie for 2nd
+            (
+                vec![2, 1, 1, 0],
+                vec![(true, 3), (true, 2), (true, 2), (true, 1)],
+                vec![],
+                Some(0),
+            ), // 2-way tie for 2nd
+            (
+                vec![2, 0, 0, 0],
+                vec![(true, 3), (true, 2), (true, 2), (true, 2)],
+                vec![],
+                Some(0),
+            ), // 3-way tie for 2nd (same coasters)
+            (
+                vec![2, 0, 0, 0],
+                vec![(true, 3), (false, 0), (false, 0), (false, 0)],
+                vec![1, 2],
+                Some(0),
+            ), // eliminations with tie
+        ];
+
+        for (i, (wins, coasters, elim, winner)) in test_cases.iter().enumerate() {
+            let env = setup_test_game(4, wins, coasters, elim, *winner);
+            let rewards = env.calculate_final_rewards();
+            let sum: f32 = rewards.iter().sum();
+            assert!(
+                sum.abs() < 0.001,
+                "Test case {i}: Rewards should sum to 0, got {sum}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_random_games_zero_sum_and_valid_placements() {
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let num_games = 1000;
+
+        for game_seed in 0..num_games {
+            let mut env = Skull::new_with_players(4, 0.0, game_seed);
+            env.reset();
+            let mut rng = StdRng::seed_from_u64(game_seed + 1_000_000);
+            let mut total_rewards = [0.0f32; 4];
+
+            let mut steps = 0;
+            while !env.game_over && steps < 10000 {
+                let mask = env.action_mask().unwrap();
+                let valid: Vec<usize> = mask
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &v)| v)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if valid.is_empty() {
+                    break;
+                }
+
+                let action = valid[rng.gen_range(0..valid.len())];
+                let (_, rewards, _) = env.step(action);
+
+                for (i, &r) in rewards.iter().enumerate().take(4) {
+                    total_rewards[i] += r;
+                }
+                steps += 1;
+            }
+
+            if env.game_over {
+                // Verify zero-sum
+                let sum: f32 = total_rewards.iter().sum();
+                assert!(
+                    sum.abs() < 0.01,
+                    "Game {game_seed}: Rewards should sum to ~0, got {sum}"
+                );
+
+                // Verify valid placements
+                let outcome = env.game_outcome().unwrap();
+                let placements = &outcome.0;
+
+                // All placements should be 1-4
+                for (p, &placement) in placements.iter().enumerate() {
+                    assert!(
+                        (1..=4).contains(&placement),
+                        "Game {game_seed}: P{p} has invalid placement {placement}"
+                    );
+                }
+
+                // Competition ranking: if placement is k, then k-1 players have better placement
+                for (p, &placement) in placements.iter().enumerate() {
+                    let better_count = placements.iter().filter(|&&pl| pl < placement).count();
+                    assert!(
+                        better_count < placement,
+                        "Game {game_seed}: P{p} placement {placement} inconsistent with competition ranking"
+                    );
+                }
+
+                // Winner should have placement 1
+                if let Some(winner) = env.winner {
+                    assert_eq!(
+                        placements[winner], 1,
+                        "Game {game_seed}: Winner P{winner} should have placement 1"
+                    );
+                }
+
+                // Verify game_outcome matches reward ordering
+                let rewards = env.calculate_final_rewards();
+                for i in 0..4 {
+                    for j in 0..4 {
+                        if placements[i] < placements[j] {
+                            assert!(
+                                rewards[i] >= rewards[j] - 0.001,
+                                "Game {game_seed}: P{i} (pl {}) should have >= reward than P{j} (pl {})",
+                                placements[i], placements[j]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_wins_beats_coasters_beats_elimination() {
+        // Comprehensive test: P1 has 1 win but only 2 coasters
+        // P2 has 0 wins but 4 coasters
+        // P3 has 0 wins, 3 coasters but is eliminated
+        // Ordering: P0 (winner) > P1 (wins) > P2 (coasters) > P3 (eliminated)
+        let env = setup_test_game(
+            4,
+            &[2, 1, 0, 0],
+            &[(true, 3), (true, 1), (true, 3), (false, 0)],
+            &[3], // P3 eliminated
+            Some(0),
+        );
+
+        let placements = env.compute_placements();
+        assert_eq!(placements[0], 1, "Winner beats all");
+        assert_eq!(
+            placements[1], 2,
+            "1 win beats 0 wins even with fewer coasters"
+        );
+        assert_eq!(placements[2], 3, "Not eliminated beats eliminated");
+        assert_eq!(placements[3], 4, "Eliminated is last");
+
+        let rewards = env.calculate_final_rewards();
+        assert!(rewards[0] > rewards[1], "Winner reward > P1 reward");
+        assert!(rewards[1] > rewards[2], "P1 reward > P2 reward");
+        assert!(rewards[2] > rewards[3], "P2 reward > P3 reward");
+
+        let sum: f32 = rewards.iter().sum();
+        assert!(sum.abs() < 0.001, "Zero-sum: got {sum}");
     }
 }
