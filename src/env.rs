@@ -130,6 +130,12 @@ pub trait Environment: Send + Sync + Sized + 'static {
     fn active_player_count(&self) -> usize {
         Self::NUM_PLAYERS
     }
+
+    /// Set the current global training step for schedulable parameters.
+    /// Default no-op for environments that don't use step-dependent parameters.
+    fn set_step(&mut self, _step: u64) {
+        // Default: no-op
+    }
 }
 
 /// Episode statistics for completed episodes
@@ -283,6 +289,13 @@ impl<E: Environment> VecEnv<E> {
         }
         self.episode_lengths.fill(0);
         self.terminal.fill(false);
+    }
+
+    /// Set global step on all environments (for schedulable parameters)
+    pub fn set_step(&mut self, step: u64) {
+        for env in &mut self.envs {
+            env.set_step(step);
+        }
     }
 
     /// Get current observations as flat array [`num_envs` * `obs_dim`]

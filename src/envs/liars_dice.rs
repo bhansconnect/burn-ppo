@@ -4,6 +4,7 @@
 /// Features hidden information, wild 1s, and elimination-based gameplay.
 use crate::env::{Environment, GameOutcome};
 use crate::profile::profile_function;
+use crate::schedule::Schedule;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::VecDeque;
@@ -142,12 +143,14 @@ pub struct LiarsDice {
     /// Random number generator
     rng: StdRng,
     /// Reward shaping coefficient (per-round survival bonus)
-    reward_shaping_coef: f32,
+    reward_shaping_coef: Schedule,
+    /// Current global training step for schedule evaluation
+    current_step: u64,
 }
 
 impl LiarsDice {
     /// Create with custom reward shaping coefficient
-    pub fn new_with_config(seed: u64, reward_shaping_coef: f32) -> Self {
+    pub fn new_with_config(seed: u64, reward_shaping_coef: Schedule) -> Self {
         let mut env = Self {
             dice: [[0; DICE_PER_PLAYER]; NUM_PLAYERS],
             dice_count: [DICE_PER_PLAYER; NUM_PLAYERS],
@@ -160,6 +163,7 @@ impl LiarsDice {
             game_over: false,
             rng: StdRng::seed_from_u64(seed),
             reward_shaping_coef,
+            current_step: 0,
         };
         env.roll_all_dice();
         env
@@ -432,7 +436,7 @@ impl Environment for LiarsDice {
     const EVAL_TEMP: f32 = 1.0; // Stochastic play essential for bluffing
 
     fn new(seed: u64) -> Self {
-        Self::new_with_config(seed, 0.0) // Default: no reward shaping
+        Self::new_with_config(seed, Schedule::constant(0.0)) // Default: no reward shaping
     }
 
     fn reset(&mut self) -> Vec<f32> {
@@ -505,7 +509,7 @@ impl Environment for LiarsDice {
                 // Survival shaping during game
                 for (p, reward) in rewards.iter_mut().enumerate() {
                     if self.dice_count[p] > 0 {
-                        *reward += self.reward_shaping_coef;
+                        *reward += self.reward_shaping_coef.get(self.current_step) as f32;
                     }
                 }
                 // Final placement rewards at game end
@@ -603,6 +607,10 @@ impl Environment for LiarsDice {
         }
 
         Err("Enter 'N Fs' (e.g., '3 4s') or 'call'".to_string())
+    }
+
+    fn set_step(&mut self, step: u64) {
+        self.current_step = step;
     }
 }
 
@@ -1255,7 +1263,7 @@ mod tests {
     #[test]
     fn test_two_player_endgame() {
         // Test placement-based rewards at game end
-        let mut env = LiarsDice::new_with_config(42, 0.0);
+        let mut env = LiarsDice::new_with_config(42, Schedule::constant(0.0));
         env.reset();
 
         // Eliminate P0 and P1
@@ -1375,7 +1383,7 @@ mod tests {
     #[test]
     fn test_reward_shaping() {
         // Test with non-zero reward shaping coefficient
-        let mut env = LiarsDice::new_with_config(42, 0.05);
+        let mut env = LiarsDice::new_with_config(42, Schedule::constant(0.05));
         env.reset();
 
         // Set up known dice: all players have [2, 2]
@@ -1400,7 +1408,7 @@ mod tests {
     fn test_mid_game_elimination() {
         // Test placement rewards: mid-game eliminations give no immediate reward
         // (only survival shaping if enabled, final rewards at game end)
-        let mut env = LiarsDice::new_with_config(42, 0.0);
+        let mut env = LiarsDice::new_with_config(42, Schedule::constant(0.0));
         env.reset();
 
         // Set P0 to 1 die so they'll be eliminated

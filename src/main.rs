@@ -681,9 +681,15 @@ where
             (config.entropy_coef.get(global_step as u64), 0.0)
         };
 
+        // Reward shaping coefficient from schedule (uses absolute timesteps)
+        let reward_shaping_coef = config.reward_shaping_coef.get(global_step as u64);
+
         // Collect rollouts using non-autodiff model for inference
         let rollout_start = std::time::Instant::now();
         let inference_model = model.valid();
+
+        // Set current step on all environments for schedulable parameters
+        vec_env.set_step(global_step as u64);
 
         // Use opponent pool collection if pool is active with opponents
         let use_opponent_pool = opponent_pool
@@ -963,6 +969,11 @@ where
             logger.log_scalar("train/approx_kl", metrics.approx_kl, global_step)?;
             logger.log_scalar("train/clip_fraction", metrics.clip_fraction, global_step)?;
             logger.log_scalar("train/learning_rate", lr as f32, global_step)?;
+            logger.log_scalar(
+                "train/reward_shaping_coef",
+                reward_shaping_coef as f32,
+                global_step,
+            )?;
             logger.log_scalar(
                 "train/explained_variance",
                 metrics.explained_variance,
@@ -1876,7 +1887,7 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                 None, // Fixed 2 players
             ),
             "liars_dice" => {
-                let reward_shaping_coef = config.reward_shaping_coef;
+                let reward_shaping_coef = config.reward_shaping_coef.clone();
                 run_training::<TB, LiarsDice, _>(
                     &mode,
                     &config,
@@ -1886,12 +1897,14 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                     &running,
                     elapsed_time_offset_ms,
                     max_checkpoints_this_run,
-                    move |i| LiarsDice::new_with_config(seed + i as u64, reward_shaping_coef),
+                    move |i| {
+                        LiarsDice::new_with_config(seed + i as u64, reward_shaping_coef.clone())
+                    },
                     None, // Fixed 2 players
                 )
             }
             "skull" => {
-                let reward_shaping_coef = config.reward_shaping_coef;
+                let reward_shaping_coef = config.reward_shaping_coef.clone();
                 let player_count = config.player_count.get_fixed_count();
                 run_training::<TB, Skull, _>(
                     &mode,
@@ -1903,7 +1916,11 @@ fn run_training_cli(args: &CliArgs) -> Result<()> {
                     elapsed_time_offset_ms,
                     max_checkpoints_this_run,
                     move |i| {
-                        Skull::new_with_players(player_count, reward_shaping_coef, seed + i as u64)
+                        Skull::new_with_players(
+                            player_count,
+                            reward_shaping_coef.clone(),
+                            seed + i as u64,
+                        )
                     },
                     Some(player_count), // Variable player count from config
                 )

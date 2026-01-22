@@ -4,6 +4,7 @@
 /// bid on how many they can reveal without hitting a skull, then reveal.
 /// Features hidden information, bidder's choice reveal, and elimination-based gameplay.
 use crate::env::{Environment, GameOutcome};
+use crate::schedule::Schedule;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::VecDeque;
@@ -89,7 +90,8 @@ struct BidEntry {
 pub struct Skull {
     // Configuration
     num_players: usize,
-    reward_shaping_coef: f32,
+    reward_shaping_coef: Schedule,
+    current_step: u64,
 
     // Per-player persistent state (across rounds)
     has_trap: [bool; MAX_PLAYERS],    // still has skull coaster
@@ -125,7 +127,7 @@ pub struct Skull {
 
 impl Skull {
     /// Create a new Skull game with specified player count
-    pub fn new_with_players(num_players: usize, reward_shaping_coef: f32, seed: u64) -> Self {
+    pub fn new_with_players(num_players: usize, reward_shaping_coef: Schedule, seed: u64) -> Self {
         assert!(
             (2..=MAX_PLAYERS).contains(&num_players),
             "Player count must be 2-6"
@@ -134,6 +136,7 @@ impl Skull {
         let mut game = Self {
             num_players,
             reward_shaping_coef,
+            current_step: 0,
             has_trap: [true; MAX_PLAYERS],
             rose_count: [ROSES_PER_PLAYER; MAX_PLAYERS],
             wins: [0; MAX_PLAYERS],
@@ -361,19 +364,16 @@ impl Skull {
     /// Calculate reward shaping for round end (if enabled)
     fn calculate_round_rewards(&self, success: bool, bidder: usize) -> Vec<f32> {
         let mut rewards = vec![0.0; self.num_players];
+        let rsc = self.reward_shaping_coef.get(self.current_step) as f32;
 
-        if self.reward_shaping_coef > 0.0 {
-            // Small survival bonus for alive players
-            for (p, reward) in rewards.iter_mut().enumerate().take(self.num_players) {
-                if self.is_alive(p) {
-                    *reward += 0.25 * self.reward_shaping_coef;
-                }
-            }
+        if rsc > 0.0 {
             // Extra bonus/penalty for bidder
             if success {
-                rewards[bidder] += self.reward_shaping_coef;
+                // Full value for getting half way to winning.
+                rewards[bidder] += rsc;
             } else {
-                rewards[bidder] -= self.reward_shaping_coef;
+                // Scale pain based on number of cards players have total.
+                rewards[bidder] -= 1.0 / CARDS_PER_PLAYER as f32 * rsc;
             }
         }
 
@@ -652,7 +652,7 @@ impl Environment for Skull {
 
     fn new(seed: u64) -> Self {
         // Default to 4 players
-        Self::new_with_players(4, 0.0, seed)
+        Self::new_with_players(4, Schedule::constant(0.0), seed)
     }
 
     fn reset(&mut self) -> Vec<f32> {
@@ -1068,6 +1068,10 @@ impl Environment for Skull {
     fn active_player_count(&self) -> usize {
         self.num_players
     }
+
+    fn set_step(&mut self, step: u64) {
+        self.current_step = step;
+    }
 }
 
 #[cfg(test)]
@@ -1101,7 +1105,7 @@ mod tests {
 
     #[test]
     fn test_new_game_initial_state() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // All 4 players should have 4 coasters
@@ -1128,7 +1132,7 @@ mod tests {
     #[test]
     fn test_relative_observation_symmetry() {
         // Verify that relative index 0 always contains current player's data
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Set up known state with different data for each player
@@ -1169,7 +1173,7 @@ mod tests {
 
     #[test]
     fn test_placing_phase_action_mask_full_hand() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         let mask = env.action_mask().unwrap();
@@ -1187,7 +1191,7 @@ mod tests {
 
     #[test]
     fn test_placing_phase_action_mask_no_skull() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Place skull
@@ -1207,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_placing_phase_action_mask_no_roses() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         let player = env.current_player;
@@ -1235,7 +1239,7 @@ mod tests {
 
     #[test]
     fn test_placing_phase_can_bid_with_card() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Place a card
@@ -1256,7 +1260,7 @@ mod tests {
 
     #[test]
     fn test_placing_advances_to_next_player() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         let first_player = env.current_player;
@@ -1270,7 +1274,7 @@ mod tests {
 
     #[test]
     fn test_bidding_phase_action_mask() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // All players place a card
@@ -1296,7 +1300,7 @@ mod tests {
 
     #[test]
     fn test_bidding_raises_bid() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         for _ in 0..4 {
@@ -1316,7 +1320,7 @@ mod tests {
 
     #[test]
     fn test_bidding_pass_marks_player() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         for _ in 0..4 {
@@ -1335,7 +1339,7 @@ mod tests {
 
     #[test]
     fn test_bidding_max_bid_triggers_reveal() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Each player places 1 card = 4 total
@@ -1355,7 +1359,7 @@ mod tests {
 
     #[test]
     fn test_bidding_all_pass_triggers_reveal() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         for _ in 0..4 {
@@ -1376,7 +1380,7 @@ mod tests {
 
     #[test]
     fn test_revealing_must_reveal_own_first() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         for _ in 0..4 {
@@ -1405,7 +1409,7 @@ mod tests {
 
     #[test]
     fn test_revealing_can_choose_opponent_after_own() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         for _ in 0..4 {
@@ -1433,7 +1437,7 @@ mod tests {
 
     #[test]
     fn test_revealing_skull_ends_round() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Player 0 places skull
@@ -1461,7 +1465,7 @@ mod tests {
 
     #[test]
     fn test_revealing_success_grants_win() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // All place roses
@@ -1486,7 +1490,7 @@ mod tests {
 
     #[test]
     fn test_two_wins_ends_game() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
         env.current_player = 0;
         env.wins[0] = 1;
@@ -1511,7 +1515,7 @@ mod tests {
 
     #[test]
     fn test_last_player_standing_wins() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Eliminate players 1, 2, 3
@@ -1537,7 +1541,7 @@ mod tests {
 
     #[test]
     fn test_elimination_when_no_coasters() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Give P0 only 1 coaster
@@ -1563,7 +1567,7 @@ mod tests {
 
     #[test]
     fn test_two_player_game() {
-        let mut env = Skull::new_with_players(2, 0.0, 42);
+        let mut env = Skull::new_with_players(2, Schedule::constant(0.0), 42);
         env.reset();
 
         assert_eq!(env.num_players, 2);
@@ -1585,7 +1589,7 @@ mod tests {
 
     #[test]
     fn test_six_player_game() {
-        let mut env = Skull::new_with_players(6, 0.0, 42);
+        let mut env = Skull::new_with_players(6, Schedule::constant(0.0), 42);
         env.reset();
 
         for p in 0..6 {
@@ -1596,8 +1600,8 @@ mod tests {
 
     #[test]
     fn test_deterministic_seeding() {
-        let mut env1 = Skull::new_with_players(4, 0.0, 12345);
-        let mut env2 = Skull::new_with_players(4, 0.0, 12345);
+        let mut env1 = Skull::new_with_players(4, Schedule::constant(0.0), 12345);
+        let mut env2 = Skull::new_with_players(4, Schedule::constant(0.0), 12345);
 
         env1.reset();
         env2.reset();
@@ -1619,7 +1623,7 @@ mod tests {
 
     #[test]
     fn test_invalid_action_handling() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Invalid action index
@@ -1629,7 +1633,7 @@ mod tests {
 
     #[test]
     fn test_action_after_game_over() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
         env.game_over = true;
 
@@ -1640,7 +1644,7 @@ mod tests {
 
     #[test]
     fn test_reward_shaping_coefficient() {
-        let mut env = Skull::new_with_players(4, 0.1, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.1), 42);
         env.reset();
 
         // Set up and complete a round with skull reveal
@@ -1669,7 +1673,7 @@ mod tests {
 
     #[test]
     fn test_zero_sum_rewards() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Play a complete game
@@ -1700,7 +1704,7 @@ mod tests {
             }
         }
 
-        if done && env.reward_shaping_coef == 0.0 {
+        if done && env.reward_shaping_coef.get(0) == 0.0 {
             let sum: f32 = total_rewards[..env.num_players].iter().sum();
             assert!(
                 sum.abs() < 0.01,
@@ -1711,7 +1715,7 @@ mod tests {
 
     #[test]
     fn test_player_exists_flags_in_observation() {
-        let mut env = Skull::new_with_players(3, 0.0, 42);
+        let mut env = Skull::new_with_players(3, Schedule::constant(0.0), 42);
         env.reset();
         let obs = env.get_observation();
 
@@ -1731,7 +1735,7 @@ mod tests {
 
     #[test]
     fn test_bid_history_encoding() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         for _ in 0..4 {
@@ -1755,7 +1759,7 @@ mod tests {
 
     #[test]
     fn test_phase_one_hot_encoding() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         let obs = env.get_observation();
@@ -1779,7 +1783,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         for seed in 0..100 {
-            let mut env = Skull::new_with_players(4, 0.0, seed);
+            let mut env = Skull::new_with_players(4, Schedule::constant(0.0), seed);
             env.reset();
 
             let mut steps = 0;
@@ -1828,7 +1832,7 @@ mod tests {
 
     #[test]
     fn test_render_output_valid() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         let render = env.render();
@@ -1841,7 +1845,7 @@ mod tests {
 
     #[test]
     fn test_game_outcome_placements_valid() {
-        let mut env = Skull::new_with_players(4, 0.0, 42);
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
         // Play until game over
@@ -1894,7 +1898,7 @@ mod tests {
         let mut first_player_counts = [0u32; 4];
 
         for game_seed in 0..num_games {
-            let mut env = Skull::new_with_players(4, 0.0, game_seed);
+            let mut env = Skull::new_with_players(4, Schedule::constant(0.0), game_seed);
             env.reset();
             let mut rng = StdRng::seed_from_u64(game_seed + 1_000_000);
             let mut total_rewards = [0.0f32; 4];
@@ -2009,7 +2013,7 @@ mod tests {
             let mut total_return = 0.0f64;
 
             for game_seed in 0..num_games {
-                let mut env = Skull::new_with_players(4, 0.0, game_seed);
+                let mut env = Skull::new_with_players(4, Schedule::constant(0.0), game_seed);
                 env.reset();
                 let mut rng = StdRng::seed_from_u64(game_seed + 1_000_000);
                 let mut agent_return = 0.0f32;
@@ -2091,7 +2095,7 @@ mod tests {
         elimination_order: &[usize],
         winner: Option<usize>,
     ) -> Skull {
-        let mut env = Skull::new_with_players(num_players, 0.0, 42);
+        let mut env = Skull::new_with_players(num_players, Schedule::constant(0.0), 42);
         env.reset();
 
         for (p, &w) in wins.iter().enumerate().take(num_players) {
@@ -2421,7 +2425,7 @@ mod tests {
         let num_games = 1000;
 
         for game_seed in 0..num_games {
-            let mut env = Skull::new_with_players(4, 0.0, game_seed);
+            let mut env = Skull::new_with_players(4, Schedule::constant(0.0), game_seed);
             env.reset();
             let mut rng = StdRng::seed_from_u64(game_seed + 1_000_000);
             let mut total_rewards = [0.0f32; 4];

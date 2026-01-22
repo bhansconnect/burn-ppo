@@ -173,8 +173,9 @@ pub struct TrainArgs {
     pub num_steps: Option<usize>,
 
     /// Reward shaping coefficient for dense rewards (default: 0.0)
+    /// Can be static value or schedule (e.g., '0.1' or '0.1@0,0.05@30M')
     #[arg(long)]
-    pub reward_shaping_coef: Option<f32>,
+    pub reward_shaping_coef: Option<String>,
 
     #[arg(long, help = "Discount factor (default: 0.99)")]
     pub gamma: Option<f64>,
@@ -730,8 +731,9 @@ pub struct Config {
     /// - Skull: per-round survival/challenge bonus.
     ///
     /// Set to 0.0 for pure zero-sum/sparse rewards.
+    /// Can be static value or schedule: `0.1` or `[[0.1, 0], [0.05, 30_000_000]]`
     #[serde(default = "default_reward_shaping_coef")]
-    pub reward_shaping_coef: f32,
+    pub reward_shaping_coef: Schedule,
 
     /// Player count mode for games supporting variable player counts (e.g., Skull).
     /// Only used by environments that support variable player counts.
@@ -889,8 +891,8 @@ pub struct Config {
 const fn default_num_steps() -> usize {
     128
 }
-const fn default_reward_shaping_coef() -> f32 {
-    0.0 // Pure zero-sum by default
+fn default_reward_shaping_coef() -> Schedule {
+    Schedule::constant(0.0) // Pure zero-sum by default
 }
 fn default_learning_rate() -> Schedule {
     Schedule::constant(2.5e-4)
@@ -1121,8 +1123,11 @@ impl Config {
         if let Some(n) = args.num_envs {
             self.num_envs = NumEnvs::Explicit(n);
         }
-        if let Some(v) = args.reward_shaping_coef {
-            self.reward_shaping_coef = v;
+        if let Some(ref v) = args.reward_shaping_coef {
+            match Schedule::parse_cli(v) {
+                Ok(s) => self.reward_shaping_coef = s,
+                Err(e) => eprintln!("Warning: invalid --reward-shaping-coef '{v}': {e}"),
+            }
         }
 
         // PPO hyperparameters
@@ -1465,6 +1470,13 @@ impl Config {
             bail!(
                 "entropy_coef must be >= 0 (initial value: {})",
                 self.entropy_coef.initial_value()
+            );
+        }
+        // Validate reward_shaping_coef schedule has non-negative initial value
+        if self.reward_shaping_coef.initial_value() < 0.0 {
+            bail!(
+                "reward_shaping_coef must be >= 0 (initial value: {})",
+                self.reward_shaping_coef.initial_value()
             );
         }
 
