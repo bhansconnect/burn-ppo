@@ -1,0 +1,62 @@
+# PPO configuration for Skull with CTDE (Centralized Training, Decentralized Execution)
+#
+# CTDE Architecture:
+# - Actor (policy) network sees only local observations (135 dims)
+# - Critic (value) network sees global game state (200 dims) with privileged information
+# - Actor is small and fast for deployment, critic can be larger for training
+#
+# When to use CTDE:
+# ✓ Multi-agent games with hidden information (poker, bluffing games)
+# ✓ Games where global state helps value estimation
+# ✓ Competitive games requiring decentralized execution
+#
+# See docs/CTDE.md for detailed guide.
+
+env = "skull"
+num_envs = 128
+num_steps = 128
+
+# === CTDE Network Configuration ===
+network_type = "ctde"
+
+# Actor network
+hidden_size = 256
+num_hidden = 3
+activation = "relu"
+
+# Critic network
+critic_hidden_size = 256
+critic_num_hidden = 3
+
+# Enable reward shaping for intermediate learning signals
+reward_shaping_coef = 0.0
+learning_rate = [[0.001, 0], [0.0003, 80_000_000], [0.0, 100_000_000]]
+
+# GAE parameters for multi-player imperfect info game
+gamma = 0.99
+gae_lambda = 0.9
+
+# PPO hyperparameters
+clip_epsilon = 0.10    # Lower threshold to trigger more clipping
+entropy_coef = 0.05    # High exploration for bluffing
+value_coef = 0.5       # Strong value function learning
+max_grad_norm = 0.5
+target_kl = 0.02       # Early stopping if KL exceeds this
+
+# Training duration
+total_steps = 100_000_000
+
+# More update iterations per rollout
+num_epochs = 4
+num_minibatches = 8
+
+# Self-play settings
+opponent_pool_fraction = 0.3
+opponent_select_exponent = 2.0
+
+checkpoint_freq = 100_000
+log_freq = 10_000
+
+[player_count]
+type = "Fixed"
+count = 4

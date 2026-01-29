@@ -63,6 +63,26 @@ const OBSERVATION_DIM: usize = OBS_OWN_HAND
     + OBS_NUM_PLAYERS
     + OBS_BID_HISTORY; // 4+4+6+6+6+6+6+3+1+6+6+6+6+5+64 = 135
 
+// Global state dimension components (exact calculation for CTDE)
+// These constants document the structure of the global_state() output
+const GS_PHASE: usize = 3;
+const GS_CURRENT_PLAYER: usize = 1;
+const GS_ROUND_STARTER: usize = 1;
+const GS_BID_STATE: usize = 2;
+const GS_BID_HISTORY: usize = 10 * 3; // 10 entries × 3 floats each
+const GS_GAME_OVER: usize = 1;
+const GS_NUM_PLAYERS_ONEHOT: usize = 5; // One-hot for 2-6 players
+const GS_PER_PLAYER: usize = 10; // exists + wins + alive + trap + roses + stack + skulls_stack + roses_stack + passed + revealed
+
+const GLOBAL_STATE_DIM_EXACT: usize = GS_PHASE
+    + GS_CURRENT_PLAYER
+    + GS_ROUND_STARTER
+    + GS_BID_STATE
+    + GS_BID_HISTORY
+    + GS_GAME_OVER
+    + GS_NUM_PLAYERS_ONEHOT
+    + (GS_PER_PLAYER * MAX_PLAYERS); // = 103 floats
+
 /// Card types in Skull
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Card {
@@ -973,6 +993,11 @@ impl Environment for Skull {
     // Skull supports 2-6 players at runtime
     const VARIABLE_PLAYER_COUNT: bool = true;
 
+    // Canonical global state for CTDE: shared game state + per-player private info
+    // Actual dimension (GLOBAL_STATE_DIM_EXACT) = 103 floats
+    // Conservative upper bound (200) allows padding for tensor alignment
+    const GLOBAL_STATE_DIM: Option<usize> = Some(200);
+
     fn new(seed: u64) -> Self {
         // Default to 4 players
         Self::new_with_players(4, Schedule::constant(0.0), seed)
@@ -1366,6 +1391,133 @@ impl Environment for Skull {
 
     fn set_step(&mut self, step: u64) {
         self.current_step = step;
+    }
+
+    fn global_state(&self) -> Vec<f32> {
+        let mut global = Vec::new();
+
+        // ===== SHARED GAME STATE (absolute indexing, ONE copy) =====
+
+        // Current phase (3 floats: one-hot for placing/bidding/revealing)
+        let phase_one_hot = match self.phase {
+            Phase::Placing => vec![1.0, 0.0, 0.0],
+            Phase::Bidding => vec![0.0, 1.0, 0.0],
+            Phase::Revealing => vec![0.0, 0.0, 1.0],
+        };
+        global.extend(phase_one_hot);
+
+        // Current player (absolute seat, normalized to [0, 1])
+        global.push(self.current_player as f32 / MAX_PLAYERS as f32);
+
+        // Round starter (absolute seat, normalized)
+        global.push(self.round_starter as f32 / MAX_PLAYERS as f32);
+
+        // Bidding state
+        if self.current_bid > 0 {
+            // Current bid (normalized to [0, 1])
+            global.push(self.current_bid as f32 / MAX_BID as f32);
+            // Current bidder (absolute seat, normalized)
+            if let Some(bidder) = self.current_bidder {
+                global.push(bidder as f32 / MAX_PLAYERS as f32);
+            } else {
+                global.push(-1.0); // No bidder (shouldn't happen if bid > 0)
+            }
+        } else {
+            global.push(0.0); // No bid yet
+            global.push(-1.0); // No bidder
+        }
+
+        // Bid history (last N bids in absolute seat order)
+        // Each entry: (bidder_seat_normalized, bid_value_normalized, is_pass)
+        // Note: BidEntry.bid = 0 means pass, 1-24 means bid amount
+        let max_history = 10;
+        let history_len = self.bid_history.len().min(max_history);
+        for entry in self.bid_history.iter().rev().take(history_len) {
+            global.push(entry.player as f32 / MAX_PLAYERS as f32);
+            global.push(entry.bid as f32 / MAX_BID as f32);
+            global.push(if entry.bid == 0 { 1.0 } else { 0.0 }); // is_pass
+        }
+        // Pad if fewer than max_history
+        for _ in history_len..max_history {
+            global.push(0.0); // bidder
+            global.push(0.0); // value
+            global.push(0.0); // is_pass
+        }
+
+        // Game over flag
+        global.push(if self.game_over { 1.0 } else { 0.0 });
+
+        // Number of active players (one-hot for 2-6 players)
+        for i in 2..=MAX_PLAYERS {
+            global.push(if self.num_players == i { 1.0 } else { 0.0 });
+        }
+
+        // ===== PER-PLAYER PRIVATE INFO (absolute seat order) =====
+
+        for seat in 0..MAX_PLAYERS {
+            // Player exists flag
+            global.push(if seat < self.num_players { 1.0 } else { 0.0 });
+
+            // Wins (successful challenges, normalized to [0, 1])
+            global.push(self.wins[seat] as f32 / WINS_TO_WIN as f32);
+
+            // Player is alive (still has cards)
+            let is_alive = self.has_trap[seat] || self.rose_count[seat] > 0;
+            global.push(if is_alive { 1.0 } else { 0.0 });
+
+            // Hand composition (what cards they still have)
+            global.push(if self.has_trap[seat] { 1.0 } else { 0.0 }); // has skull
+            global.push(self.rose_count[seat] as f32 / ROSES_PER_PLAYER as f32); // roses normalized
+
+            // Stack composition (what they've played this round)
+            let stack_size = self.stack[seat].len();
+            global.push(stack_size as f32 / CARDS_PER_PLAYER as f32); // stack size normalized
+
+            // Count skulls and roses in stack
+            let skulls_in_stack = self.stack[seat]
+                .iter()
+                .filter(|&&c| c == Card::Skull)
+                .count();
+            let roses_in_stack = self.stack[seat]
+                .iter()
+                .filter(|&&c| c == Card::Rose)
+                .count();
+            global.push(skulls_in_stack as f32 / CARDS_PER_PLAYER as f32);
+            global.push(roses_in_stack as f32 / CARDS_PER_PLAYER as f32);
+
+            // Has passed in current phase
+            global.push(if self.passed[seat] { 1.0 } else { 0.0 });
+
+            // Revealed count (how many cards revealed from their stack)
+            global.push(self.revealed[seat] as f32 / CARDS_PER_PLAYER as f32);
+        }
+
+        // Pad to GLOBAL_STATE_DIM if needed for fixed tensor size
+        let target_dim = Self::GLOBAL_STATE_DIM.expect("GLOBAL_STATE_DIM must be set for CTDE");
+        let actual_len = global.len();
+
+        if actual_len < target_dim {
+            global.extend(std::iter::repeat_n(0.0, target_dim - actual_len));
+        }
+
+        // Runtime validation (debug builds only)
+        debug_assert_eq!(
+            global.len(),
+            target_dim,
+            "Global state dimension mismatch: got {}, expected {}",
+            global.len(),
+            target_dim
+        );
+
+        // Sanity check: actual size shouldn't greatly exceed exact calculation
+        // This catches bugs where global_state() implementation adds more floats than expected
+        assert!(actual_len <= GLOBAL_STATE_DIM_EXACT + 10,
+            "Global state dimension calculation error in Skull.\n\
+             Expected ~{GLOBAL_STATE_DIM_EXACT} floats (GLOBAL_STATE_DIM_EXACT), got {actual_len} before padding.\n\
+             Update dimension constants in src/envs/skull.rs"
+        );
+
+        global
     }
 }
 
@@ -2832,5 +2984,53 @@ mod tests {
 
         let sum: f32 = rewards.iter().sum();
         assert!(sum.abs() < 0.001, "Zero-sum: got {sum}");
+    }
+
+    #[test]
+    fn test_global_state_dimension() {
+        let mut env = Skull::new(42);
+        env.set_num_players(4);
+        env.reset();
+
+        let global_state = env.global_state();
+        let expected_dim = Skull::GLOBAL_STATE_DIM.unwrap();
+
+        assert_eq!(
+            global_state.len(),
+            expected_dim,
+            "Skull global state should match GLOBAL_STATE_DIM"
+        );
+
+        // Verify it's not truncating (actual dimension should be <= target)
+        // The exact dimension is ~103, so 200 should accommodate it with room to spare
+        assert!(
+            expected_dim >= GLOBAL_STATE_DIM_EXACT,
+            "Skull GLOBAL_STATE_DIM ({expected_dim}) should accommodate GLOBAL_STATE_DIM_EXACT ({GLOBAL_STATE_DIM_EXACT}) floats"
+        );
+    }
+
+    #[test]
+    fn test_global_state_no_truncation() {
+        // Test with max players to ensure worst-case dimension is handled
+        let mut env = Skull::new(42);
+        env.set_num_players(6);
+        env.reset();
+
+        let global_state = env.global_state();
+        let expected_dim = Skull::GLOBAL_STATE_DIM.unwrap();
+
+        assert_eq!(
+            global_state.len(),
+            expected_dim,
+            "Skull global state with 6 players should match GLOBAL_STATE_DIM"
+        );
+
+        // No truncation - all values after the actual data should be padding zeros
+        // The exact dimension is GLOBAL_STATE_DIM_EXACT, so everything after should be 0.0
+        let padding = &global_state[GLOBAL_STATE_DIM_EXACT..];
+        assert!(
+            padding.iter().all(|&x| x == 0.0),
+            "Padding region should be all zeros (no truncation)"
+        );
     }
 }

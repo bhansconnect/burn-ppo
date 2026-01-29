@@ -38,17 +38,23 @@ pub struct OpponentStats {
     pub checkpoint_step: usize,
     /// Learner's win rate against this opponent (EMA, 0.0 to 1.0)
     pub win_rate: f64,
+    /// Learner's average Swiss points against this opponent (EMA)
+    /// Swiss points = `num_players` - 1 for 1st place, 0 for last place
+    #[serde(default)]
+    pub avg_swiss_points: f64,
     /// Total games played against this opponent (for debugging/confidence)
     pub games_played: u32,
 }
 
 impl OpponentStats {
     /// Create a new opponent stats with default win rate (0.5 = neutral)
+    /// and `avg_swiss_points` (0.0 = no data yet, will converge to actual performance)
     pub fn new(checkpoint_name: String, checkpoint_step: usize) -> Self {
         Self {
             checkpoint_name,
             checkpoint_step,
-            win_rate: 0.5, // Neutral initial assumption
+            win_rate: 0.5,         // Neutral initial assumption
+            avg_swiss_points: 0.0, // No data yet, will be updated from games
             games_played: 0,
         }
     }
@@ -153,9 +159,9 @@ pub struct OpponentPool<B: Backend> {
     /// Refreshed after each policy update for optimal batching
     current_opponents: Vec<usize>,
 
-    /// Pending rotation stats for batched win rate updates
-    /// Key = pool index, Value = (wins, games) accumulated this rotation
-    pending_rotation_stats: HashMap<usize, (u32, u32)>,
+    /// Pending rotation stats for batched win rate and Swiss points updates
+    /// Key = pool index, Value = (wins, games, `total_swiss_points`) accumulated this rotation
+    pending_rotation_stats: HashMap<usize, (u32, u32, f64)>,
 }
 
 /// Persisted opponent stats file format (`opponent_stats.json`)
@@ -576,6 +582,12 @@ impl<B: Backend> OpponentPool<B> {
         position_to_opponent: &[Option<usize>],
     ) {
         let learner_placement = placements[learner_position];
+        let num_players = placements.len();
+
+        // Compute learner's Swiss points: num_players - placement
+        // 1st place (placement=1) in 4-player game: 4-1 = 3.0 points
+        // Last place (placement=4) in 4-player game: 4-4 = 0.0 points
+        let learner_swiss_points = (num_players - learner_placement) as f64;
 
         // For each opponent, determine if they beat the current model (pairwise)
         for (pos, &placement) in placements.iter().enumerate() {
@@ -590,26 +602,29 @@ impl<B: Backend> OpponentPool<B> {
             // Learner wins against this opponent if learner placed better (lower number)
             let learner_won = learner_placement < placement;
 
-            // Accumulate stats for this opponent
+            // Accumulate stats for this opponent: (wins, games, total_swiss_points)
             let entry = self
                 .pending_rotation_stats
                 .entry(pool_idx)
-                .or_insert((0, 0));
+                .or_insert((0, 0, 0.0));
             entry.1 += 1; // games
+            entry.2 += learner_swiss_points; // total Swiss points
             if learner_won {
                 entry.0 += 1; // wins
             }
         }
     }
 
-    /// Apply all pending game results to win rates using batch EMA
+    /// Apply all pending game results to win rates and Swiss points using batch EMA
     ///
     /// For each opponent with pending stats:
     /// - `rotation_win_rate = wins / games`
     /// - `win_rate = win_rate * (1 - alpha) + rotation_win_rate * alpha`
+    /// - `rotation_avg_swiss = total_swiss_points / games`
+    /// - `avg_swiss_points = avg_swiss_points * (1 - alpha) + rotation_avg_swiss * alpha`
     ///
     /// This updates once per rotation (not per game) to avoid overwriting
-    /// the historical win rate too quickly.
+    /// the historical stats too quickly.
     pub fn apply_pending_win_rate_updates(&mut self) {
         if self.pending_rotation_stats.is_empty() {
             return;
@@ -617,14 +632,21 @@ impl<B: Backend> OpponentPool<B> {
 
         let alpha = self.opponent_select_alpha;
 
-        for (pool_idx, (wins, games)) in self.pending_rotation_stats.drain() {
+        for (pool_idx, (wins, games, total_swiss_points)) in self.pending_rotation_stats.drain() {
             if games == 0 {
                 continue;
             }
 
             if let Some((_, stats)) = self.available.get_mut(pool_idx) {
+                // Update win rate
                 let rotation_win_rate = f64::from(wins) / f64::from(games);
                 stats.win_rate = stats.win_rate * (1.0 - alpha) + rotation_win_rate * alpha;
+
+                // Update average Swiss points
+                let rotation_avg_swiss = total_swiss_points / f64::from(games);
+                stats.avg_swiss_points =
+                    stats.avg_swiss_points * (1.0 - alpha) + rotation_avg_swiss * alpha;
+
                 stats.games_played += games;
             }
         }
@@ -864,11 +886,106 @@ impl<B: Backend> OpponentPool<B> {
 
         Ok(())
     }
+
+    /// Get index of best opponent checkpoint (checkpoint with highest performance against learner)
+    ///
+    /// "Best" opponent = checkpoint with highest `avg_swiss_points`, meaning learner performs
+    /// worst against it (lower Swiss points for learner = better opponent).
+    ///
+    /// Returns None if pool is empty.
+    pub fn get_best_checkpoint_index(&self) -> Option<usize> {
+        if self.available.is_empty() {
+            return None;
+        }
+
+        // Find opponent with highest avg_swiss_points (learner performs worst against them)
+        // Higher Swiss points for opponent means lower performance for learner
+        self.available
+            .iter()
+            .enumerate()
+            .max_by(|(_, (_, a)), (_, (_, b))| {
+                a.avg_swiss_points
+                    .partial_cmp(&b.avg_swiss_points)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+    }
+
+    /// Get current pool performance score based on performance vs best checkpoint
+    ///
+    /// Uses Swiss points for multiplayer games (generalizes to win rate for 2-player).
+    /// Score ranges from 0.0 (dominating best checkpoint) to 1.0 (dominated by best).
+    /// Lower is better (learner is outperforming historical checkpoints).
+    ///
+    /// Returns None if no games have been played or pool is empty.
+    pub fn get_pool_performance(&self, num_players: usize) -> Option<f32> {
+        if self.available.is_empty() || num_players < 2 {
+            return None;
+        }
+
+        // Find best checkpoint (highest avg_swiss_points)
+        let best_idx = self.get_best_checkpoint_index()?;
+        let best_stats = &self.available[best_idx].1;
+
+        // If no games played against best, return None
+        if best_stats.games_played == 0 {
+            return None;
+        }
+
+        // Compute learner's avg Swiss points vs best checkpoint
+        // Note: avg_swiss_points in stats is already the learner's average
+        let learner_avg_swiss_points = best_stats.avg_swiss_points;
+
+        // Maximum Swiss points possible (always 1st place)
+        let max_points = (num_players - 1) as f64;
+
+        // Performance score: 0.0 = dominating (max points), 1.0 = dominated (0 points)
+        // Formula: (max - actual) / max
+        let performance_score = (max_points - learner_avg_swiss_points) / max_points;
+
+        Some(performance_score.clamp(0.0, 1.0) as f32)
+    }
+
+    /// Deprecated: Use `get_pool_performance()` instead.
+    ///
+    /// This metric measures performance against the opponent pool, not game-theoretic exploitability.
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use `get_pool_performance()` instead. This metric measures performance against the opponent pool, not game-theoretic exploitability."
+    )]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Deprecated function still used in tests")
+    )]
+    pub fn get_exploitability(&self, num_players: usize) -> Option<f32> {
+        self.get_pool_performance(num_players)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::backend::NdArray;
+    use std::collections::HashMap;
+
+    /// Test helper: Create a minimal `OpponentPool` for unit testing
+    fn create_test_pool() -> OpponentPool<NdArray> {
+        use crate::config::Config;
+
+        OpponentPool {
+            available: Vec::new(),
+            loaded: HashMap::new(),
+            num_opponent_slots: 0,
+            checkpoints_dir: PathBuf::from("/tmp/test"),
+            opponent_select_alpha: 0.1,
+            opponent_select_exponent: 1.0,
+            config: Config::default(),
+            device: Default::default(),
+            rng: rand::rngs::StdRng::seed_from_u64(42),
+            current_opponents: Vec::new(),
+            pending_rotation_stats: HashMap::new(),
+        }
+    }
 
     // ==================== OpponentStats Tests ====================
 
@@ -887,6 +1004,7 @@ mod tests {
             checkpoint_name: "step_00010000".to_string(),
             checkpoint_step: 10000,
             win_rate: 0.75,
+            avg_swiss_points: 1.5,
             games_played: 100,
         };
 
@@ -913,6 +1031,7 @@ mod tests {
                     checkpoint_name: "step_00020000".to_string(),
                     checkpoint_step: 20000,
                     win_rate: 0.65,
+                    avg_swiss_points: 1.2,
                     games_played: 50,
                 },
             ],
@@ -1240,12 +1359,14 @@ mod tests {
                     checkpoint_name: "step_00001000".to_string(),
                     checkpoint_step: 1000,
                     win_rate: 0.3,
+                    avg_swiss_points: 2.5,
                     games_played: 100,
                 },
                 OpponentStats {
                     checkpoint_name: "step_00002000".to_string(),
                     checkpoint_step: 2000,
                     win_rate: 0.7,
+                    avg_swiss_points: 0.8,
                     games_played: 50,
                 },
             ],
@@ -1271,5 +1392,232 @@ mod tests {
         let stats = OpponentStats::new("step_00100000".to_string(), 100_000);
         assert!((stats.win_rate - 0.5).abs() < f64::EPSILON);
         assert_eq!(stats.games_played, 0);
+    }
+
+    // ==================== Exploitability Metrics Tests ====================
+
+    #[test]
+    fn test_get_best_checkpoint_index_empty_pool() {
+        let pool = create_test_pool();
+        assert_eq!(pool.get_best_checkpoint_index(), None);
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_index_single_opponent() {
+        let mut pool = create_test_pool();
+
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 0.6,
+                avg_swiss_points: 1.5,
+                games_played: 100,
+            },
+        ));
+
+        assert_eq!(pool.get_best_checkpoint_index(), Some(0));
+    }
+
+    #[test]
+    fn test_get_best_checkpoint_index_multiple_opponents() {
+        let mut pool = create_test_pool();
+
+        // Opponent 0: Low avg_swiss_points (learner performs well against it)
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 0.3,
+                avg_swiss_points: 0.8, // Learner gets low Swiss points (weak opponent)
+                games_played: 100,
+            },
+        ));
+
+        // Opponent 1: High avg_swiss_points (learner performs poorly against it)
+        pool.available.push((
+            PathBuf::from("step_2000"),
+            OpponentStats {
+                checkpoint_name: "step_2000".to_string(),
+                checkpoint_step: 2000,
+                win_rate: 0.7,
+                avg_swiss_points: 2.5, // Learner gets high Swiss points (strong opponent)
+                games_played: 100,
+            },
+        ));
+
+        // Opponent 2: Medium avg_swiss_points
+        pool.available.push((
+            PathBuf::from("step_3000"),
+            OpponentStats {
+                checkpoint_name: "step_3000".to_string(),
+                checkpoint_step: 3000,
+                win_rate: 0.5,
+                avg_swiss_points: 1.5,
+                games_played: 100,
+            },
+        ));
+
+        // Best opponent should be index 1 (highest avg_swiss_points)
+        assert_eq!(pool.get_best_checkpoint_index(), Some(1));
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_get_exploitability_empty_pool() {
+        let pool = create_test_pool();
+        assert_eq!(pool.get_exploitability(4), None);
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_get_exploitability_dominating_best() {
+        let mut pool = create_test_pool();
+
+        // Learner always places 1st (gets 3.0 Swiss points in 4-player game)
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 1.0,
+                avg_swiss_points: 3.0, // Max Swiss points (always 1st)
+                games_played: 100,
+            },
+        ));
+
+        // Exploitability should be 0.0 (dominating)
+        let exploit = pool.get_exploitability(4).unwrap();
+        assert!(exploit.abs() < 1e-6, "Expected 0.0, got {exploit}");
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_get_exploitability_dominated_by_best() {
+        let mut pool = create_test_pool();
+
+        // Learner always places last (gets 0.0 Swiss points in 4-player game)
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 0.0,
+                avg_swiss_points: 0.0, // Min Swiss points (always last)
+                games_played: 100,
+            },
+        ));
+
+        // Exploitability should be 1.0 (dominated)
+        let exploit = pool.get_exploitability(4).unwrap();
+        assert!((exploit - 1.0).abs() < 1e-6, "Expected 1.0, got {exploit}");
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_get_exploitability_middle_performance() {
+        let mut pool = create_test_pool();
+
+        // Learner gets average Swiss points (1.5 in 4-player game = 2nd-3rd place avg)
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 0.5,
+                avg_swiss_points: 1.5, // Middle Swiss points
+                games_played: 100,
+            },
+        ));
+
+        // Exploitability should be 0.5 (middle performance)
+        // Formula: (3.0 - 1.5) / 3.0 = 0.5
+        let exploit = pool.get_exploitability(4).unwrap();
+        assert!((exploit - 0.5).abs() < 1e-6, "Expected 0.5, got {exploit}");
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_get_exploitability_two_player_game() {
+        let mut pool = create_test_pool();
+
+        // In 2-player game: Swiss points = 1.0 for 1st, 0.0 for 2nd
+        // 60% win rate means avg_swiss_points = 0.6
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 0.6,
+                avg_swiss_points: 0.6,
+                games_played: 100,
+            },
+        ));
+
+        // Exploitability should be 0.4 (40% of distance from best)
+        // Formula: (1.0 - 0.6) / 1.0 = 0.4
+        let exploit = pool.get_exploitability(2).unwrap();
+        assert!((exploit - 0.4).abs() < 1e-6, "Expected 0.4, got {exploit}");
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_get_exploitability_selects_best_opponent() {
+        let mut pool = create_test_pool();
+
+        // Add multiple opponents, exploitability should use the best one
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 0.3,
+                avg_swiss_points: 2.0, // Good Swiss points (learner does OK)
+                games_played: 100,
+            },
+        ));
+
+        pool.available.push((
+            PathBuf::from("step_2000"),
+            OpponentStats {
+                checkpoint_name: "step_2000".to_string(),
+                checkpoint_step: 2000,
+                win_rate: 0.1,
+                avg_swiss_points: 0.5, // Low Swiss points (learner struggles)
+                games_played: 100,
+            },
+        ));
+
+        // Exploitability should be based on opponent 0 (highest avg_swiss_points = 2.0)
+        // Formula: (3.0 - 2.0) / 3.0 = 0.333...
+        let exploit = pool.get_exploitability(4).unwrap();
+        let expected = 1.0 / 3.0;
+        assert!(
+            (exploit - expected).abs() < 1e-6,
+            "Expected {expected}, got {exploit}"
+        );
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_get_exploitability_invalid_num_players() {
+        let mut pool = create_test_pool();
+
+        pool.available.push((
+            PathBuf::from("step_1000"),
+            OpponentStats {
+                checkpoint_name: "step_1000".to_string(),
+                checkpoint_step: 1000,
+                win_rate: 0.5,
+                avg_swiss_points: 1.5,
+                games_played: 100,
+            },
+        ));
+
+        // Invalid num_players < 2 should return None
+        assert_eq!(pool.get_exploitability(1), None);
+        assert_eq!(pool.get_exploitability(0), None);
     }
 }

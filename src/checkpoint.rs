@@ -71,12 +71,28 @@ pub struct CheckpointMetadata {
     /// Number of FC layers after conv (CNN only)
     #[serde(default = "default_cnn_num_fc_layers")]
     pub cnn_num_fc_layers: usize,
+    /// Global state dimension for CTDE critic (CTDE only)
+    #[serde(default)]
+    pub global_state_dim: Option<usize>,
+    /// Critic hidden layer size for CTDE (CTDE only)
+    #[serde(default)]
+    pub critic_hidden_size: Option<usize>,
+    /// Number of critic hidden layers for CTDE (CTDE only)
+    #[serde(default)]
+    pub critic_num_hidden: Option<usize>,
     /// Spatial observation shape (H, W, C) for CNN networks
     /// None for MLP networks
     #[serde(default)]
     pub obs_shape: Option<(usize, usize, usize)>,
     /// Environment name for dispatching at eval time
     pub env_name: String,
+    /// Exploitability score from opponent pool (0.0-1.0, lower = better)
+    /// Based on Swiss points vs best historical checkpoint
+    /// 0.0 = dominating (always 1st), 1.0 = dominated (always last)
+    /// For 2-player: equivalent to (1.0 - `win_rate`)
+    /// None if opponent pool not used or no games played
+    #[serde(default)]
+    pub exploitability_vs_pool: Option<f32>,
 }
 
 fn default_network_type() -> String {
@@ -204,12 +220,16 @@ impl CheckpointManager {
         load_config.kernel_size = metadata.kernel_size;
         load_config.cnn_fc_hidden_size = metadata.cnn_fc_hidden_size;
         load_config.cnn_num_fc_layers = metadata.cnn_num_fc_layers;
+        // CTDE-specific params (global_state_dim passed directly to ActorCritic::new)
+        load_config.critic_hidden_size = metadata.critic_hidden_size;
+        load_config.critic_num_hidden = metadata.critic_num_hidden;
 
         let default_model: ActorCritic<B> = ActorCritic::new(
             metadata.obs_dim,
             metadata.obs_shape,
             metadata.action_count,
             metadata.num_players,
+            metadata.global_state_dim,
             &load_config,
             device,
         );
@@ -495,7 +515,8 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, None, 2, 1, &config, &device);
+        let model: ActorCritic<TestBackend> =
+            ActorCritic::new(4, None, 2, 1, None, &config, &device);
         let metadata = CheckpointMetadata {
             step: 1000,
             avg_return: 150.0,
@@ -516,8 +537,12 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
+            global_state_dim: None,
+            critic_hidden_size: None,
+            critic_num_hidden: None,
             obs_shape: None,
             env_name: "cartpole".to_string(),
+            exploitability_vs_pool: None,
         };
 
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
@@ -546,7 +571,8 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> = ActorCritic::new(4, None, 2, 1, &config, &device);
+        let model: ActorCritic<TestBackend> =
+            ActorCritic::new(4, None, 2, 1, None, &config, &device);
 
         // Save first checkpoint with low return
         manager
@@ -572,8 +598,12 @@ mod tests {
                     kernel_size: 3,
                     cnn_fc_hidden_size: 128,
                     cnn_num_fc_layers: 1,
+                    global_state_dim: None,
+                    critic_hidden_size: None,
+                    critic_num_hidden: None,
                     obs_shape: None,
                     env_name: "cartpole".to_string(),
+                    exploitability_vs_pool: None,
                 },
                 true,
             )
@@ -603,8 +633,12 @@ mod tests {
                     kernel_size: 3,
                     cnn_fc_hidden_size: 128,
                     cnn_num_fc_layers: 1,
+                    global_state_dim: None,
+                    critic_hidden_size: None,
+                    critic_num_hidden: None,
                     obs_shape: None,
                     env_name: "cartpole".to_string(),
+                    exploitability_vs_pool: None,
                 },
                 true,
             )
@@ -634,8 +668,12 @@ mod tests {
                     kernel_size: 3,
                     cnn_fc_hidden_size: 128,
                     cnn_num_fc_layers: 1,
+                    global_state_dim: None,
+                    critic_hidden_size: None,
+                    critic_num_hidden: None,
                     obs_shape: None,
                     env_name: "cartpole".to_string(),
+                    exploitability_vs_pool: None,
                 },
                 true,
             )
@@ -720,8 +758,12 @@ mod tests {
             kernel_size: 4,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
+            global_state_dim: None,
+            critic_hidden_size: None,
+            critic_num_hidden: None,
             obs_shape: Some((6, 7, 2)),
             env_name: "connect_four".to_string(),
+            exploitability_vs_pool: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();
@@ -841,7 +883,7 @@ mod tests {
         };
 
         let model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, &split_config, &device);
+            ActorCritic::new(4, None, 2, 1, None, &split_config, &device);
 
         let metadata = CheckpointMetadata {
             step: 1000,
@@ -863,8 +905,12 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
+            global_state_dim: None,
+            critic_hidden_size: None,
+            critic_num_hidden: None,
             obs_shape: None,
             env_name: "test".to_string(),
+            exploitability_vs_pool: None,
         };
 
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
@@ -901,7 +947,7 @@ mod tests {
         let shared_config = Config::default();
 
         let model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, &shared_config, &device);
+            ActorCritic::new(4, None, 2, 1, None, &shared_config, &device);
 
         let metadata = CheckpointMetadata {
             step: 1000,
@@ -923,8 +969,12 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
+            global_state_dim: None,
+            critic_hidden_size: None,
+            critic_num_hidden: None,
             obs_shape: None,
             env_name: "test".to_string(),
+            exploitability_vs_pool: None,
         };
 
         let checkpoint_path = manager.save(&model, &metadata, true).unwrap();
@@ -966,7 +1016,7 @@ mod tests {
             ..Config::default()
         };
         let split_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, &split_config, &device);
+            ActorCritic::new(4, None, 2, 1, None, &split_config, &device);
 
         let split_metadata = CheckpointMetadata {
             step: 1000,
@@ -988,15 +1038,19 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
+            global_state_dim: None,
+            critic_hidden_size: None,
+            critic_num_hidden: None,
             obs_shape: None,
             env_name: "test".to_string(),
+            exploitability_vs_pool: None,
         };
         let split_path = manager.save(&split_model, &split_metadata, false).unwrap();
 
         // Create and save shared network model
         let shared_config = Config::default();
         let shared_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, &shared_config, &device);
+            ActorCritic::new(4, None, 2, 1, None, &shared_config, &device);
 
         let shared_metadata = CheckpointMetadata {
             step: 2000,
@@ -1018,8 +1072,12 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
+            global_state_dim: None,
+            critic_hidden_size: None,
+            critic_num_hidden: None,
             obs_shape: None,
             env_name: "test".to_string(),
+            exploitability_vs_pool: None,
         };
         let shared_path = manager
             .save(&shared_model, &shared_metadata, false)

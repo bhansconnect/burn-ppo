@@ -1,0 +1,51 @@
+# PPO configuration for Liar's Dice with CTDE (Centralized Training, Decentralized Execution)
+#
+# CTDE Architecture:
+# - Actor (policy) network sees only local observations (270 dims)
+# - Critic (value) network sees global game state (120 dims) with privileged information
+# - Actor makes decisions based only on observable information
+# - Critic learns from full game state (all players' dice)
+#
+# CTDE is particularly effective for Liar's Dice because:
+# - Hidden dice information helps critic estimate values
+# - Actor makes decisions based only on observable information
+# - Critic learns from full game state (all players' dice)
+#
+# See docs/CTDE.md for detailed guide.
+
+env = "liars_dice"
+num_envs = 256
+num_steps = 128
+
+# === CTDE Network Configuration ===
+network_type = "ctde"
+
+# Actor network
+hidden_size = 256
+num_hidden = 2
+activation = "relu"
+
+# Critic network (larger for better value estimation)
+critic_hidden_size = 512
+critic_num_hidden = 3
+
+# === PPO Hyperparameters ===
+reward_shaping_coef = 0.05
+learning_rate = 0.0003
+gamma = 0.97
+gae_lambda = 0.90
+clip_epsilon = 0.2
+entropy_coef = 0.05
+value_coef = 1.0
+max_grad_norm = 0.5
+target_kl = 0.025
+
+total_steps = 20_000_000
+num_epochs = 4
+num_minibatches = 8
+
+opponent_pool_fraction = 0.25
+opponent_select_exponent = 2.0
+
+checkpoint_freq = 100_000
+log_freq = 10_000

@@ -41,6 +41,7 @@ type FlattenedBuffer<B> = (
     Tensor<B, 1, Int>,         // acting_players
     Tensor<B, 1>,              // old_values (flattened)
     Option<Tensor<B, 1, Int>>, // valid_indices for opponent pool training
+    Option<Tensor<B, 2>>,      // global_states for CTDE (batch_size, global_state_dim)
 );
 
 /// Stores trajectory data from environment rollouts
@@ -51,6 +52,9 @@ type FlattenedBuffer<B> = (
 pub struct RolloutBuffer<B: Backend> {
     /// Observations [`num_steps`, `num_envs`, `obs_dim`]
     pub observations: Tensor<B, 3>,
+    /// Global states for CTDE critic [`num_steps`, `num_envs`, `global_state_dim`]
+    /// Only populated when using CTDE networks
+    pub global_states: Option<Tensor<B, 3>>,
     /// Actions taken [`num_steps`, `num_envs`]
     pub actions: Tensor<B, 2, Int>,
     /// Rewards for acting player [`num_steps`, `num_envs`]
@@ -90,16 +94,21 @@ impl<B: Backend> RolloutBuffer<B> {
     /// Create empty buffer with given dimensions
     ///
     /// `num_players` must be <= 255 (stored as u8)
+    /// `global_state_dim`: Optional global state dimension for CTDE networks
     pub fn new(
         num_steps: usize,
         num_envs: usize,
         obs_dim: usize,
+        global_state_dim: Option<usize>,
         num_players: u8,
         device: &B::Device,
     ) -> Self {
         let np = num_players as usize;
+        let global_states =
+            global_state_dim.map(|dim| Tensor::zeros([num_steps, num_envs, dim], device));
         Self {
             observations: Tensor::zeros([num_steps, num_envs, obs_dim], device),
+            global_states,
             actions: Tensor::zeros([num_steps, num_envs], device),
             rewards: Tensor::zeros([num_steps, num_envs], device),
             dones: Tensor::zeros([num_steps, num_envs], device),
@@ -172,6 +181,12 @@ impl<B: Backend> RolloutBuffer<B> {
             None
         };
 
+        // Reshape global states if present (for CTDE)
+        let global_states = self.global_states.as_ref().map(|gs| {
+            let [_num_steps, _num_envs, global_dim] = gs.dims();
+            gs.clone().reshape([batch_size, global_dim])
+        });
+
         (
             obs,
             actions,
@@ -181,6 +196,7 @@ impl<B: Backend> RolloutBuffer<B> {
             acting_players,
             old_values,
             valid_indices,
+            global_states,
         )
     }
 }
@@ -226,6 +242,17 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
 
+    // Global states for CTDE (collected if buffer has global_states field)
+    let collect_global_states = buffer.global_states.is_some();
+    let mut all_global_states: Vec<f32> = if collect_global_states {
+        // Get global state dim from first env
+        let first_global = vec_env.get_global_states();
+        let global_state_dim = first_global.len() / num_envs;
+        Vec::with_capacity(num_steps * num_envs * global_state_dim)
+    } else {
+        Vec::new()
+    };
+
     // Action masks (collected if environment provides them)
     let mut all_action_masks: Option<Vec<f32>> = None;
     let mut num_actions: usize = 0;
@@ -248,6 +275,12 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 
         // Get current observations
         let mut obs_flat = vec_env.get_observations();
+
+        // Get global states for CTDE (if enabled)
+        if collect_global_states {
+            let global_states_flat = vec_env.get_global_states();
+            all_global_states.extend_from_slice(&global_states_flat);
+        }
 
         // Store raw observations BEFORE normalization for stats update
         if collect_raw_obs {
@@ -283,7 +316,20 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 
             let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device)
                 .reshape([num_envs, obs_dim]);
-            let (logits, values) = model.forward(obs_tensor);
+
+            // Handle CTDE networks: separate forward passes for actor and critic
+            let (logits, values) = if model.is_ctde() {
+                let global_states_flat = vec_env.get_global_states();
+                let global_state_dim = global_states_flat.len() / num_envs;
+                let global_state_tensor =
+                    Tensor::<B, 1>::from_floats(global_states_flat.as_slice(), device)
+                        .reshape([num_envs, global_state_dim]);
+                let logits = model.forward_actor(obs_tensor);
+                let values = model.forward_critic(global_state_tensor);
+                (logits, values)
+            } else {
+                model.forward(obs_tensor)
+            };
             // values is [num_envs, num_players]
 
             // Apply action mask to prevent sampling invalid actions
@@ -406,6 +452,18 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         profile_scope!("batch_gpu_transfer");
         buffer.observations = Tensor::<B, 1>::from_floats(all_obs.as_slice(), device)
             .reshape([num_steps, num_envs, obs_dim]);
+
+        // Populate global states if CTDE is enabled
+        if let Some(ref mut global_states_tensor) = buffer.global_states {
+            let global_state_dim = all_global_states.len() / (num_steps * num_envs);
+            *global_states_tensor =
+                Tensor::<B, 1>::from_floats(all_global_states.as_slice(), device).reshape([
+                    num_steps,
+                    num_envs,
+                    global_state_dim,
+                ]);
+        }
+
         buffer.actions = Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device)
             .reshape([num_steps, num_envs]);
         buffer.rewards = Tensor::<B, 1>::from_floats(all_acting_rewards.as_slice(), device)
@@ -527,6 +585,17 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     let mut collected_action_masks: Option<Vec<f32>> = None;
     let mut stored_action_count: usize = 0;
 
+    // Global states for CTDE (collected if buffer has global_states field)
+    let collect_global_states = buffer.global_states.is_some();
+    let mut all_global_states: Vec<f32> = if collect_global_states {
+        // Get global state dim from first env
+        let first_global = vec_env.get_global_states();
+        let global_state_dim = first_global.len() / num_envs;
+        Vec::with_capacity(num_steps * num_envs * global_state_dim)
+    } else {
+        Vec::new()
+    };
+
     // Collect raw observations for normalizer stats update
     let collect_raw_obs = normalizer.is_some();
     let mut raw_obs_for_stats: Vec<f32> = if collect_raw_obs {
@@ -547,6 +616,12 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
         // Store raw observations for normalizer stats update
         if collect_raw_obs {
             raw_obs_for_stats.extend_from_slice(&obs_flat_raw);
+        }
+
+        // Get global states for CTDE (if enabled)
+        if collect_global_states {
+            let global_states_flat = vec_env.get_global_states();
+            all_global_states.extend_from_slice(&global_states_flat);
         }
 
         // Partition envs by which model should act
@@ -628,7 +703,33 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             let obs_tensor: Tensor<B, 2> =
                 Tensor::<B, 1>::from_floats(learner_obs.as_slice(), device)
                     .reshape([batch_size, obs_dim]);
-            let (logits, values) = model.forward(obs_tensor);
+
+            // Handle CTDE networks: separate forward passes for actor and critic
+            let (logits, values) = if model.is_ctde() {
+                // Get full global states (all envs)
+                let all_global_states_flat = vec_env.get_global_states();
+                let global_state_dim = all_global_states_flat.len() / num_envs;
+
+                // Extract global states for learner envs
+                let learner_global_states: Vec<f32> = learner_env_indices
+                    .iter()
+                    .flat_map(|&env_idx| {
+                        let start = env_idx * global_state_dim;
+                        all_global_states_flat[start..start + global_state_dim]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+
+                let global_state_tensor =
+                    Tensor::<B, 1>::from_floats(learner_global_states.as_slice(), device)
+                        .reshape([batch_size, global_state_dim]);
+                let logits = model.forward_actor(obs_tensor);
+                let values = model.forward_critic(global_state_tensor);
+                (logits, values)
+            } else {
+                model.forward(obs_tensor)
+            };
 
             // Apply action mask to prevent sampling invalid actions
             let masked_logits = apply_action_mask(logits, learner_masks);
@@ -707,7 +808,33 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             let batch_size = env_indices.len();
             let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(opp_obs.as_slice(), device)
                 .reshape([batch_size, obs_dim]);
-            let (logits, _values) = opp_model.forward(obs_tensor);
+
+            // Handle CTDE opponent models: separate forward passes for actor and critic
+            let (logits, _values) = if opp_model.is_ctde() {
+                // Get full global states (all envs)
+                let all_global_states_flat = vec_env.get_global_states();
+                let global_state_dim = all_global_states_flat.len() / num_envs;
+
+                // Extract global states for opponent envs
+                let opp_global_states: Vec<f32> = env_indices
+                    .iter()
+                    .flat_map(|&env_idx| {
+                        let start = env_idx * global_state_dim;
+                        all_global_states_flat[start..start + global_state_dim]
+                            .iter()
+                            .copied()
+                    })
+                    .collect();
+
+                let global_state_tensor =
+                    Tensor::<B, 1>::from_floats(opp_global_states.as_slice(), device)
+                        .reshape([batch_size, global_state_dim]);
+                let logits = opp_model.forward_actor(obs_tensor);
+                let values = opp_model.forward_critic(global_state_tensor);
+                (logits, values)
+            } else {
+                opp_model.forward(obs_tensor)
+            };
 
             // Apply action mask and sample (opponents don't need log probs or values for training)
             let masked_logits = apply_action_mask(logits, opp_masks);
@@ -875,6 +1002,18 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
         profile_scope!("batch_gpu_transfer");
         buffer.observations = Tensor::<B, 1>::from_floats(all_obs.as_slice(), device)
             .reshape([num_steps, num_envs, obs_dim]);
+
+        // Populate global states if CTDE is enabled
+        if let Some(ref mut global_states_tensor) = buffer.global_states {
+            let global_state_dim = all_global_states.len() / (num_steps * num_envs);
+            *global_states_tensor =
+                Tensor::<B, 1>::from_floats(all_global_states.as_slice(), device).reshape([
+                    num_steps,
+                    num_envs,
+                    global_state_dim,
+                ]);
+        }
+
         buffer.actions = Tensor::<B, 1, Int>::from_ints(all_actions.as_slice(), device)
             .reshape([num_steps, num_envs]);
         buffer.rewards = Tensor::<B, 1>::from_floats(all_acting_rewards.as_slice(), device)
@@ -1245,6 +1384,7 @@ pub struct UpdateMetrics {
 fn compute_minibatch_loss<B: burn::tensor::backend::AutodiffBackend>(
     model: &ActorCritic<B>,
     mb_obs: Tensor<B::InnerBackend, 2>,
+    mb_global_states: Option<Tensor<B::InnerBackend, 2>>,
     mb_actions: Tensor<B::InnerBackend, 1, Int>,
     mb_old_log_probs: Tensor<B::InnerBackend, 1>,
     mb_advantages_normalized: Tensor<B::InnerBackend, 1>,
@@ -1265,7 +1405,18 @@ where
     B::FloatElem: Into<f32>,
 {
     // Forward pass (creates autodiff tensors)
-    let (logits, all_values) = model.forward(Tensor::from_inner(mb_obs));
+    // For CTDE: use separate actor/critic forward passes
+    // For non-CTDE: use standard forward pass
+    let (logits, all_values) = if model.is_ctde() {
+        let local_obs_autodiff = Tensor::from_inner(mb_obs);
+        let global_states_autodiff =
+            Tensor::from_inner(mb_global_states.expect("CTDE requires global_states in buffer"));
+        let logits = model.forward_actor(local_obs_autodiff);
+        let all_values = model.forward_critic(global_states_autodiff);
+        (logits, all_values)
+    } else {
+        model.forward(Tensor::from_inner(mb_obs))
+    };
 
     // Extract acting player values
     let mb_size = logits.dims()[0];
@@ -1521,6 +1672,7 @@ where
         acting_players_inner,
         old_values_inner,
         valid_indices,
+        global_states_inner,
     ) = buffer.flatten();
 
     // If opponent pool training, filter to only learner turn data
@@ -1533,6 +1685,7 @@ where
         returns_inner,
         acting_players_inner,
         old_values_inner,
+        global_states_inner,
     ) = if let Some(indices) = valid_indices {
         (
             obs_inner.select(0, indices.clone()),
@@ -1541,7 +1694,8 @@ where
             advantages_inner.select(0, indices.clone()),
             returns_inner.select(0, indices.clone()),
             acting_players_inner.select(0, indices.clone()),
-            old_values_inner.select(0, indices),
+            old_values_inner.select(0, indices.clone()),
+            global_states_inner.map(|gs| gs.select(0, indices)),
         )
     } else {
         (
@@ -1552,6 +1706,7 @@ where
             returns_inner,
             acting_players_inner,
             old_values_inner,
+            global_states_inner,
         )
     };
 
@@ -1698,6 +1853,9 @@ where
                 .clone()
                 .select(0, mb_indices_inner.clone());
             let mb_old_values_inner = old_values_inner.clone().select(0, mb_indices_inner.clone());
+            let mb_global_states_inner = global_states_inner
+                .as_ref()
+                .map(|gs| gs.clone().select(0, mb_indices_inner.clone()));
 
             // PopArt: Normalize returns and old_values for value loss computation
             // Buffer stores RAW values (denormalized during collection), but value loss
@@ -1776,6 +1934,7 @@ where
                 let out = compute_minibatch_loss(
                     &model,
                     mb_obs_inner,
+                    mb_global_states_inner,
                     mb_actions_inner,
                     mb_old_log_probs_inner,
                     mb_advantages_normalized,
@@ -1954,7 +2113,7 @@ mod tests {
     #[test]
     fn test_rollout_buffer_creation() {
         let device = Default::default();
-        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(128, 4, 4, 1u8, &device);
+        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(128, 4, 4, None, 1u8, &device);
 
         assert_eq!(buffer.observations.dims(), [128, 4, 4]);
         assert_eq!(buffer.actions.dims(), [128, 4]);
@@ -1967,7 +2126,7 @@ mod tests {
     #[test]
     fn test_rollout_buffer_multiplayer() {
         let device = Default::default();
-        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(64, 8, 86, 2u8, &device);
+        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(64, 8, 86, None, 2u8, &device);
 
         assert_eq!(buffer.observations.dims(), [64, 8, 86]);
         assert_eq!(buffer.all_values.dims(), [64, 8, 2]);
@@ -1983,7 +2142,7 @@ mod tests {
         let num_players = 1u8;
 
         let mut buffer: RolloutBuffer<TestBackend> =
-            RolloutBuffer::new(num_steps, num_envs, 1, num_players, &device);
+            RolloutBuffer::new(num_steps, num_envs, 1, None, num_players, &device);
 
         // Set up simple rewards and values for testing
         buffer.rewards =
@@ -2017,7 +2176,7 @@ mod tests {
         let num_players = 2u8;
 
         let mut buffer: RolloutBuffer<TestBackend> =
-            RolloutBuffer::new(num_steps, num_envs, 86, num_players, &device);
+            RolloutBuffer::new(num_steps, num_envs, 86, None, num_players, &device);
 
         // Set up multi-player data
         // All rewards and values for both players
@@ -2064,7 +2223,7 @@ mod tests {
         let gamma = 0.99_f32;
         let lambda = 0.95_f32;
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 1, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 1, 4, None, 2, &device);
 
         // P0 acts both steps, step 1 is terminal
         buffer.dones = Tensor::from_floats([[0.0], [1.0]], &device);
@@ -2114,7 +2273,7 @@ mod tests {
         let device = Default::default();
         let gamma = 0.99_f32;
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, None, 2, &device);
 
         buffer.dones = Tensor::from_floats([[0.0], [1.0], [1.0]], &device);
         buffer.acting_players = Tensor::from_ints([[0], [1], [0]], &device);
@@ -2174,7 +2333,7 @@ mod tests {
 
         let device = Default::default();
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 1, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 1, 4, None, 2, &device);
 
         buffer.dones = Tensor::from_floats([[0.0], [1.0], [0.0], [1.0]], &device);
         buffer.acting_players = Tensor::from_ints([[0], [1], [0], [1]], &device);
@@ -2226,7 +2385,7 @@ mod tests {
 
         let device = Default::default();
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 3, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, None, 3, &device);
 
         buffer.dones = Tensor::from_floats([[0.0], [0.0], [1.0]], &device);
         buffer.acting_players = Tensor::from_ints([[0], [1], [2]], &device);
@@ -2275,7 +2434,7 @@ mod tests {
         let gamma = 0.99_f32;
         let lambda = 0.95_f32;
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(6, 1, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(6, 1, 4, None, 2, &device);
 
         buffer.dones = Tensor::from_floats([[0.0], [0.0], [0.0], [0.0], [0.0], [1.0]], &device);
         buffer.acting_players = Tensor::from_ints([[0], [1], [0], [1], [0], [1]], &device);
@@ -2361,7 +2520,7 @@ mod tests {
 
         let device = Default::default();
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 1, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 1, 4, None, 2, &device);
 
         buffer.dones = Tensor::from_floats([[0.0], [1.0]], &device);
         buffer.acting_players = Tensor::from_ints([[0], [1]], &device);
@@ -2402,7 +2561,7 @@ mod tests {
 
         let device = Default::default();
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, None, 2, &device);
 
         // Episode 1: step 0 (P0), step 1 (P0, done)
         // Episode 2: step 2 (P0, done)
@@ -2464,7 +2623,7 @@ mod tests {
 
         let device = Default::default();
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 2, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(2, 2, 4, None, 2, &device);
 
         // Env 0: done at step 1, Env 1: not done
         buffer.dones = Tensor::from_floats([[0.0, 0.0], [1.0, 0.0]], &device);
@@ -2513,7 +2672,7 @@ mod tests {
 
         let device = Default::default();
 
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, 2, &device);
+        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(3, 1, 4, None, 2, &device);
 
         // No done flags - single ongoing episode
         buffer.dones = Tensor::zeros([3, 1], &device);
@@ -2550,7 +2709,7 @@ mod tests {
     #[test]
     fn test_buffer_flatten() {
         let device = Default::default();
-        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
+        let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, None, 1u8, &device);
 
         // Set advantages and returns
         let mut buffer = buffer;
@@ -2566,6 +2725,7 @@ mod tests {
             acting_players,
             old_values,
             valid_indices,
+            global_states,
         ) = buffer.flatten();
 
         assert_eq!(obs.dims(), [8, 3]);
@@ -2578,6 +2738,10 @@ mod tests {
         assert!(
             valid_indices.is_none(),
             "valid_indices should be None without valid_mask"
+        );
+        assert!(
+            global_states.is_none(),
+            "global_states should be None without CTDE"
         );
     }
 
@@ -2642,7 +2806,8 @@ mod tests {
     fn test_valid_mask_produces_correct_indices() {
         // Test that valid_mask correctly filters to only learner turn indices
         let device = Default::default();
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
+        let mut buffer: RolloutBuffer<TestBackend> =
+            RolloutBuffer::new(4, 2, 3, None, 1u8, &device);
 
         // Set up required fields
         buffer.advantages = Some(Tensor::ones([4, 2], &device));
@@ -2657,7 +2822,7 @@ mod tests {
             &device,
         ));
 
-        let (_, _, _, _, _, _, _, valid_indices) = buffer.flatten();
+        let (_, _, _, _, _, _, _, valid_indices, _) = buffer.flatten();
 
         assert!(
             valid_indices.is_some(),
@@ -2678,7 +2843,8 @@ mod tests {
     fn test_valid_mask_all_learner_turns() {
         // When all turns are learner turns, valid_indices should include all
         let device = Default::default();
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
+        let mut buffer: RolloutBuffer<TestBackend> =
+            RolloutBuffer::new(4, 2, 3, None, 1u8, &device);
 
         buffer.advantages = Some(Tensor::ones([4, 2], &device));
         buffer.returns = Some(Tensor::ones([4, 2], &device));
@@ -2686,7 +2852,7 @@ mod tests {
         // All 1.0 = all learner turns
         buffer.valid_mask = Some(Tensor::ones([4, 2], &device));
 
-        let (_, _, _, _, _, _, _, valid_indices) = buffer.flatten();
+        let (_, _, _, _, _, _, _, valid_indices, _) = buffer.flatten();
 
         let indices = valid_indices.expect("should have valid_indices");
         assert_eq!(indices.dims(), [8], "All 8 positions should be valid");
@@ -2699,7 +2865,8 @@ mod tests {
     fn test_valid_mask_no_learner_turns() {
         // Edge case: no learner turns (shouldn't happen in practice, but test robustness)
         let device = Default::default();
-        let mut buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(4, 2, 3, 1u8, &device);
+        let mut buffer: RolloutBuffer<TestBackend> =
+            RolloutBuffer::new(4, 2, 3, None, 1u8, &device);
 
         buffer.advantages = Some(Tensor::ones([4, 2], &device));
         buffer.returns = Some(Tensor::ones([4, 2], &device));
@@ -2707,7 +2874,7 @@ mod tests {
         // All 0.0 = all opponent turns
         buffer.valid_mask = Some(Tensor::zeros([4, 2], &device));
 
-        let (_, _, _, _, _, _, _, valid_indices) = buffer.flatten();
+        let (_, _, _, _, _, _, _, valid_indices, _) = buffer.flatten();
 
         let indices = valid_indices.expect("should have valid_indices");
         assert_eq!(indices.dims(), [0], "No positions should be valid");

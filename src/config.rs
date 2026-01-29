@@ -55,6 +55,8 @@ pub enum Command {
     Eval(EvalArgs),
     /// Run a tournament between checkpoints with skill ratings
     Tournament(TournamentArgs),
+    /// Evaluate exploitability via trained best-response policies
+    ExploitEval(ExploitEvalArgs),
 }
 
 /// Arguments for training
@@ -610,6 +612,119 @@ pub struct TournamentArgs {
     pub players: Option<usize>,
 }
 
+/// Arguments for exploit-eval command
+#[derive(Parser, Debug)]
+pub struct ExploitEvalArgs {
+    /// Path to run folder or specific checkpoint directory
+    pub path: PathBuf,
+
+    #[arg(long, help = "Compute backend (default: ndarray)")]
+    pub backend: Option<String>,
+
+    // Checkpoint selection
+    #[arg(long, help = "Max checkpoints to evaluate (default: all)")]
+    pub limit: Option<usize>,
+
+    #[arg(
+        long,
+        default_value = "evenly-spaced",
+        help = "Selection strategy: all, best, latest, evenly-spaced"
+    )]
+    pub selection: String,
+
+    // BR training hyperparameters
+    #[arg(
+        long,
+        default_value = "5000",
+        help = "Minimum training steps for BR policy"
+    )]
+    pub br_min_steps: usize,
+
+    #[arg(
+        long,
+        default_value = "20000",
+        help = "Maximum training steps for BR policy"
+    )]
+    pub br_max_steps: usize,
+
+    #[arg(
+        long,
+        default_value = "2000",
+        help = "Steps to check for plateau (0 = disable early stopping)"
+    )]
+    pub br_plateau_window: usize,
+
+    #[arg(
+        long,
+        default_value = "0.01",
+        help = "Minimum improvement to not be considered plateau"
+    )]
+    pub br_plateau_threshold: f64,
+
+    #[arg(long, default_value = "0.001", help = "Learning rate for BR training")]
+    pub br_lr: f64,
+
+    #[arg(
+        long,
+        default_value = "8",
+        help = "Parallel environments for BR training"
+    )]
+    pub br_envs: usize,
+
+    // BR network architecture
+    #[arg(long, default_value = "64", help = "Hidden layer size for BR network")]
+    pub br_hidden_size: usize,
+
+    #[arg(
+        long,
+        default_value = "2",
+        help = "Number of hidden layers for BR network"
+    )]
+    pub br_num_hidden: usize,
+
+    #[arg(
+        long,
+        default_value = "relu",
+        help = "Activation function (relu, tanh)"
+    )]
+    pub br_activation: String,
+
+    // Evaluation parameters
+    #[arg(
+        long,
+        default_value = "100",
+        help = "Games to play for final measurement"
+    )]
+    pub eval_games: usize,
+
+    #[arg(long, help = "Temperature for action sampling (default: env default)")]
+    pub eval_temp: Option<f32>,
+
+    #[arg(
+        long,
+        help = "Number of players per game for variable-player games like skull (required for skull)"
+    )]
+    pub players: Option<usize>,
+
+    // Output and reproducibility
+    #[arg(
+        short = 'o',
+        long,
+        help = "Output JSON path (default: <RUN_FOLDER>/exploitability_results.json)"
+    )]
+    pub output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Random seed for reproducibility (default: from timestamp)"
+    )]
+    pub seed: Option<u64>,
+
+    // Progress control
+    #[arg(long, default_value = "false", help = "Suppress progress bars")]
+    pub quiet: bool,
+}
+
 /// Legacy alias for backward compatibility
 pub type CliArgs = TrainArgs;
 
@@ -833,7 +948,17 @@ pub struct Config {
     #[serde(default)]
     pub split_networks: bool,
 
-    // CNN-specific parameters (ignored when network_type = "mlp")
+    // CTDE-specific parameters (only used when `network_type` = "ctde")
+    // Note: global_state_dim is NOT configurable - it's always read from the environment's
+    // GLOBAL_STATE_DIM constant to ensure consistency.
+    /// Critic hidden layer size for CTDE (default: same as actor)
+    #[serde(default)]
+    pub critic_hidden_size: Option<usize>,
+    /// Number of critic hidden layers for CTDE (default: same as actor)
+    #[serde(default)]
+    pub critic_num_hidden: Option<usize>,
+
+    // CNN-specific parameters (ignored when `network_type` = "mlp" or "ctde")
     /// Number of convolutional layers (default: 2)
     #[serde(default = "default_num_conv_layers")]
     pub num_conv_layers: usize,
@@ -1031,6 +1156,8 @@ impl Default for Config {
             num_hidden: default_num_hidden(),
             activation: default_activation(),
             split_networks: false,
+            critic_hidden_size: None,
+            critic_num_hidden: None,
             num_conv_layers: default_num_conv_layers(),
             conv_channels: default_conv_channels(),
             kernel_size: default_kernel_size(),
@@ -1516,12 +1643,15 @@ impl Config {
         }
 
         // Validate network type
-        if !["mlp", "cnn"].contains(&self.network_type.as_str()) {
+        if !["mlp", "cnn", "ctde"].contains(&self.network_type.as_str()) {
             bail!(
-                "Unknown network_type '{}'. Supported: mlp, cnn",
+                "Unknown network_type '{}'. Supported: mlp, cnn, ctde",
                 self.network_type
             );
         }
+
+        // Note: CTDE global_state_dim validation happens at runtime in run_training()
+        // when we have access to the environment type's GLOBAL_STATE_DIM constant
 
         // Validate CNN parameters
         if self.num_conv_layers == 0 {

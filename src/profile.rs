@@ -4,12 +4,21 @@
 //! so that only our application code gets instrumented, not dependencies like wgpu.
 
 // Memory tracking: callstack depth 0 by default (fast), 10 with tracy-callstack feature
-#[cfg(all(feature = "tracy", feature = "tracy-callstack"))]
+// Note: mutually exclusive with stats_alloc (can't have two global allocators)
+#[cfg(all(
+    feature = "tracy",
+    feature = "tracy-callstack",
+    not(feature = "stats_alloc")
+))]
 #[global_allocator]
 static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 30);
 
-#[cfg(all(feature = "tracy", not(feature = "tracy-callstack")))]
+#[cfg(all(
+    feature = "tracy",
+    not(feature = "tracy-callstack"),
+    not(feature = "stats_alloc")
+))]
 #[global_allocator]
 static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 0);

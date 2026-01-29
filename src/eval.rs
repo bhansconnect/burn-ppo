@@ -753,6 +753,9 @@ pub fn load_model_from_checkpoint<B: Backend>(
         kernel_size: metadata.kernel_size,
         cnn_fc_hidden_size: metadata.cnn_fc_hidden_size,
         cnn_num_fc_layers: metadata.cnn_num_fc_layers,
+        // Note: global_state_dim is read from metadata in CheckpointManager::load
+        critic_hidden_size: metadata.critic_hidden_size,
+        critic_num_hidden: metadata.critic_num_hidden,
         ..Config::default()
     };
 
@@ -1167,7 +1170,13 @@ fn run_watch_mode_env<B: Backend, E: Environment>(
                 let obs_tensor: Tensor<B, 2> =
                     Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
                         .reshape([1, E::OBSERVATION_DIM]);
-                let (logits, _) = model.forward(obs_tensor);
+
+                // Handle CTDE networks: use actor network only (don't need values for action selection)
+                let logits = if model.is_ctde() {
+                    model.forward_actor(obs_tensor)
+                } else {
+                    model.forward(obs_tensor).0
+                };
                 logits
                     .to_data()
                     .to_vec()
@@ -1403,7 +1412,13 @@ pub fn run_interactive_game<B: Backend, E: Environment>(
                     let obs_tensor: Tensor<B, 2> =
                         Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
                             .reshape([1, E::OBSERVATION_DIM]);
-                    let (logits, _) = model.forward(obs_tensor);
+
+                    // Handle CTDE networks: use actor network only
+                    let logits = if model.is_ctde() {
+                        model.forward_actor(obs_tensor)
+                    } else {
+                        model.forward(obs_tensor).0
+                    };
                     let logits_vec: Vec<f32> = logits
                         .to_data()
                         .to_vec()
@@ -1501,7 +1516,13 @@ fn build_hint_closure<'a, B: Backend, E: Environment>(
     };
     let obs_tensor: Tensor<B, 2> =
         Tensor::<B, 1>::from_floats(&obs_for_model[..], device).reshape([1, E::OBSERVATION_DIM]);
-    let (logits, _) = model.forward(obs_tensor);
+
+    // Handle CTDE networks: use actor network only
+    let logits = if model.is_ctde() {
+        model.forward_actor(obs_tensor)
+    } else {
+        model.forward(obs_tensor).0
+    };
     let logits_vec: Vec<f32> = logits
         .to_data()
         .to_vec()
@@ -1714,7 +1735,13 @@ pub fn run_stats_mode_env<B: Backend, E: Environment>(
                 let obs_tensor: Tensor<B, 2> =
                     Tensor::<B, 1>::from_floats(&obs_for_model[..], device)
                         .reshape([batch_size, obs_dim]);
-                let (logits_tensor, _) = model.forward(obs_tensor.clone());
+
+                // Handle CTDE networks: use actor network only
+                let logits_tensor = if model.is_ctde() {
+                    model.forward_actor(obs_tensor)
+                } else {
+                    model.forward(obs_tensor.clone()).0
+                };
                 logits_tensor
                     .to_data()
                     .to_vec()

@@ -61,6 +61,15 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// If true, `set_num_players` and `active_player_count` should be implemented.
     const VARIABLE_PLAYER_COUNT: bool = false;
 
+    /// Global state dimension for CTDE critic (None = no CTDE support / use local obs)
+    ///
+    /// When using CTDE (Centralized Training, Decentralized Execution):
+    /// - Actor sees only `OBSERVATION_DIM` local observations
+    /// - Critic sees `GLOBAL_STATE_DIM` global state (privileged information)
+    ///
+    /// If None, CTDE cannot be used for this environment.
+    const GLOBAL_STATE_DIM: Option<usize> = None;
+
     /// Create a new environment with the given seed.
     /// For deterministic games, the seed may be ignored.
     fn new(seed: u64) -> Self;
@@ -91,6 +100,22 @@ pub trait Environment: Send + Sync + Sized + 'static {
     /// Default: None (infer from `total_rewards` via argmax)
     fn game_outcome(&self) -> Option<GameOutcome> {
         None
+    }
+
+    /// Return global state for CTDE critic (optional)
+    ///
+    /// The global state provides privileged information to the critic during training:
+    /// - Actor (decentralized): sees only local observation
+    /// - Critic (centralized): sees full game state
+    ///
+    /// **Design**: Should be minimal canonical representation:
+    /// - Shared game state (ONE copy, not per-player)
+    /// - Per-player private information (cards, dice, etc.)
+    /// - All values normalized to [0, 1] or [-1, 1] ranges
+    ///
+    /// Default: returns empty vec (CTDE not supported)
+    fn global_state(&self) -> Vec<f32> {
+        vec![]
     }
 
     /// Render the current state as a string for visualization.
@@ -322,6 +347,23 @@ impl<E: Environment> VecEnv<E> {
             }
         }
         Some(masks)
+    }
+
+    /// Get global states for all environments (for CTDE critic)
+    /// Returns flattened array [`num_envs` * `global_state_dim`]
+    /// Returns empty vec if environment doesn't provide global states
+    pub fn get_global_states(&self) -> Vec<f32> {
+        let first_state = self.envs[0].global_state();
+        if first_state.is_empty() {
+            return Vec::new();
+        }
+
+        let global_state_dim = first_state.len();
+        let mut states = Vec::with_capacity(self.envs.len() * global_state_dim);
+        for env in &self.envs {
+            states.extend(env.global_state());
+        }
+        states
     }
 
     /// Mark an env as terminal (won't step or reset)

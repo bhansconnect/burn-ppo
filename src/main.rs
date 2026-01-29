@@ -23,6 +23,7 @@ mod entropy;
 mod env;
 mod envs;
 mod eval;
+mod exploit_eval;
 mod human;
 mod metrics;
 mod network;
@@ -210,6 +211,27 @@ where
         );
     }
 
+    // Resolve global_state_dim from environment for CTDE networks
+    let global_state_dim: Option<usize> = if config.network_type == "ctde" {
+        match E::GLOBAL_STATE_DIM {
+            Some(dim) => {
+                if !quiet {
+                    println!("CTDE enabled with global_state_dim={dim} (from environment)");
+                }
+                Some(dim)
+            }
+            None => {
+                bail!(
+                    "Environment '{}' does not support CTDE (GLOBAL_STATE_DIM is None). \
+                     Use network_type='mlp' instead.",
+                    E::NAME
+                );
+            }
+        }
+    } else {
+        None
+    };
+
     // Create observation normalizer if enabled
     let mut obs_normalizer: Option<ObsNormalizer> = if config.normalize_obs {
         Some(ObsNormalizer::new(obs_dim, 10.0))
@@ -260,6 +282,7 @@ where
                 obs_shape,
                 action_count,
                 num_players as usize,
+                global_state_dim,
                 config,
                 device,
             );
@@ -393,8 +416,15 @@ where
 
     // Create rollout buffer with inference backend (non-autodiff)
     // This prevents memory accumulation from autodiff graph during rollout
-    let mut buffer: RolloutBuffer<TB::InnerBackend> =
-        RolloutBuffer::new(config.num_steps, num_envs, obs_dim, num_players, device);
+    // For CTDE networks, also allocate space for global states (global_state_dim resolved earlier)
+    let mut buffer: RolloutBuffer<TB::InnerBackend> = RolloutBuffer::new(
+        config.num_steps,
+        num_envs,
+        obs_dim,
+        global_state_dim,
+        num_players,
+        device,
+    );
 
     // Create metrics logger
     let mut logger = MetricsLogger::new(run_dir)?;
@@ -439,8 +469,12 @@ where
             kernel_size: config.kernel_size,
             cnn_fc_hidden_size: config.cnn_fc_hidden_size,
             cnn_num_fc_layers: config.cnn_num_fc_layers,
+            global_state_dim,
+            critic_hidden_size: config.critic_hidden_size,
+            critic_num_hidden: config.critic_num_hidden,
             obs_shape,
             env_name: E::NAME.to_string(),
+            exploitability_vs_pool: None,
         };
 
         checkpoint_manager.save(&model, &metadata, true)?;
@@ -642,7 +676,9 @@ where
     #[cfg(feature = "stats_alloc")]
     let mut last_net_bytes: i64 = {
         let s = GLOBAL.stats();
-        s.bytes_allocated as i64 + s.bytes_reallocated as i64 - s.bytes_deallocated as i64
+        s.bytes_allocated.try_into().unwrap_or(i64::MAX)
+            + s.bytes_reallocated.try_into().unwrap_or(i64::MAX)
+            - s.bytes_deallocated.try_into().unwrap_or(i64::MAX)
     };
 
     // Training loop
@@ -759,6 +795,12 @@ where
             // Apply pending win rate updates and refresh opponent selection
             // Note: new checkpoints are added via pool.add_checkpoint() when saved
             pool.apply_pending_win_rate_updates();
+
+            // Log pool performance metric if we have valid data
+            if let Some(perf) = pool.get_pool_performance(num_players as usize) {
+                logger.log_scalar("eval/pool_performance", perf, global_step)?;
+            }
+
             pool.refresh_current_opponents();
 
             // Debug output for opponent selection (to stderr for debug output)
@@ -841,7 +883,18 @@ where
         let obs_tensor: Tensor<TB::InnerBackend, 2> =
             Tensor::<TB::InnerBackend, 1>::from_floats(obs_flat.as_slice(), device)
                 .reshape([num_envs, obs_dim]);
-        let (_, all_values) = inference_model.forward(obs_tensor);
+
+        // Handle CTDE networks: use critic network with global states
+        let all_values = if inference_model.is_ctde() {
+            let global_states_flat = vec_env.get_global_states();
+            let global_state_dim = global_states_flat.len() / num_envs;
+            let global_state_tensor =
+                Tensor::<TB::InnerBackend, 1>::from_floats(global_states_flat.as_slice(), device)
+                    .reshape([num_envs, global_state_dim]);
+            inference_model.forward_critic(global_state_tensor)
+        } else {
+            inference_model.forward(obs_tensor).1
+        };
 
         // Denormalize bootstrap values if PopArt is active
         // After rescaling, model outputs normalized values - convert back to raw for GAE
@@ -902,14 +955,14 @@ where
         #[cfg(feature = "stats_alloc")]
         {
             let stats = GLOBAL.stats();
-            let net_bytes = stats.bytes_allocated as i64 + stats.bytes_reallocated as i64
-                - stats.bytes_deallocated as i64;
+            let net_bytes = stats.bytes_allocated.try_into().unwrap_or(i64::MAX)
+                + stats.bytes_reallocated.try_into().unwrap_or(i64::MAX)
+                - stats.bytes_deallocated.try_into().unwrap_or(i64::MAX);
             let delta_bytes = net_bytes - last_net_bytes;
             let delta_mb = delta_bytes as f64 / (1024.0 * 1024.0);
             let net_mb = net_bytes as f64 / (1024.0 * 1024.0);
             progress.eprintln(&format!(
-                "[mem] update {}: {:.2} MB (delta: {:+.2} MB)",
-                update, net_mb, delta_mb
+                "[mem] update {update}: {net_mb:.2} MB (delta: {delta_mb:+.2} MB)"
             ));
             last_net_bytes = net_bytes;
         }
@@ -1176,6 +1229,11 @@ where
                     / episodes_since_checkpoint.len() as f32
             };
 
+            // Compute pool performance from opponent pool if available
+            let exploitability_vs_pool = opponent_pool
+                .as_ref()
+                .and_then(|pool| pool.get_pool_performance(num_players as usize));
+
             let metadata = CheckpointMetadata {
                 step: global_step,
                 avg_return,
@@ -1196,8 +1254,12 @@ where
                 kernel_size: config.kernel_size,
                 cnn_fc_hidden_size: config.cnn_fc_hidden_size,
                 cnn_num_fc_layers: config.cnn_num_fc_layers,
+                global_state_dim,
+                critic_hidden_size: config.critic_hidden_size,
+                critic_num_hidden: config.critic_num_hidden,
                 obs_shape,
                 env_name: E::NAME.to_string(),
+                exploitability_vs_pool,
             };
 
             // Determine whether to auto-update "best" symlink
@@ -1364,6 +1426,11 @@ where
             episodes_since_checkpoint.iter().sum::<f32>() / episodes_since_checkpoint.len() as f32
         };
 
+        // Compute pool performance from opponent pool if available
+        let exploitability_vs_pool = opponent_pool
+            .as_ref()
+            .and_then(|pool| pool.get_pool_performance(num_players as usize));
+
         let metadata = CheckpointMetadata {
             step: global_step,
             avg_return,
@@ -1384,8 +1451,12 @@ where
             kernel_size: config.kernel_size,
             cnn_fc_hidden_size: config.cnn_fc_hidden_size,
             cnn_num_fc_layers: config.cnn_num_fc_layers,
+            global_state_dim,
+            critic_hidden_size: config.critic_hidden_size,
+            critic_num_hidden: config.critic_num_hidden,
             obs_shape,
             env_name: E::NAME.to_string(),
+            exploitability_vs_pool,
         };
 
         // Determine whether to auto-update "best" symlink (same logic as regular checkpoints)
@@ -1589,6 +1660,16 @@ fn main() -> Result<()> {
                 tournament::run_tournament::<
                     <TB as burn::tensor::backend::AutodiffBackend>::InnerBackend,
                 >(&tournament_args, &device)
+            })
+        }
+        Some(Command::ExploitEval(exploit_eval_args)) => {
+            let backend_name = exploit_eval_args
+                .backend
+                .as_deref()
+                .unwrap_or_else(|| backend::default_backend());
+            backend::warn_if_better_backend_available(backend_name);
+            dispatch_backend!(backend_name, device, {
+                exploit_eval::run_exploit_eval_with_backend::<TB>(&exploit_eval_args, &device)
             })
         }
         Some(Command::Train(args)) => {

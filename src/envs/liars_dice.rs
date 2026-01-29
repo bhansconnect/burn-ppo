@@ -45,6 +45,24 @@ const OBSERVATION_DIM: usize = OBS_OWN_DICE
     + OBS_LAST_BIDDER
     + OBS_BID_HISTORY; // 78 + 192 = 270
 
+// Global state dimension components (exact calculation for CTDE)
+// These constants document the structure of the global_state() output
+const GS_CURRENT_PLAYER: usize = 1;
+const GS_CURRENT_BID: usize = 2; // quantity + face
+const GS_LAST_BIDDER: usize = 1;
+const GS_BID_COUNT: usize = 1;
+const GS_BID_HISTORY: usize = 16 * 3; // 16 entries × 3 floats each (bidder + quantity + face)
+const GS_GAME_OVER: usize = 1;
+const GS_PER_PLAYER: usize = 14; // dice_count + is_alive + (2 dice × 6 faces one-hot)
+
+const GLOBAL_STATE_DIM_EXACT: usize = GS_CURRENT_PLAYER
+    + GS_CURRENT_BID
+    + GS_LAST_BIDDER
+    + GS_BID_COUNT
+    + GS_BID_HISTORY
+    + GS_GAME_OVER
+    + (GS_PER_PLAYER * NUM_PLAYERS); // = 110 floats
+
 /// Action types in Liar's Dice
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -435,6 +453,11 @@ impl Environment for LiarsDice {
     const NUM_PLAYERS: usize = NUM_PLAYERS;
     const EVAL_TEMP: f32 = 1.0; // Stochastic play essential for bluffing
 
+    // Canonical global state for CTDE: shared game state + per-player private dice
+    // Actual dimension (GLOBAL_STATE_DIM_EXACT) = 110 floats
+    // CRITICAL FIX: Increased from 100 to 120 (was causing truncation!)
+    const GLOBAL_STATE_DIM: Option<usize> = Some(120);
+
     fn new(seed: u64) -> Self {
         Self::new_with_config(seed, Schedule::constant(0.0)) // Default: no reward shaping
     }
@@ -611,6 +634,108 @@ impl Environment for LiarsDice {
 
     fn set_step(&mut self, step: u64) {
         self.current_step = step;
+    }
+
+    fn global_state(&self) -> Vec<f32> {
+        let mut global = Vec::new();
+
+        // ===== SHARED GAME STATE (absolute indexing, ONE copy) =====
+
+        // Current player (absolute seat, normalized to [0, 1])
+        global.push(self.current_player as f32 / NUM_PLAYERS as f32);
+
+        // Current bid state
+        if let Some((quantity, face)) = self.current_bid {
+            // Quantity (normalized to [0, 1])
+            global.push(quantity as f32 / MAX_TOTAL_DICE as f32);
+            // Face (normalized to [0, 1])
+            global.push(face as f32 / DICE_FACES as f32);
+        } else {
+            global.push(0.0); // No bid yet
+            global.push(0.0);
+        }
+
+        // Last bidder (absolute seat, normalized)
+        if let Some(bidder) = self.last_bidder {
+            global.push(bidder as f32 / NUM_PLAYERS as f32);
+        } else {
+            global.push(-1.0); // No bidder yet
+        }
+
+        // Bid count this round (normalized)
+        global.push(self.bid_count as f32 / (NUM_PLAYERS * 3) as f32); // Rough max estimate
+
+        // Bid history (last N bids in absolute seat order)
+        // Each entry: (bidder_seat_normalized, quantity_normalized, face_normalized)
+        let max_history = 16;
+        let history_len = self.bid_history.history.len().min(max_history);
+        for &(bidder, quantity, face) in self.bid_history.history.iter().rev().take(history_len) {
+            global.push(bidder as f32 / NUM_PLAYERS as f32);
+            global.push(quantity as f32 / MAX_TOTAL_DICE as f32);
+            global.push(face as f32 / DICE_FACES as f32);
+        }
+        // Pad if fewer than max_history
+        for _ in history_len..max_history {
+            global.push(0.0); // bidder
+            global.push(0.0); // quantity
+            global.push(0.0); // face
+        }
+
+        // Game over flag
+        global.push(if self.game_over { 1.0 } else { 0.0 });
+
+        // ===== PER-PLAYER PRIVATE INFO (absolute seat order) =====
+
+        for seat in 0..NUM_PLAYERS {
+            // Dice count (normalized to [0, 1])
+            global.push(self.dice_count[seat] as f32 / DICE_PER_PLAYER as f32);
+
+            // Player is alive (still has dice)
+            let is_alive = self.dice_count[seat] > 0;
+            global.push(if is_alive { 1.0 } else { 0.0 });
+
+            // Player's actual dice (what only they know)
+            // One-hot encode each die (faces 1-6)
+            for die_idx in 0..DICE_PER_PLAYER {
+                if die_idx < self.dice_count[seat] {
+                    let die_value = self.dice[seat][die_idx];
+                    // One-hot for faces 1-6
+                    for face in 1..=DICE_FACES {
+                        global.push(if die_value as usize == face { 1.0 } else { 0.0 });
+                    }
+                } else {
+                    // Dice lost - pad with zeros
+                    global.extend(std::iter::repeat_n(0.0, DICE_FACES));
+                }
+            }
+        }
+
+        // Pad to GLOBAL_STATE_DIM if needed for fixed tensor size
+        let target_dim = Self::GLOBAL_STATE_DIM.expect("GLOBAL_STATE_DIM must be set for CTDE");
+        let actual_len = global.len();
+
+        if actual_len < target_dim {
+            global.extend(std::iter::repeat_n(0.0, target_dim - actual_len));
+        }
+
+        // Runtime validation (debug builds only)
+        debug_assert_eq!(
+            global.len(),
+            target_dim,
+            "Global state dimension mismatch: got {}, expected {}",
+            global.len(),
+            target_dim
+        );
+
+        // Sanity check: actual size shouldn't greatly exceed exact calculation
+        // This catches bugs where global_state() implementation adds more floats than expected
+        assert!(actual_len <= GLOBAL_STATE_DIM_EXACT + 10,
+            "Global state dimension calculation error in Liar's Dice.\n\
+             Expected ~{GLOBAL_STATE_DIM_EXACT} floats (GLOBAL_STATE_DIM_EXACT), got {actual_len} before padding.\n\
+             Update dimension constants in src/envs/liars_dice.rs"
+        );
+
+        global
     }
 }
 
@@ -1431,5 +1556,40 @@ mod tests {
         assert_eq!(rewards[1], 0.0, "P1 survives with 0 shaping");
         assert_eq!(rewards[2], 0.0, "P2 survives with 0 shaping");
         assert_eq!(rewards[3], 0.0, "P3 survives with 0 shaping");
+    }
+
+    #[test]
+    fn test_global_state_dimension() {
+        let mut env = LiarsDice::new(42);
+        env.reset();
+
+        let global_state = env.global_state();
+        let expected_dim = LiarsDice::GLOBAL_STATE_DIM.unwrap();
+
+        assert_eq!(
+            global_state.len(),
+            expected_dim,
+            "Liar's Dice global state should match GLOBAL_STATE_DIM"
+        );
+
+        // CRITICAL: Verify the fix for the truncation bug
+        // The exact dimension is GLOBAL_STATE_DIM_EXACT (110), so 120 should accommodate it
+        assert!(
+            expected_dim >= GLOBAL_STATE_DIM_EXACT,
+            "Liar's Dice GLOBAL_STATE_DIM ({expected_dim}) should accommodate GLOBAL_STATE_DIM_EXACT ({GLOBAL_STATE_DIM_EXACT}) floats"
+        );
+
+        // Verify GLOBAL_STATE_DIM was increased from 100 to 120
+        assert_eq!(
+            expected_dim, 120,
+            "Liar's Dice GLOBAL_STATE_DIM should be 120 (bug fix from 100)"
+        );
+
+        // No truncation - all values after the actual data should be padding zeros
+        let padding = &global_state[GLOBAL_STATE_DIM_EXACT..];
+        assert!(
+            padding.iter().all(|&x| x == 0.0),
+            "Padding region should be all zeros (no truncation)"
+        );
     }
 }
