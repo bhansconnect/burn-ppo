@@ -65,14 +65,14 @@ const OBSERVATION_DIM: usize = OBS_OWN_HAND
 
 /// Card types in Skull
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Card {
+pub enum Card {
     Skull,
     Rose,
 }
 
 /// Game phases
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Phase {
+pub enum Phase {
     Placing,
     Bidding,
     Revealing,
@@ -100,7 +100,7 @@ pub struct Skull {
 
     // Per-player round state
     stack: [Vec<Card>; MAX_PLAYERS], // cards played this round
-    passed: [bool; MAX_PLAYERS],     // who has passed in current bidding/placing
+    passed: [bool; MAX_PLAYERS],     // who has passed in current bidding
 
     // Round state
     phase: Phase,
@@ -638,6 +638,329 @@ impl Skull {
     }
 }
 
+// ===== Public accessor methods for interactive UI =====
+#[expect(dead_code, reason = "Public API for interactive UI feature")]
+impl Skull {
+    /// Get the current game phase
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Get the current player index
+    pub fn current_player(&self) -> usize {
+        self.current_player
+    }
+
+    /// Get the number of active players
+    pub fn num_players(&self) -> usize {
+        self.num_players
+    }
+
+    /// Get the current bid value
+    pub fn current_bid(&self) -> usize {
+        self.current_bid
+    }
+
+    /// Get the current bidder if any
+    pub fn current_bidder(&self) -> Option<usize> {
+        self.current_bidder
+    }
+
+    /// Check if a player is alive (public accessor)
+    pub fn player_is_alive(&self, player: usize) -> bool {
+        self.is_alive(player)
+    }
+
+    /// Get coaster count for a player (public accessor)
+    pub fn player_coaster_count(&self, player: usize) -> usize {
+        self.coaster_count(player)
+    }
+
+    /// Get wins for a player
+    pub fn player_wins(&self, player: usize) -> usize {
+        if player < self.num_players {
+            self.wins[player]
+        } else {
+            0
+        }
+    }
+
+    /// Get stack size for a player
+    pub fn player_stack_size(&self, player: usize) -> usize {
+        if player < self.num_players {
+            self.stack[player].len()
+        } else {
+            0
+        }
+    }
+
+    /// Get revealed count for a player
+    pub fn player_revealed(&self, player: usize) -> usize {
+        if player < self.num_players {
+            self.revealed[player]
+        } else {
+            0
+        }
+    }
+
+    /// Check if a player has passed
+    pub fn player_passed(&self, player: usize) -> bool {
+        if player < self.num_players {
+            self.passed[player]
+        } else {
+            false
+        }
+    }
+
+    /// Check if game is over
+    pub fn is_game_over(&self) -> bool {
+        self.game_over
+    }
+
+    /// Get the winner if game is over
+    pub fn winner(&self) -> Option<usize> {
+        self.winner
+    }
+
+    /// Get hand info for a player (`has_skull_in_hand`, `roses_in_hand`)
+    pub fn player_hand_info(&self, player: usize) -> (bool, usize) {
+        if player < self.num_players {
+            (self.has_trap_in_hand(player), self.roses_in_hand(player))
+        } else {
+            (false, 0)
+        }
+    }
+
+    /// Get stack contents for a player (for AI's own view)
+    pub fn player_stack_contents(&self, player: usize) -> Vec<Card> {
+        if player < self.num_players {
+            self.stack[player].clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Check if bidder must reveal own stack first
+    pub fn must_reveal_own_stack(&self) -> bool {
+        self.must_reveal_own
+    }
+
+    /// Set a specific card in a player's stack (for interactive reveal handling)
+    /// This allows the UI to specify what card was revealed when revealing other players
+    pub fn set_stack_card(&mut self, player: usize, index: usize, card: Card) {
+        if player < self.num_players && index < self.stack[player].len() {
+            self.stack[player][index] = card;
+        }
+    }
+
+    /// Set current player directly (for interactive navigation)
+    pub fn set_current_player(&mut self, player: usize) {
+        if player < self.num_players {
+            self.current_player = player;
+        }
+    }
+
+    /// Get observation vector (public wrapper for Environment trait method)
+    pub fn observation(&self) -> Vec<f32> {
+        // This is a copy of the private get_observation logic
+        // to allow interactive mode to access it
+        let mut obs = vec![0.0; OBSERVATION_DIM];
+        let mut idx = 0;
+
+        let player = self.current_player;
+        let n = self.num_players;
+
+        // Own hand: [has_trap_in_hand, rose1, rose2, rose3]
+        obs[idx] = if self.has_trap_in_hand(player) {
+            1.0
+        } else {
+            0.0
+        };
+        let roses_in_hand = self.roses_in_hand(player);
+        for i in 0..ROSES_PER_PLAYER {
+            obs[idx + 1 + i] = if i < roses_in_hand { 1.0 } else { 0.0 };
+        }
+        idx += OBS_OWN_HAND;
+
+        // Own stack contents (known to self)
+        for i in 0..CARDS_PER_PLAYER {
+            if i < self.stack[player].len() {
+                obs[idx + i] = if self.stack[player][i] == Card::Skull {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
+        }
+        idx += OBS_OWN_STACK;
+
+        // Stack sizes per player (normalized by max cards) - RELATIVE indexing
+        for rel_idx in 0..MAX_PLAYERS {
+            if rel_idx < n {
+                let abs_idx = (rel_idx + player) % n;
+                obs[idx + rel_idx] = self.stack[abs_idx].len() as f32 / CARDS_PER_PLAYER as f32;
+            }
+        }
+        idx += OBS_STACK_SIZES;
+
+        // Coasters remaining (normalized) - RELATIVE indexing
+        for rel_idx in 0..MAX_PLAYERS {
+            if rel_idx < n {
+                let abs_idx = (rel_idx + player) % n;
+                obs[idx + rel_idx] = self.coaster_count(abs_idx) as f32 / CARDS_PER_PLAYER as f32;
+            }
+        }
+        idx += OBS_COASTERS;
+
+        // Alive flags - RELATIVE indexing
+        for rel_idx in 0..MAX_PLAYERS {
+            if rel_idx < n {
+                let abs_idx = (rel_idx + player) % n;
+                obs[idx + rel_idx] = if self.is_alive(abs_idx) { 1.0 } else { 0.0 };
+            }
+        }
+        idx += OBS_ALIVE_FLAGS;
+
+        // Player exists flags - RELATIVE indexing
+        for rel_idx in 0..MAX_PLAYERS {
+            if rel_idx < n {
+                obs[idx + rel_idx] = 1.0;
+            }
+        }
+        idx += OBS_PLAYER_EXISTS;
+
+        // Seat position one-hot - ABSOLUTE
+        obs[idx + player] = 1.0;
+        idx += OBS_SEAT_POSITION;
+
+        // Phase one-hot
+        let phase_idx = match self.phase {
+            Phase::Placing => 0,
+            Phase::Bidding => 1,
+            Phase::Revealing => 2,
+        };
+        obs[idx + phase_idx] = 1.0;
+        idx += OBS_PHASE;
+
+        // Current bid (normalized)
+        obs[idx] = self.current_bid as f32 / MAX_BID as f32;
+        idx += OBS_CURRENT_BID;
+
+        // Current bidder one-hot - RELATIVE indexing
+        if let Some(bidder) = self.current_bidder {
+            let rel_bidder = (bidder + n - player) % n;
+            obs[idx + rel_bidder] = 1.0;
+        }
+        idx += OBS_CURRENT_BIDDER;
+
+        // Passed flags - RELATIVE indexing
+        for rel_idx in 0..MAX_PLAYERS {
+            if rel_idx < n {
+                let abs_idx = (rel_idx + player) % n;
+                obs[idx + rel_idx] = if self.passed[abs_idx] { 1.0 } else { 0.0 };
+            }
+        }
+        idx += OBS_PASSED;
+
+        // Win count per player - RELATIVE indexing
+        for rel_idx in 0..MAX_PLAYERS {
+            if rel_idx < n {
+                let abs_idx = (rel_idx + player) % n;
+                obs[idx + rel_idx] = self.wins[abs_idx] as f32 / WINS_TO_WIN as f32;
+            }
+        }
+        idx += OBS_WIN_COUNT;
+
+        // Revealed count per stack (normalized) - RELATIVE indexing
+        for rel_idx in 0..MAX_PLAYERS {
+            if rel_idx < n {
+                let abs_idx = (rel_idx + player) % n;
+                obs[idx + rel_idx] = self.revealed[abs_idx] as f32 / CARDS_PER_PLAYER as f32;
+            }
+        }
+        idx += OBS_REVEALED_COUNT;
+
+        // Number of players one-hot (2-6 maps to indices 0-4)
+        if (2..=MAX_PLAYERS).contains(&n) {
+            obs[idx + n - 2] = 1.0;
+        }
+        idx += OBS_NUM_PLAYERS;
+
+        // Bid history - RELATIVE player indexing
+        for (i, entry) in self.bid_history.iter().enumerate() {
+            let base = idx + i * BID_HISTORY_ENTRY_SIZE;
+            let rel_player = (entry.player + n - player) % n;
+            obs[base + rel_player] = 1.0;
+            if entry.bid == 0 {
+                obs[base + MAX_PLAYERS + 1] = 1.0;
+            } else {
+                obs[base + MAX_PLAYERS] = entry.bid as f32 / MAX_BID as f32;
+            }
+        }
+
+        obs
+    }
+
+    /// Get action mask (public wrapper for Environment trait method)
+    pub fn valid_actions(&self) -> Vec<bool> {
+        let mut mask = vec![false; ACTION_COUNT];
+
+        if self.game_over {
+            return mask;
+        }
+
+        let player = self.current_player;
+
+        match self.phase {
+            Phase::Placing => {
+                if self.has_trap_in_hand(player) {
+                    mask[PLACE_SKULL] = true;
+                }
+                if self.roses_in_hand(player) > 0 {
+                    mask[PLACE_ROSE] = true;
+                }
+                if !self.stack[player].is_empty() {
+                    let total_cards = self.total_cards_in_stacks();
+                    let min_bid = (self.current_bid + 1).max(1);
+                    for bid in min_bid..=total_cards {
+                        mask[BID_BASE + bid - 1] = true;
+                    }
+                }
+            }
+            Phase::Bidding => {
+                let total_cards = self.total_cards_in_stacks();
+                for bid in (self.current_bid + 1)..=total_cards {
+                    mask[BID_BASE + bid - 1] = true;
+                }
+                if !self.passed[player] && self.non_passed_count() > 1 {
+                    mask[PASS_ACTION] = true;
+                }
+            }
+            Phase::Revealing => {
+                let bidder = self
+                    .current_bidder
+                    .expect("Revealing phase requires a bidder");
+                if player == bidder {
+                    if self.must_reveal_own && self.unrevealed_count(bidder) > 0 {
+                        mask[REVEAL_PLAYER_BASE + bidder] = true;
+                    } else {
+                        if self.unrevealed_count(bidder) > 0 {
+                            mask[REVEAL_PLAYER_BASE + bidder] = true;
+                        }
+                        for p in 0..self.num_players {
+                            if p != bidder && self.unrevealed_count(p) > 0 {
+                                mask[REVEAL_PLAYER_BASE + p] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        mask
+    }
+}
+
 impl Environment for Skull {
     const OBSERVATION_DIM: usize = OBSERVATION_DIM;
     const ACTION_COUNT: usize = ACTION_COUNT;
@@ -722,28 +1045,6 @@ impl Environment for Skull {
                     // Start bidding
                     let bid = action - BID_BASE + 1;
                     self.transition_to_bidding(player, bid);
-                } else if action == PASS_ACTION {
-                    self.passed[player] = true;
-                    // Check if all but one have passed (that one must bid)
-                    let non_passed = self.non_passed_count();
-                    if non_passed == 1 {
-                        // Force the remaining player to start bidding phase
-                        // They'll need to place a card or bid on their turn
-                        let remaining = (0..self.num_players)
-                            .find(|&p| self.is_alive(p) && !self.passed[p])
-                            .expect("non_passed is 1 but no non-passed player found");
-                        self.current_player = remaining;
-                    } else if non_passed == 0 {
-                        // Everyone passed without bidding - shouldn't happen with proper masking
-                        // Start new round
-                        self.start_new_round(self.round_starter);
-                    } else {
-                        self.current_player = self.next_alive_player(player);
-                        // Skip passed players
-                        while self.passed[self.current_player] && self.current_player != player {
-                            self.current_player = self.next_alive_player(self.current_player);
-                        }
-                    }
                 }
             }
 
@@ -880,12 +1181,6 @@ impl Environment for Skull {
                     let min_bid = (self.current_bid + 1).max(1);
                     for bid in min_bid..=total_cards {
                         mask[BID_BASE + bid - 1] = true;
-                    }
-
-                    // Can pass if other players still need to act
-                    // (but not if we're the only non-passed player)
-                    if self.non_passed_count() > 1 {
-                        mask[PASS_ACTION] = true;
                     }
                 }
             }
