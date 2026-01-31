@@ -25,6 +25,7 @@ mod envs;
 mod eval;
 mod exploit_eval;
 mod human;
+mod interactive;
 mod metrics;
 mod network;
 mod normalization;
@@ -1623,7 +1624,8 @@ where
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Initialize rayon thread pool with named threads for Tracy
     rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("Rayon-{idx}"))
@@ -1638,6 +1640,16 @@ fn main() -> Result<()> {
 
     // Dispatch based on subcommand
     match cli.command {
+        Some(Command::Interactive(interactive_args)) => {
+            let backend_name = interactive_args.backend.as_str();
+            backend::warn_if_better_backend_available(backend_name);
+            dispatch_backend!(backend_name, device, {
+                interactive::run_interactive::<
+                    <TB as burn::tensor::backend::AutodiffBackend>::InnerBackend,
+                >(interactive_args, device)
+                .await
+            })
+        }
         Some(Command::Eval(eval_args)) => {
             let backend_name = eval_args
                 .backend

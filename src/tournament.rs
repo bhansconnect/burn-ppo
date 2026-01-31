@@ -236,12 +236,12 @@ pub struct TournamentConfigSummary {
 }
 
 /// Check if a path is a checkpoint directory (has metadata.json)
-fn is_checkpoint_dir(path: &Path) -> bool {
+pub fn is_checkpoint_dir(path: &Path) -> bool {
     path.is_dir() && path.join("metadata.json").exists()
 }
 
 /// Check if a path is a checkpoints directory (contains step_* subdirectories)
-fn is_run_checkpoints_dir(path: &Path) -> bool {
+pub fn is_run_checkpoints_dir(path: &Path) -> bool {
     path.is_dir()
         && std::fs::read_dir(path)
             .map(|entries| {
@@ -255,12 +255,12 @@ fn is_run_checkpoints_dir(path: &Path) -> bool {
 }
 
 /// Check if a path is a run directory (has checkpoints subdirectory)
-fn is_run_dir(path: &Path) -> bool {
+pub fn is_run_dir(path: &Path) -> bool {
     path.is_dir() && path.join("checkpoints").is_dir()
 }
 
 /// Enumerate checkpoint directories in a checkpoints folder
-fn enumerate_checkpoints(checkpoints_dir: &Path) -> Result<Vec<PathBuf>> {
+pub fn enumerate_checkpoints(checkpoints_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut checkpoints: Vec<PathBuf> = std::fs::read_dir(checkpoints_dir)
         .context("Failed to read checkpoints directory")?
         .filter_map(Result::ok)
@@ -297,7 +297,7 @@ fn enumerate_checkpoints(checkpoints_dir: &Path) -> Result<Vec<PathBuf>> {
 /// - n=1: middle (1/2)
 /// - n=2: 1/3rd and 2/3rd
 /// - n=3: 1/4th, 2/4th, 3/4th
-fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
+pub fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
     if n >= checkpoints.len() {
         return checkpoints.to_vec();
     }
@@ -319,7 +319,7 @@ fn select_evenly_spaced(checkpoints: &[PathBuf], n: usize) -> Vec<PathBuf> {
 
 /// Get the "best" checkpoint from a checkpoints directory.
 /// Priority: best symlink > highest `training_rating` (with warning)
-fn get_best_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
+pub fn get_best_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
     let best_symlink = checkpoints_dir.join("best");
 
     // If "best" symlink exists, use it
@@ -382,7 +382,7 @@ fn get_best_checkpoint(checkpoints_dir: &Path) -> Option<PathBuf> {
 /// Deduplication of best/latest does not count against limit.
 /// - limit 1: best only (or latest as fallback)
 /// - limit 2+: best + latest (deduplicated) + evenly distributed from remaining
-fn select_checkpoints_with_priority(
+pub fn select_checkpoints_with_priority(
     checkpoints_dir: &Path,
     checkpoints: &[PathBuf],
     limit: usize,

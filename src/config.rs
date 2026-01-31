@@ -57,6 +57,8 @@ pub enum Command {
     Tournament(TournamentArgs),
     /// Evaluate exploitability via trained best-response policies
     ExploitEval(ExploitEvalArgs),
+    /// Interactive web interface for policy inspection
+    Interactive(InteractiveArgs),
 }
 
 /// Arguments for training
@@ -723,6 +725,27 @@ pub struct ExploitEvalArgs {
     // Progress control
     #[arg(long, default_value = "false", help = "Suppress progress bars")]
     pub quiet: bool,
+}
+
+/// Arguments for interactive web interface
+#[derive(Parser, Debug)]
+pub struct InteractiveArgs {
+    /// Checkpoint paths or run directories to include
+    /// For run directories, all checkpoints are discovered automatically
+    #[arg(required = true)]
+    pub sources: Vec<PathBuf>,
+
+    /// Max checkpoints per run directory (default: 1 = best only)
+    #[arg(long, default_value = "1")]
+    pub limit_per_run: usize,
+
+    /// Port to run web server on
+    #[arg(short = 'p', long = "port", default_value = "3000")]
+    pub port: u16,
+
+    /// Backend (ndarray or wgpu)
+    #[arg(long, default_value = "ndarray")]
+    pub backend: String,
 }
 
 /// Legacy alias for backward compatibility

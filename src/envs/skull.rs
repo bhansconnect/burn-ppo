@@ -84,18 +84,26 @@ const GLOBAL_STATE_DIM_EXACT: usize = GS_PHASE
     + (GS_PER_PLAYER * MAX_PLAYERS); // = 103 floats
 
 /// Card types in Skull
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Card {
     Skull,
     Rose,
 }
 
 /// Game phases
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Phase {
     Placing,
     Bidding,
     Revealing,
+}
+
+/// Options for discard choice when player loses a coaster
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DiscardChoice {
+    Random,
+    Skull,
+    Rose,
 }
 
 /// Entry in bid history
@@ -312,6 +320,59 @@ impl Skull {
         if self.coaster_count(player) == 0 {
             self.elimination_order.push(player);
         }
+    }
+
+    /// Bidder loses a specific coaster type (for interactive mode)
+    /// Returns true if successful, false if player doesn't have that card type
+    pub fn lose_coaster_specified(&mut self, player: usize, choice: DiscardChoice) -> bool {
+        let total = self.coaster_count(player);
+        if total == 0 {
+            return false;
+        }
+
+        match choice {
+            DiscardChoice::Random => {
+                self.lose_coaster(player);
+                true
+            }
+            DiscardChoice::Skull => {
+                if self.has_trap[player] {
+                    self.has_trap[player] = false;
+                    if self.coaster_count(player) == 0 {
+                        self.elimination_order.push(player);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            DiscardChoice::Rose => {
+                if self.rose_count[player] > 0 {
+                    self.rose_count[player] -= 1;
+                    if self.coaster_count(player) == 0 {
+                        self.elimination_order.push(player);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Check if player has skull coaster
+    pub fn player_has_skull(&self, player: usize) -> bool {
+        self.has_trap[player]
+    }
+
+    /// Check if player has any rose coasters
+    pub fn player_has_rose(&self, player: usize) -> bool {
+        self.rose_count[player] > 0
+    }
+
+    /// Start a new round manually (for interactive mode after handling discard)
+    pub fn interactive_start_new_round(&mut self, starter: usize) {
+        self.start_new_round(starter);
     }
 
     /// Start a new round (after reveal resolution)
@@ -659,7 +720,6 @@ impl Skull {
 }
 
 // ===== Public accessor methods for interactive UI =====
-#[expect(dead_code, reason = "Public API for interactive UI feature")]
 impl Skull {
     /// Get the current game phase
     pub fn phase(&self) -> Phase {

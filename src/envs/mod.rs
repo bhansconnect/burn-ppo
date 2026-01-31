@@ -6,7 +6,9 @@ pub mod skull;
 pub use cartpole::CartPole;
 pub use connect_four::ConnectFour;
 pub use liars_dice::LiarsDice;
-pub use skull::Skull;
+pub use skull::{
+    Card as SkullCard, DiscardChoice as SkullDiscardChoice, Phase as SkullPhase, Skull,
+};
 
 /// Dispatch to the correct environment type based on `env_name`.
 /// Uses compile-time monomorphization for zero runtime overhead.
