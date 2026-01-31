@@ -6,15 +6,15 @@ num_steps = 128
 
 # Enable reward shaping for intermediate learning signals
 reward_shaping_coef = 0.0
-learning_rate = [[0.001, 0], [0.0003, 20_000_000], [0.0001, 80_000_000], [0.0, 100_000_000]]
+learning_rate = [[0.001, 0], [0.0003, 80_000_000], [0.0, 100_000_000]]
 
 # GAE parameters for multi-player imperfect info game
-gamma = 0.95
-gae_lambda = 0.92
+gamma = 0.99
+gae_lambda = 0.9
 
 # PPO hyperparameters
 clip_epsilon = 0.10    # Lower threshold to trigger more clipping
-entropy_coef = 0.03    # High exploration for bluffing
+entropy_coef = 0.05    # High exploration for bluffing
 value_coef = 0.5       # Strong value function learning
 max_grad_norm = 0.5
 target_kl = 0.02       # Early stopping if KL exceeds this
