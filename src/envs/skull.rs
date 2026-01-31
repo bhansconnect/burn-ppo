@@ -995,7 +995,7 @@ impl Environment for Skull {
         }
 
         self.phase = Phase::Placing;
-        self.current_player = self.rng.gen_range(0..self.num_players);
+        self.current_player = 0;
         self.round_starter = self.current_player;
         self.current_bid = 0;
         self.current_bidder = None;
