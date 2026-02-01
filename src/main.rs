@@ -23,7 +23,6 @@ mod entropy;
 mod env;
 mod envs;
 mod eval;
-mod exploit_eval;
 mod human;
 mod interactive;
 mod metrics;
@@ -1672,16 +1671,6 @@ async fn main() -> Result<()> {
                 tournament::run_tournament::<
                     <TB as burn::tensor::backend::AutodiffBackend>::InnerBackend,
                 >(&tournament_args, &device)
-            })
-        }
-        Some(Command::ExploitEval(exploit_eval_args)) => {
-            let backend_name = exploit_eval_args
-                .backend
-                .as_deref()
-                .unwrap_or_else(|| backend::default_backend());
-            backend::warn_if_better_backend_available(backend_name);
-            dispatch_backend!(backend_name, device, {
-                exploit_eval::run_exploit_eval_with_backend::<TB>(&exploit_eval_args, &device)
             })
         }
         Some(Command::Train(args)) => {

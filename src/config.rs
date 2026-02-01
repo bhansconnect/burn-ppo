@@ -55,8 +55,6 @@ pub enum Command {
     Eval(EvalArgs),
     /// Run a tournament between checkpoints with skill ratings
     Tournament(TournamentArgs),
-    /// Evaluate exploitability via trained best-response policies
-    ExploitEval(ExploitEvalArgs),
     /// Interactive web interface for policy inspection
     Interactive(InteractiveArgs),
 }
@@ -612,126 +610,6 @@ pub struct TournamentArgs {
         help = "Number of players per game for variable-player games like skull (required for skull)"
     )]
     pub players: Option<usize>,
-}
-
-/// Arguments for exploit-eval command
-#[derive(Parser, Debug)]
-pub struct ExploitEvalArgs {
-    /// Path to run folder or specific checkpoint directory
-    pub path: PathBuf,
-
-    #[arg(long, help = "Compute backend (default: ndarray)")]
-    pub backend: Option<String>,
-
-    // Checkpoint selection
-    #[arg(long, help = "Max checkpoints to evaluate (default: all)")]
-    pub limit: Option<usize>,
-
-    #[arg(
-        long,
-        default_value = "evenly-spaced",
-        help = "Selection strategy: all, best, latest, evenly-spaced"
-    )]
-    pub selection: String,
-
-    // BR training hyperparameters
-    #[arg(
-        long,
-        default_value = "5000",
-        help = "Minimum training steps for BR policy"
-    )]
-    pub br_min_steps: usize,
-
-    #[arg(
-        long,
-        default_value = "20000",
-        help = "Maximum training steps for BR policy"
-    )]
-    pub br_max_steps: usize,
-
-    #[arg(
-        long,
-        default_value = "10000",
-        help = "Steps without improvement before stopping (0 = disable early stopping)"
-    )]
-    pub br_plateau_window: usize,
-
-    #[arg(
-        long,
-        default_value = "0.001",
-        help = "Minimum improvement to not be considered plateau"
-    )]
-    pub br_plateau_threshold: f64,
-
-    #[arg(
-        long,
-        default_value = "100",
-        help = "Episodes for plateau detection (compares last N/2 vs previous N/2)"
-    )]
-    pub br_rolling_window: usize,
-
-    #[arg(long, default_value = "0.001", help = "Learning rate for BR training")]
-    pub br_lr: f64,
-
-    #[arg(
-        long,
-        default_value = "32",
-        help = "Parallel environments for BR training"
-    )]
-    pub br_envs: usize,
-
-    // BR network architecture
-    #[arg(long, default_value = "64", help = "Hidden layer size for BR network")]
-    pub br_hidden_size: usize,
-
-    #[arg(
-        long,
-        default_value = "2",
-        help = "Number of hidden layers for BR network"
-    )]
-    pub br_num_hidden: usize,
-
-    #[arg(
-        long,
-        default_value = "relu",
-        help = "Activation function (relu, tanh)"
-    )]
-    pub br_activation: String,
-
-    // Evaluation parameters
-    #[arg(
-        long,
-        default_value = "100",
-        help = "Games to play for final measurement"
-    )]
-    pub eval_games: usize,
-
-    #[arg(long, help = "Temperature for action sampling (default: env default)")]
-    pub eval_temp: Option<f32>,
-
-    #[arg(
-        long,
-        help = "Number of players per game for variable-player games like skull (required for skull)"
-    )]
-    pub players: Option<usize>,
-
-    // Output and reproducibility
-    #[arg(
-        short = 'o',
-        long,
-        help = "Output JSON path (default: <RUN_FOLDER>/exploitability_results.json)"
-    )]
-    pub output: Option<PathBuf>,
-
-    #[arg(
-        long,
-        help = "Random seed for reproducibility (default: from timestamp)"
-    )]
-    pub seed: Option<u64>,
-
-    // Progress control
-    #[arg(long, default_value = "false", help = "Suppress progress bars")]
-    pub quiet: bool,
 }
 
 /// Arguments for interactive web interface
