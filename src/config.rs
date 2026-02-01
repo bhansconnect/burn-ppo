@@ -651,24 +651,31 @@ pub struct ExploitEvalArgs {
 
     #[arg(
         long,
-        default_value = "2000",
-        help = "Steps to check for plateau (0 = disable early stopping)"
+        default_value = "10000",
+        help = "Steps without improvement before stopping (0 = disable early stopping)"
     )]
     pub br_plateau_window: usize,
 
     #[arg(
         long,
-        default_value = "0.01",
+        default_value = "0.001",
         help = "Minimum improvement to not be considered plateau"
     )]
     pub br_plateau_threshold: f64,
+
+    #[arg(
+        long,
+        default_value = "100",
+        help = "Episodes for plateau detection (compares last N/2 vs previous N/2)"
+    )]
+    pub br_rolling_window: usize,
 
     #[arg(long, default_value = "0.001", help = "Learning rate for BR training")]
     pub br_lr: f64,
 
     #[arg(
         long,
-        default_value = "8",
+        default_value = "32",
         help = "Parallel environments for BR training"
     )]
     pub br_envs: usize,
