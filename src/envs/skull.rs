@@ -682,11 +682,12 @@ impl Skull {
         // Check if bid equals total cards (immediate reveal)
         if bid == self.total_cards_in_stacks() {
             self.transition_to_revealing();
-        } else {
+        } else if let Some(next) = self.next_non_passed_player(bidder) {
             // Move to next non-passed player
-            if let Some(next) = self.next_non_passed_player(bidder) {
-                self.current_player = next;
-            }
+            self.current_player = next;
+        } else {
+            // No other non-passed players - bidder wins by default
+            self.check_bidding_end();
         }
     }
 
@@ -1150,6 +1151,9 @@ impl Environment for Skull {
                         self.transition_to_revealing();
                     } else if let Some(next) = self.next_non_passed_player(player) {
                         self.current_player = next;
+                    } else {
+                        // No other non-passed players - bidder wins by default
+                        self.check_bidding_end();
                     }
                 } else if action == PASS_ACTION {
                     self.passed[player] = true;
@@ -3092,5 +3096,250 @@ mod tests {
             padding.iter().all(|&x| x == 0.0),
             "Padding region should be all zeros (no truncation)"
         );
+    }
+
+    #[test]
+    fn test_bidding_only_non_passed_transitions_to_reveal() {
+        // Bug scenario: After bidding, if we're the only non-passed player,
+        // we should automatically transition to Revealing (not stay in Bidding)
+        let mut env = Skull::new_with_players(2, Schedule::constant(0.0), 42);
+        env.reset();
+
+        // P0 places rose
+        env.step(PLACE_ROSE);
+        // P1 places rose
+        env.step(PLACE_ROSE);
+
+        // Now in Placing phase, P0's turn
+        // P0 bids 1
+        env.step(BID_BASE); // Bid 1
+        assert_eq!(env.phase, Phase::Bidding, "Should be in Bidding phase");
+        assert_eq!(env.current_player, 1, "P1 should be current player");
+
+        // P1 passes - now P0 is only non-passed player
+        env.step(PASS_ACTION);
+
+        // BUG FIX: After P1 passes, P0 should transition to Revealing
+        // (not stay in Bidding with no valid actions)
+        assert_eq!(
+            env.phase,
+            Phase::Revealing,
+            "Should transition to Revealing when only one non-passed player"
+        );
+        assert_eq!(env.current_bidder, Some(0), "P0 should be the bidder");
+
+        // Verify action mask has valid actions (can reveal)
+        let mask = env.action_mask().unwrap();
+        assert!(
+            mask.iter().any(|&v| v),
+            "Action mask should have valid actions in Revealing phase"
+        );
+    }
+
+    #[test]
+    fn test_bid_when_only_non_passed_transitions_to_reveal() {
+        // BUG TEST: After a BID (not pass), if bidder is now the only non-passed player,
+        // should transition to Revealing. This was the bug - check_bidding_end was only
+        // called after PASS, not after BID.
+        let mut env = Skull::new_with_players(3, Schedule::constant(0.0), 42);
+        env.reset();
+
+        // All 3 players place roses
+        env.step(PLACE_ROSE); // P0
+        env.step(PLACE_ROSE); // P1
+        env.step(PLACE_ROSE); // P2
+
+        // P0 bids 1
+        env.step(BID_BASE); // Bid 1
+        assert_eq!(env.phase, Phase::Bidding);
+        assert_eq!(env.current_player, 1);
+
+        // P1 passes
+        env.step(PASS_ACTION);
+        // Now P0 and P2 are non-passed
+        assert_eq!(env.phase, Phase::Bidding);
+        assert_eq!(env.current_player, 2);
+
+        // P2 passes
+        env.step(PASS_ACTION);
+        // Now only P0 is non-passed - should transition to Revealing
+        assert_eq!(
+            env.phase,
+            Phase::Revealing,
+            "Should transition to Revealing after everyone else passes"
+        );
+    }
+
+    #[test]
+    fn test_bid_after_all_others_passed_triggers_reveal() {
+        // BUG TEST: This is the exact bug scenario
+        // P0 bids, everyone else passes, P0 bids AGAIN -> should trigger Revealing
+        let mut env = Skull::new_with_players(3, Schedule::constant(0.0), 42);
+        env.reset();
+
+        // All place 2 roses each (total_cards will be 6)
+        for _ in 0..2 {
+            env.step(PLACE_ROSE); // P0
+            env.step(PLACE_ROSE); // P1
+            env.step(PLACE_ROSE); // P2
+        }
+
+        // P0 bids 1
+        env.step(BID_BASE); // Bid 1
+        assert_eq!(env.phase, Phase::Bidding);
+
+        // P1 passes
+        env.step(PASS_ACTION);
+        // P2 passes
+        env.step(PASS_ACTION);
+        // Now P0 is only non-passed, should be in Revealing
+        assert_eq!(
+            env.phase,
+            Phase::Revealing,
+            "Should transition to Revealing when only P0 remains"
+        );
+
+        // Verify P0 can reveal
+        let mask = env.action_mask().unwrap();
+        assert!(
+            mask[REVEAL_PLAYER_BASE],
+            "P0 should be able to reveal their own stack"
+        );
+    }
+
+    #[test]
+    fn test_eliminated_bidder_starts_valid_player() {
+        // Scenario: Player 0 has 1 coaster, bids, reveals own skull, gets eliminated
+        // Verify: Next round starts with alive player (not eliminated bidder)
+        let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
+        env.reset();
+
+        // Give P0 only 1 coaster (skull)
+        env.has_trap[0] = true;
+        env.rose_count[0] = 0;
+
+        // All players place
+        env.stack[0].push(Card::Skull);
+        env.stack[1].push(Card::Rose);
+        env.stack[2].push(Card::Rose);
+        env.stack[3].push(Card::Rose);
+
+        // Setup P0 as bidder about to reveal
+        env.phase = Phase::Revealing;
+        env.current_player = 0;
+        env.current_bidder = Some(0);
+        env.current_bid = 4;
+        env.must_reveal_own = true;
+
+        // P0 reveals own skull - should be eliminated
+        let (_, _, done) = env.step(REVEAL_PLAYER_BASE); // Reveal P0
+
+        // Game shouldn't be over (3 players remain)
+        assert!(!done, "Game should not be over with 3 players remaining");
+        assert!(!env.is_alive(0), "P0 should be eliminated");
+        assert!(
+            env.is_alive(env.current_player),
+            "Current player must be alive"
+        );
+        assert_ne!(
+            env.current_player, 0,
+            "Eliminated player shouldn't be current"
+        );
+
+        // Verify action mask has valid actions
+        let mask = env.action_mask().unwrap();
+        assert!(
+            mask.iter().any(|&v| v),
+            "Action mask must have valid actions after bidder elimination"
+        );
+    }
+
+    #[test]
+    fn test_action_mask_never_empty_fuzz() {
+        // Extensive fuzz test: run many random games and assert action mask always valid
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(12345);
+
+        for seed in 0u64..10_000 {
+            let num_players = 2 + (seed as usize % 5); // 2-6 players
+            let mut env = Skull::new_with_players(num_players, Schedule::constant(0.0), seed);
+            env.reset();
+
+            let mut steps = 0;
+            let max_steps = 10_000;
+
+            while !env.game_over && steps < max_steps {
+                let mask = env.action_mask().unwrap();
+                let valid: Vec<usize> = mask
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &v)| v)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                assert!(
+                    !valid.is_empty(),
+                    "Empty action mask at step {} for seed {}, phase={:?}, player={}, \
+                     is_alive={}, has_trap={}, rose_count={}, stack_len={}",
+                    steps,
+                    seed,
+                    env.phase,
+                    env.current_player,
+                    env.is_alive(env.current_player),
+                    env.has_trap[env.current_player],
+                    env.rose_count[env.current_player],
+                    env.stack[env.current_player].len()
+                );
+
+                let action = valid[rng.gen_range(0..valid.len())];
+                env.step(action);
+                steps += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn test_current_player_always_alive() {
+        // Verify current_player is always alive during gameplay
+        use rand::SeedableRng;
+        let mut rng = StdRng::seed_from_u64(54321);
+
+        for seed in 0u64..1_000 {
+            let num_players = 2 + (seed as usize % 5); // 2-6 players
+            let mut env = Skull::new_with_players(num_players, Schedule::constant(0.0), seed);
+            env.reset();
+
+            let mut steps = 0;
+            let max_steps = 10_000;
+
+            while !env.game_over && steps < max_steps {
+                assert!(
+                    env.is_alive(env.current_player),
+                    "Current player {} must be alive at step {} for seed {}. \
+                     has_trap={}, rose_count={}",
+                    env.current_player,
+                    steps,
+                    seed,
+                    env.has_trap[env.current_player],
+                    env.rose_count[env.current_player]
+                );
+
+                let mask = env.action_mask().unwrap();
+                let valid: Vec<usize> = mask
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &v)| v)
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if valid.is_empty() {
+                    break;
+                }
+
+                let action = valid[rng.gen_range(0..valid.len())];
+                env.step(action);
+                steps += 1;
+            }
+        }
     }
 }

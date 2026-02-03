@@ -104,6 +104,19 @@ pub fn apply_action_mask<B: Backend>(
     let [batch, num_actions] = logits.dims();
     let device = logits.device();
 
+    // Fast debug assertions: check mask validity
+    debug_assert_eq!(
+        mask.len(),
+        batch * num_actions,
+        "Action mask length mismatch: expected {}, got {}",
+        batch * num_actions,
+        mask.len()
+    );
+    debug_assert!(
+        mask.iter().any(|&v| v),
+        "Empty action mask: no valid actions in entire batch"
+    );
+
     // Convert bool mask to f32: true -> 0.0, false -> -1e9
     let mask_values: Vec<f32> = mask
         .iter()
