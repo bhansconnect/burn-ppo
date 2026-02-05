@@ -884,14 +884,14 @@ where
             Tensor::<TB::InnerBackend, 1>::from_floats(obs_flat.as_slice(), device)
                 .reshape([num_envs, obs_dim]);
 
-        // Handle CTDE networks: use critic network with global states
+        // Handle CTDE networks: use critic network with global states + local obs
         let all_values = if inference_model.is_ctde() {
             let global_states_flat = vec_env.get_global_states();
             let global_state_dim = global_states_flat.len() / num_envs;
             let global_state_tensor =
                 Tensor::<TB::InnerBackend, 1>::from_floats(global_states_flat.as_slice(), device)
                     .reshape([num_envs, global_state_dim]);
-            inference_model.forward_critic(global_state_tensor)
+            inference_model.forward_critic(global_state_tensor, obs_tensor)
         } else {
             inference_model.forward(obs_tensor).1
         };

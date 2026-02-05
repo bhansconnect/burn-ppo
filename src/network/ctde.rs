@@ -92,8 +92,9 @@ impl<B: Backend> CtdeActorCritic<B> {
         let policy_head = create_linear_orthogonal(in_size, action_count, 0.01, device);
 
         // Build critic network
+        // Critic sees global_state + local_obs (MAPPO-style agent-specific features)
         let mut critic_layers = Vec::with_capacity(critic_num_hidden);
-        in_size = global_state_dim;
+        in_size = global_state_dim + local_obs_dim;
 
         for _ in 0..critic_num_hidden {
             critic_layers.push(create_linear_orthogonal(
@@ -151,14 +152,24 @@ impl<B: Backend> CtdeActorCritic<B> {
     ///
     /// # Arguments
     /// * `global_state` - Global game state [`batch_size`, `global_state_dim`]
+    /// * `local_obs` - Local observations [`batch_size`, `local_obs_dim`]
+    ///
+    /// The critic sees both global state (privileged info) AND local observations
+    /// (what the agent knows). This MAPPO-style approach reduces value function bias
+    /// in partially observable games by conditioning on the agent's information set.
     ///
     /// # Returns
     /// Per-player values [`batch_size`, `num_players`]
-    pub fn forward_critic(&self, global_state: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward_critic(
+        &self,
+        global_state: Tensor<B, 2>,
+        local_obs: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         profile_function!();
         profile_scope!("critic");
 
-        let mut x = global_state;
+        // Concatenate global state with local observation (MAPPO agent-specific features)
+        let mut x = Tensor::cat(vec![global_state, local_obs], 1);
 
         // Critic hidden layers with activation
         for layer in &self.critic_layers {
@@ -265,7 +276,8 @@ mod tests {
 
         let batch_size = 8;
         let global_state = Tensor::<TestBackend, 2>::zeros([batch_size, 20], &device);
-        let values = network.forward_critic(global_state);
+        let local_obs = Tensor::<TestBackend, 2>::zeros([batch_size, 10], &device);
+        let values = network.forward_critic(global_state, local_obs);
 
         assert_eq!(values.dims(), [batch_size, 2]);
     }

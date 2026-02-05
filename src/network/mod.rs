@@ -131,12 +131,18 @@ impl<B: Backend> ActorCriticNetwork<B> {
 
     /// Forward pass through critic network only (for CTDE)
     ///
-    /// For non-CTDE networks, this is equivalent to calling `forward()` and taking the values.
-    pub fn forward_critic(&self, global_state: Tensor<B, 2>) -> Tensor<B, 2> {
+    /// For CTDE networks, the critic takes both global state and local observations
+    /// to reduce value function bias in partially observable games.
+    /// For non-CTDE networks, `local_obs` is used as input (same as actor).
+    pub fn forward_critic(
+        &self,
+        global_state: Tensor<B, 2>,
+        local_obs: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         match self {
-            Self::Mlp(mlp) => mlp.forward(global_state).1,
-            Self::Cnn(cnn) => cnn.forward(global_state).1,
-            Self::Ctde(ctde) => ctde.forward_critic(global_state),
+            Self::Mlp(mlp) => mlp.forward(local_obs).1,
+            Self::Cnn(cnn) => cnn.forward(local_obs).1,
+            Self::Ctde(ctde) => ctde.forward_critic(global_state, local_obs),
         }
     }
 
@@ -287,8 +293,8 @@ mod tests {
         let local_obs = Tensor::zeros([8, 10], &device);
         let global_state = Tensor::zeros([8, 20], &device);
 
-        let logits = model.forward_actor(local_obs);
-        let values = model.forward_critic(global_state);
+        let logits = model.forward_actor(local_obs.clone());
+        let values = model.forward_critic(global_state, local_obs);
 
         assert_eq!(logits.dims(), [8, 5]);
         assert_eq!(values.dims(), [8, 2]);

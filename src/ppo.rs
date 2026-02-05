@@ -324,8 +324,8 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
                 let global_state_tensor =
                     Tensor::<B, 1>::from_floats(global_states_flat.as_slice(), device)
                         .reshape([num_envs, global_state_dim]);
-                let logits = model.forward_actor(obs_tensor);
-                let values = model.forward_critic(global_state_tensor);
+                let logits = model.forward_actor(obs_tensor.clone());
+                let values = model.forward_critic(global_state_tensor, obs_tensor);
                 (logits, values)
             } else {
                 model.forward(obs_tensor)
@@ -724,8 +724,8 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 let global_state_tensor =
                     Tensor::<B, 1>::from_floats(learner_global_states.as_slice(), device)
                         .reshape([batch_size, global_state_dim]);
-                let logits = model.forward_actor(obs_tensor);
-                let values = model.forward_critic(global_state_tensor);
+                let logits = model.forward_actor(obs_tensor.clone());
+                let values = model.forward_critic(global_state_tensor, obs_tensor);
                 (logits, values)
             } else {
                 model.forward(obs_tensor)
@@ -829,8 +829,8 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 let global_state_tensor =
                     Tensor::<B, 1>::from_floats(opp_global_states.as_slice(), device)
                         .reshape([batch_size, global_state_dim]);
-                let logits = opp_model.forward_actor(obs_tensor);
-                let values = opp_model.forward_critic(global_state_tensor);
+                let logits = opp_model.forward_actor(obs_tensor.clone());
+                let values = opp_model.forward_critic(global_state_tensor, obs_tensor);
                 (logits, values)
             } else {
                 opp_model.forward(obs_tensor)
@@ -1411,8 +1411,8 @@ where
         let local_obs_autodiff = Tensor::from_inner(mb_obs);
         let global_states_autodiff =
             Tensor::from_inner(mb_global_states.expect("CTDE requires global_states in buffer"));
-        let logits = model.forward_actor(local_obs_autodiff);
-        let all_values = model.forward_critic(global_states_autodiff);
+        let logits = model.forward_actor(local_obs_autodiff.clone());
+        let all_values = model.forward_critic(global_states_autodiff, local_obs_autodiff);
         (logits, all_values)
     } else {
         model.forward(Tensor::from_inner(mb_obs))
