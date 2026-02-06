@@ -1067,6 +1067,12 @@ where
                 metrics.value_error_max,
                 global_step,
             )?;
+            if let Some(avg_valid) = metrics.avg_valid_actions {
+                logger.log_scalar("train/avg_valid_actions", avg_valid, global_step)?;
+            }
+            if let Some(pct) = metrics.entropy_valid_pct {
+                logger.log_scalar("train/entropy_valid_pct", pct, global_step)?;
+            }
 
             // Value normalization metrics (when enabled)
             if let Some(ref norm) = popart_normalizer {

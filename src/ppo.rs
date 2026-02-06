@@ -1300,6 +1300,9 @@ struct RawMinibatchValues<B: Backend> {
 
     // Targets passed through (needed for value_error computation)
     returns: Tensor<B, 1>,
+
+    // Per-sample count of valid actions (only when action masks present)
+    valid_counts: Option<Tensor<B, 1>>,
 }
 
 /// Scalar metrics extracted from a single minibatch update
@@ -1321,6 +1324,9 @@ struct MinibatchMetrics {
     value_error_mean: f32,
     value_error_std: f32,
     value_error_max: f32,
+    // Valid action metrics (only when action masks present)
+    avg_valid_actions: Option<f32>,
+    entropy_valid_pct: Option<f32>,
 }
 
 /// Training metrics from a single update
@@ -1349,6 +1355,9 @@ pub struct UpdateMetrics {
     pub value_norm_target_mean: Option<f32>,
     pub value_norm_target_std: Option<f32>,
     pub value_norm_rescale_mag: Option<f32>,
+    // Valid action metrics (only when action masks present)
+    pub avg_valid_actions: Option<f32>,
+    pub entropy_valid_pct: Option<f32>,
 }
 
 /// Compute PPO loss with minimal autodiff scope
@@ -1409,6 +1418,11 @@ where
 
     // IMMEDIATELY extract inner for metrics (before loss uses it)
     let values_inner = values.clone().inner();
+
+    // Compute per-sample valid action counts before consuming the mask
+    let valid_counts = mb_action_masks
+        .as_ref()
+        .map(|mask| mask.clone().sum_dim(1).squeeze_dims(&[1]));
 
     // Apply action mask
     let masked_logits = if let Some(mask) = mb_action_masks {
@@ -1471,6 +1485,7 @@ where
         entropy: entropy_inner,
         values: values_inner,
         returns: mb_returns,
+        valid_counts,
     };
 
     // All intermediate autodiff tensors are DROPPED when this function returns.
@@ -1519,7 +1534,29 @@ where
     let value_error_max: f32 = value_errors.max().into_scalar().into();
 
     // Entropy mean
-    let entropy: f32 = raw.entropy.mean().into_scalar().into();
+    let entropy_per_sample = raw.entropy;
+    let entropy: f32 = entropy_per_sample.clone().mean().into_scalar().into();
+
+    // Valid action metrics (only when action masks present)
+    let (avg_valid_actions, entropy_valid_pct) = if let Some(valid_counts) = raw.valid_counts {
+        let avg: f32 = valid_counts.clone().mean().into_scalar().into();
+
+        // Per-sample entropy/ln(valid_count), excluding forced moves (valid_count <= 1)
+        let max_ent = valid_counts.clone().log();
+        let has_choice = valid_counts.greater_elem(1.0).float();
+        let choice_count: f32 = has_choice.clone().sum().into_scalar().into();
+
+        let pct = if choice_count > 0.0 {
+            let ratio = entropy_per_sample * has_choice.clone() / max_ent.clamp_min(1e-8);
+            let ratio_sum: f32 = ratio.sum().into_scalar().into();
+            ratio_sum / choice_count
+        } else {
+            0.0
+        };
+        (Some(avg), Some(pct))
+    } else {
+        (None, None)
+    };
 
     // Value and returns means
     let value_mean: f32 = raw.values.mean().into_scalar().into();
@@ -1541,6 +1578,8 @@ where
         value_error_mean,
         value_error_std,
         value_error_max,
+        avg_valid_actions,
+        entropy_valid_pct,
     }
 }
 
@@ -1729,6 +1768,9 @@ where
     let mut total_value_error_mean = 0.0;
     let mut total_value_error_std = 0.0;
     let mut total_value_error_max = f32::NEG_INFINITY;
+    let mut total_avg_valid_actions = 0.0f32;
+    let mut total_entropy_valid_pct = 0.0f32;
+    let mut has_mask_metrics = false;
     let mut num_updates = 0;
 
     let mut model = model;
@@ -1990,6 +2032,13 @@ where
                 total_value_error_mean += metrics.value_error_mean;
                 total_value_error_std += metrics.value_error_std;
                 total_value_error_max = total_value_error_max.max(metrics.value_error_max);
+                if let Some(avg) = metrics.avg_valid_actions {
+                    total_avg_valid_actions += avg;
+                    has_mask_metrics = true;
+                }
+                if let Some(pct) = metrics.entropy_valid_pct {
+                    total_entropy_valid_pct += pct;
+                }
                 num_updates += 1;
 
                 // KL early stopping: stop epoch if KL divergence exceeds threshold
@@ -2069,6 +2118,16 @@ where
         value_norm_target_mean,
         value_norm_target_std,
         value_norm_rescale_mag,
+        avg_valid_actions: if has_mask_metrics {
+            Some(total_avg_valid_actions / num_updates as f32)
+        } else {
+            None
+        },
+        entropy_valid_pct: if has_mask_metrics {
+            Some(total_entropy_valid_pct / num_updates as f32)
+        } else {
+            None
+        },
     };
 
     // Cleanup memory in hopes of avoiding any leaks.
