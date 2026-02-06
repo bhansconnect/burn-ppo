@@ -18,6 +18,8 @@ use super::mlp::create_linear_orthogonal;
 /// 5. Policy and value heads
 ///
 /// When `split_networks` is true: separate conv+FC stacks for actor and critic
+///
+/// The value head outputs a single scalar value (the acting player's value).
 #[derive(Module, Debug)]
 pub struct CnnActorCritic<B: Backend> {
     /// Actor convolutional layers
@@ -30,7 +32,7 @@ pub struct CnnActorCritic<B: Backend> {
     pub critic_fc_layers: Vec<nn::Linear<B>>,
     /// Policy output head
     pub policy_head: nn::Linear<B>,
-    /// Single value head with N outputs (one per player)
+    /// Single value head - outputs scalar (acting player's value)
     pub value_head: nn::Linear<B>,
     /// Spatial input shape (H, W, C)
     #[module(skip)]
@@ -41,9 +43,6 @@ pub struct CnnActorCritic<B: Backend> {
     /// Use `ReLU` activation (always true for CNN, but kept for consistency)
     #[module(skip)]
     use_relu: bool,
-    /// Number of players (for value head output dimension)
-    #[module(skip)]
-    num_players: usize,
     /// Whether to use separate actor/critic networks
     #[module(skip)]
     split_networks: bool,
@@ -56,17 +55,17 @@ impl<B: Backend> CnnActorCritic<B> {
     /// * `obs_dim` - Total observation dimension (spatial + extra features)
     /// * `obs_shape` - Spatial shape (height, width, channels)
     /// * `action_count` - Number of discrete actions
-    /// * `num_players` - Number of value outputs (1 for single-agent, 2+ for multi-player)
     /// * `config` - Configuration with CNN parameters
     /// * `device` - Compute device
     ///
     /// # Panics
     /// Panics if `obs_shape` is None (CNN requires spatial observations)
+    ///
+    /// The value head outputs a single scalar (the acting player's value).
     pub fn new(
         obs_dim: usize,
         obs_shape: Option<(usize, usize, usize)>,
         action_count: usize,
-        num_players: usize,
         config: &Config,
         device: &B::Device,
     ) -> Self {
@@ -138,8 +137,8 @@ impl<B: Backend> CnnActorCritic<B> {
         // Policy head: small init (0.01) for stable initial policy
         let policy_head = create_linear_orthogonal(fc_hidden_size, action_count, 0.01, device);
 
-        // Value head: N outputs (one per player), gain 1.0
-        let value_head = create_linear_orthogonal(fc_hidden_size, num_players, 1.0, device);
+        // Value head: single output (acting player's value), gain 1.0
+        let value_head = create_linear_orthogonal(fc_hidden_size, 1, 1.0, device);
 
         Self {
             conv_layers,
@@ -151,7 +150,6 @@ impl<B: Backend> CnnActorCritic<B> {
             input_shape: (height, width, channels),
             extra_features_size,
             use_relu,
-            num_players,
             split_networks,
         }
     }
@@ -230,10 +228,10 @@ impl<B: Backend> CnnActorCritic<B> {
         x
     }
 
-    /// Forward pass returning action logits and N player values
+    /// Forward pass returning action logits and value
     ///
     /// Input: observations [batch, `obs_dim`] (flat, will be reshaped internally)
-    /// Output: (logits [batch, `action_count`], values [batch, `num_players`])
+    /// Output: (logits [batch, `action_count`], values [batch, 1])
     pub fn forward(&self, obs: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         profile_function!();
 
@@ -356,16 +354,16 @@ mod tests {
         let device = Default::default();
         let config = cnn_config();
 
-        // Connect Four: 86 obs_dim, (6, 7, 2) shape, 7 actions, 2 players
+        // Connect Four: 86 obs_dim, (6, 7, 2) shape, 7 actions
         let model: CnnActorCritic<TestBackend> =
-            CnnActorCritic::new(86, Some((6, 7, 2)), 7, 2, &config, &device);
+            CnnActorCritic::new(86, Some((6, 7, 2)), 7, &config, &device);
 
         let batch_size = 8;
         let obs = Tensor::zeros([batch_size, 86], &device);
         let (logits, values) = model.forward(obs);
 
         assert_eq!(logits.dims(), [batch_size, 7]);
-        assert_eq!(values.dims(), [batch_size, 2]);
+        assert_eq!(values.dims(), [batch_size, 1]); // Single scalar value
     }
 
     #[test]
@@ -375,7 +373,7 @@ mod tests {
 
         // 4x4x2 = 32 spatial, no extra features
         let model: CnnActorCritic<TestBackend> =
-            CnnActorCritic::new(32, Some((4, 4, 2)), 4, 1, &config, &device);
+            CnnActorCritic::new(32, Some((4, 4, 2)), 4, &config, &device);
 
         let batch_size = 4;
         let obs = Tensor::zeros([batch_size, 32], &device);
@@ -394,7 +392,7 @@ mod tests {
         };
 
         let model: CnnActorCritic<TestBackend> =
-            CnnActorCritic::new(86, Some((6, 7, 2)), 7, 2, &config, &device);
+            CnnActorCritic::new(86, Some((6, 7, 2)), 7, &config, &device);
 
         // Verify split structure
         assert!(!model.critic_conv_layers.is_empty());
@@ -406,7 +404,7 @@ mod tests {
         let (logits, values) = model.forward(obs);
 
         assert_eq!(logits.dims(), [batch_size, 7]);
-        assert_eq!(values.dims(), [batch_size, 2]);
+        assert_eq!(values.dims(), [batch_size, 1]);
     }
 
     #[test]
@@ -420,7 +418,7 @@ mod tests {
         };
 
         let model: CnnActorCritic<TestBackend> =
-            CnnActorCritic::new(86, Some((6, 7, 2)), 7, 2, &config, &device);
+            CnnActorCritic::new(86, Some((6, 7, 2)), 7, &config, &device);
 
         // Just verify forward pass works (spatial dims preserved internally)
         let batch_size = 2;
@@ -428,7 +426,7 @@ mod tests {
         let (logits, values) = model.forward(obs);
 
         assert_eq!(logits.dims(), [batch_size, 7]);
-        assert_eq!(values.dims(), [batch_size, 2]);
+        assert_eq!(values.dims(), [batch_size, 1]);
 
         // Values should be finite
         let value_data = values.into_data();
@@ -445,6 +443,6 @@ mod tests {
 
         // This should panic because obs_shape is None
         let _model: CnnActorCritic<TestBackend> =
-            CnnActorCritic::new(86, None, 7, 2, &config, &device);
+            CnnActorCritic::new(86, None, 7, &config, &device);
     }
 }

@@ -71,9 +71,9 @@ pub struct CheckpointMetadata {
     /// Number of FC layers after conv (CNN only)
     #[serde(default = "default_cnn_num_fc_layers")]
     pub cnn_num_fc_layers: usize,
-    /// Global state dimension for CTDE critic (CTDE only)
-    #[serde(default)]
-    pub global_state_dim: Option<usize>,
+    /// Privileged observation dimension for CTDE critic (CTDE only)
+    #[serde(default, alias = "global_state_dim")]
+    pub privileged_obs_dim: Option<usize>,
     /// Critic hidden layer size for CTDE (CTDE only)
     #[serde(default)]
     pub critic_hidden_size: Option<usize>,
@@ -220,7 +220,7 @@ impl CheckpointManager {
         load_config.kernel_size = metadata.kernel_size;
         load_config.cnn_fc_hidden_size = metadata.cnn_fc_hidden_size;
         load_config.cnn_num_fc_layers = metadata.cnn_num_fc_layers;
-        // CTDE-specific params (global_state_dim passed directly to ActorCritic::new)
+        // CTDE-specific params (privileged_obs_dim passed directly to ActorCritic::new)
         load_config.critic_hidden_size = metadata.critic_hidden_size;
         load_config.critic_num_hidden = metadata.critic_num_hidden;
 
@@ -228,8 +228,7 @@ impl CheckpointManager {
             metadata.obs_dim,
             metadata.obs_shape,
             metadata.action_count,
-            metadata.num_players,
-            metadata.global_state_dim,
+            metadata.privileged_obs_dim,
             &load_config,
             device,
         );
@@ -248,7 +247,6 @@ impl CheckpointManager {
                     let legacy_model = MlpActorCritic::new(
                         metadata.obs_dim,
                         metadata.action_count,
-                        metadata.num_players,
                         &load_config,
                         device,
                     );
@@ -515,8 +513,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, None, &config, &device);
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, None, 2, None, &config, &device);
         let metadata = CheckpointMetadata {
             step: 1000,
             avg_return: 150.0,
@@ -537,7 +534,7 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
-            global_state_dim: None,
+            privileged_obs_dim: None,
             critic_hidden_size: None,
             critic_num_hidden: None,
             obs_shape: None,
@@ -571,8 +568,7 @@ mod tests {
         let device = Default::default();
         let config = Config::default();
 
-        let model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, None, &config, &device);
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, None, 2, None, &config, &device);
 
         // Save first checkpoint with low return
         manager
@@ -598,7 +594,7 @@ mod tests {
                     kernel_size: 3,
                     cnn_fc_hidden_size: 128,
                     cnn_num_fc_layers: 1,
-                    global_state_dim: None,
+                    privileged_obs_dim: None,
                     critic_hidden_size: None,
                     critic_num_hidden: None,
                     obs_shape: None,
@@ -633,7 +629,7 @@ mod tests {
                     kernel_size: 3,
                     cnn_fc_hidden_size: 128,
                     cnn_num_fc_layers: 1,
-                    global_state_dim: None,
+                    privileged_obs_dim: None,
                     critic_hidden_size: None,
                     critic_num_hidden: None,
                     obs_shape: None,
@@ -668,7 +664,7 @@ mod tests {
                     kernel_size: 3,
                     cnn_fc_hidden_size: 128,
                     cnn_num_fc_layers: 1,
-                    global_state_dim: None,
+                    privileged_obs_dim: None,
                     critic_hidden_size: None,
                     critic_num_hidden: None,
                     obs_shape: None,
@@ -758,7 +754,7 @@ mod tests {
             kernel_size: 4,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
-            global_state_dim: None,
+            privileged_obs_dim: None,
             critic_hidden_size: None,
             critic_num_hidden: None,
             obs_shape: Some((6, 7, 2)),
@@ -883,7 +879,7 @@ mod tests {
         };
 
         let model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, None, &split_config, &device);
+            ActorCritic::new(4, None, 2, None, &split_config, &device);
 
         let metadata = CheckpointMetadata {
             step: 1000,
@@ -905,7 +901,7 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
-            global_state_dim: None,
+            privileged_obs_dim: None,
             critic_hidden_size: None,
             critic_num_hidden: None,
             obs_shape: None,
@@ -947,7 +943,7 @@ mod tests {
         let shared_config = Config::default();
 
         let model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, None, &shared_config, &device);
+            ActorCritic::new(4, None, 2, None, &shared_config, &device);
 
         let metadata = CheckpointMetadata {
             step: 1000,
@@ -969,7 +965,7 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
-            global_state_dim: None,
+            privileged_obs_dim: None,
             critic_hidden_size: None,
             critic_num_hidden: None,
             obs_shape: None,
@@ -1016,7 +1012,7 @@ mod tests {
             ..Config::default()
         };
         let split_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, None, &split_config, &device);
+            ActorCritic::new(4, None, 2, None, &split_config, &device);
 
         let split_metadata = CheckpointMetadata {
             step: 1000,
@@ -1038,7 +1034,7 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
-            global_state_dim: None,
+            privileged_obs_dim: None,
             critic_hidden_size: None,
             critic_num_hidden: None,
             obs_shape: None,
@@ -1050,7 +1046,7 @@ mod tests {
         // Create and save shared network model
         let shared_config = Config::default();
         let shared_model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, None, &shared_config, &device);
+            ActorCritic::new(4, None, 2, None, &shared_config, &device);
 
         let shared_metadata = CheckpointMetadata {
             step: 2000,
@@ -1072,7 +1068,7 @@ mod tests {
             kernel_size: 3,
             cnn_fc_hidden_size: 128,
             cnn_num_fc_layers: 1,
-            global_state_dim: None,
+            privileged_obs_dim: None,
             critic_hidden_size: None,
             critic_num_hidden: None,
             obs_shape: None,

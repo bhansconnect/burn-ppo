@@ -3,6 +3,9 @@
 //! This module provides different network architectures that can be selected via config:
 //! - MLP (Multi-Layer Perceptron): Default, works for any observation
 //! - CNN (Convolutional Neural Network): For spatial observations like board games
+//! - CTDE (Centralized Training, Decentralized Execution): For partially observable multi-agent games
+//!
+//! All networks output a single scalar value (the acting player's value).
 
 mod cnn;
 mod ctde;
@@ -35,50 +38,42 @@ impl<B: Backend> ActorCriticNetwork<B> {
     /// Create a new actor-critic network based on config
     ///
     /// # Arguments
-    /// * `obs_dim` - Total observation dimension
+    /// * `obs_dim` - Total observation dimension (player-relative)
     /// * `obs_shape` - Optional spatial shape (height, width, channels) for CNN
     /// * `action_count` - Number of discrete actions
-    /// * `num_players` - Number of value outputs (1 for single-agent, 2+ for multi-player)
-    /// * `global_state_dim` - Global state dimension for CTDE (required when `network_type` is "ctde")
+    /// * `privileged_obs_dim` - Privileged observation dimension for CTDE (required when `network_type` is "ctde")
     /// * `config` - Configuration specifying network type and parameters
     /// * `device` - Compute device
     ///
     /// # Panics
     /// Panics if `network_type = "cnn"` but `obs_shape` is None
-    /// Panics if `network_type = "ctde"` but `global_state_dim` is None
+    /// Panics if `network_type = "ctde"` but `privileged_obs_dim` is None
+    ///
+    /// All networks output a single scalar value (the acting player's value).
     pub fn new(
         obs_dim: usize,
         obs_shape: Option<(usize, usize, usize)>,
         action_count: usize,
-        num_players: usize,
-        global_state_dim: Option<usize>,
+        privileged_obs_dim: Option<usize>,
         config: &Config,
         device: &B::Device,
     ) -> Self {
         match config.network_type.as_str() {
-            "mlp" => Self::Mlp(MlpActorCritic::new(
-                obs_dim,
-                action_count,
-                num_players,
-                config,
-                device,
-            )),
+            "mlp" => Self::Mlp(MlpActorCritic::new(obs_dim, action_count, config, device)),
             "cnn" => Self::Cnn(CnnActorCritic::new(
                 obs_dim,
                 obs_shape,
                 action_count,
-                num_players,
                 config,
                 device,
             )),
             "ctde" => {
                 let dim =
-                    global_state_dim.expect("CTDE network requires global_state_dim parameter");
+                    privileged_obs_dim.expect("CTDE network requires privileged_obs_dim parameter");
                 Self::Ctde(CtdeActorCritic::new(
                     obs_dim,
                     dim,
                     action_count,
-                    num_players,
                     config,
                     device,
                 ))
@@ -87,14 +82,14 @@ impl<B: Backend> ActorCriticNetwork<B> {
         }
     }
 
-    /// Forward pass returning action logits and N player values
+    /// Forward pass returning action logits and value
     ///
     /// Input: observations [batch, `obs_dim`]
-    /// Output: (logits [batch, `action_count`], values [batch, `num_players`])
+    /// Output: (logits [batch, `action_count`], values [batch, 1])
     ///
     /// # Panics
     /// Panics if called on a CTDE network. CTDE requires separate inputs for actor and critic.
-    /// Use `forward_actor(local_obs)` and `forward_critic(global_state)` instead.
+    /// Use `forward_actor(obs)` and `forward_critic(privileged_obs, obs)` instead.
     pub fn forward(&self, obs: Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
         match self {
             Self::Mlp(mlp) => mlp.forward(obs),
@@ -102,12 +97,12 @@ impl<B: Backend> ActorCriticNetwork<B> {
             Self::Ctde(_) => {
                 panic!(
                     "forward() called on CTDE network. CTDE requires separate inputs for actor and critic.\n\
-                     Use forward_actor(local_obs) and forward_critic(global_state) instead.\n\
+                     Use forward_actor(obs) and forward_critic(privileged_obs, obs) instead.\n\
                      \n\
                      Example:\n\
                      if network.is_ctde() {{\n\
-                         let logits = network.forward_actor(local_obs);\n\
-                         let values = network.forward_critic(global_state);\n\
+                         let logits = network.forward_actor(obs);\n\
+                         let values = network.forward_critic(privileged_obs, obs);\n\
                      }} else {{\n\
                          let (logits, values) = network.forward(obs);\n\
                      }}\n\
@@ -121,28 +116,26 @@ impl<B: Backend> ActorCriticNetwork<B> {
     /// Forward pass through actor network only (for CTDE)
     ///
     /// For non-CTDE networks, this is equivalent to calling `forward()` and taking the logits.
-    pub fn forward_actor(&self, local_obs: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward_actor(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         match self {
-            Self::Mlp(mlp) => mlp.forward(local_obs).0,
-            Self::Cnn(cnn) => cnn.forward(local_obs).0,
-            Self::Ctde(ctde) => ctde.forward_actor(local_obs),
+            Self::Mlp(mlp) => mlp.forward(obs).0,
+            Self::Cnn(cnn) => cnn.forward(obs).0,
+            Self::Ctde(ctde) => ctde.forward_actor(obs),
         }
     }
 
     /// Forward pass through critic network only (for CTDE)
     ///
-    /// For CTDE networks, the critic takes both global state and local observations
-    /// to reduce value function bias in partially observable games.
-    /// For non-CTDE networks, `local_obs` is used as input (same as actor).
-    pub fn forward_critic(
-        &self,
-        global_state: Tensor<B, 2>,
-        local_obs: Tensor<B, 2>,
-    ) -> Tensor<B, 2> {
+    /// For CTDE networks, the critic takes `privileged_obs` (hidden info) + obs.
+    /// Both are player-relative (current player at index 0).
+    /// For non-CTDE networks, only `obs` is used (`privileged_obs` is ignored).
+    ///
+    /// Returns: values [batch, 1] (acting player's value)
+    pub fn forward_critic(&self, privileged_obs: Tensor<B, 2>, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         match self {
-            Self::Mlp(mlp) => mlp.forward(local_obs).1,
-            Self::Cnn(cnn) => cnn.forward(local_obs).1,
-            Self::Ctde(ctde) => ctde.forward_critic(global_state, local_obs),
+            Self::Mlp(mlp) => mlp.forward(obs).1,
+            Self::Cnn(cnn) => cnn.forward(obs).1,
+            Self::Ctde(ctde) => ctde.forward_critic(privileged_obs, obs),
         }
     }
 
@@ -216,7 +209,7 @@ mod tests {
         };
 
         let model: ActorCriticNetwork<TestBackend> =
-            ActorCriticNetwork::new(4, None, 2, 1, None, &config, &device);
+            ActorCriticNetwork::new(4, None, 2, None, &config, &device);
 
         assert!(model.is_mlp());
         assert!(!model.is_cnn());
@@ -224,7 +217,7 @@ mod tests {
         let obs = Tensor::zeros([8, 4], &device);
         let (logits, values) = model.forward(obs);
         assert_eq!(logits.dims(), [8, 2]);
-        assert_eq!(values.dims(), [8, 1]);
+        assert_eq!(values.dims(), [8, 1]); // Single scalar value
     }
 
     #[test]
@@ -241,7 +234,7 @@ mod tests {
         };
 
         let model: ActorCriticNetwork<TestBackend> =
-            ActorCriticNetwork::new(86, Some((6, 7, 2)), 7, 2, None, &config, &device);
+            ActorCriticNetwork::new(86, Some((6, 7, 2)), 7, None, &config, &device);
 
         assert!(model.is_cnn());
         assert!(!model.is_mlp());
@@ -249,7 +242,7 @@ mod tests {
         let obs = Tensor::zeros([8, 86], &device);
         let (logits, values) = model.forward(obs);
         assert_eq!(logits.dims(), [8, 7]);
-        assert_eq!(values.dims(), [8, 2]);
+        assert_eq!(values.dims(), [8, 1]); // Single scalar value
     }
 
     #[test]
@@ -258,8 +251,7 @@ mod tests {
         let config = Config::default();
 
         // Use the old alias
-        let model: ActorCritic<TestBackend> =
-            ActorCritic::new(4, None, 2, 1, None, &config, &device);
+        let model: ActorCritic<TestBackend> = ActorCritic::new(4, None, 2, None, &config, &device);
 
         let obs = Tensor::zeros([1, 4], &device);
         let (logits, values) = model.forward(obs);
@@ -276,7 +268,7 @@ mod tests {
             ..Config::default()
         };
         let model: ActorCriticNetwork<TestBackend> =
-            ActorCriticNetwork::new(10, None, 5, 2, Some(20), &config, &device);
+            ActorCriticNetwork::new(10, None, 5, Some(20), &config, &device);
         let obs = Tensor::zeros([8, 10], &device);
         let _ = model.forward(obs); // Should panic
     }
@@ -289,15 +281,15 @@ mod tests {
             ..Config::default()
         };
         let model: ActorCriticNetwork<TestBackend> =
-            ActorCriticNetwork::new(10, None, 5, 2, Some(20), &config, &device);
-        let local_obs = Tensor::zeros([8, 10], &device);
-        let global_state = Tensor::zeros([8, 20], &device);
+            ActorCriticNetwork::new(10, None, 5, Some(20), &config, &device);
+        let obs = Tensor::zeros([8, 10], &device);
+        let privileged_obs = Tensor::zeros([8, 20], &device);
 
-        let logits = model.forward_actor(local_obs.clone());
-        let values = model.forward_critic(global_state, local_obs);
+        let logits = model.forward_actor(obs.clone());
+        let values = model.forward_critic(privileged_obs, obs);
 
         assert_eq!(logits.dims(), [8, 5]);
-        assert_eq!(values.dims(), [8, 2]);
+        assert_eq!(values.dims(), [8, 1]); // Single scalar value
     }
 
     #[test]
@@ -308,7 +300,7 @@ mod tests {
             ..Config::default()
         };
         let model: ActorCriticNetwork<TestBackend> =
-            ActorCriticNetwork::new(10, None, 5, 2, Some(20), &config, &device);
+            ActorCriticNetwork::new(10, None, 5, Some(20), &config, &device);
 
         assert!(model.is_ctde());
         assert!(!model.is_mlp());

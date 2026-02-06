@@ -41,35 +41,34 @@ type FlattenedBuffer<B> = (
     Tensor<B, 1, Int>,         // acting_players
     Tensor<B, 1>,              // old_values (flattened)
     Option<Tensor<B, 1, Int>>, // valid_indices for opponent pool training
-    Option<Tensor<B, 2>>,      // global_states for CTDE (batch_size, global_state_dim)
+    Option<Tensor<B, 2>>,      // privileged_obs for CTDE (batch_size, privileged_obs_dim)
 );
 
 /// Stores trajectory data from environment rollouts
 ///
 /// Shape: [`num_steps`, `num_envs`] for most fields
-/// For multi-player games, also stores per-player values and rewards.
+/// For multi-player games, also stores per-player rewards for attribution.
 #[derive(Debug)]
 pub struct RolloutBuffer<B: Backend> {
     /// Observations [`num_steps`, `num_envs`, `obs_dim`]
     pub observations: Tensor<B, 3>,
-    /// Global states for CTDE critic [`num_steps`, `num_envs`, `global_state_dim`]
+    /// Privileged observations for CTDE critic [`num_steps`, `num_envs`, `privileged_obs_dim`]
     /// Only populated when using CTDE networks
-    pub global_states: Option<Tensor<B, 3>>,
+    pub privileged_obs: Option<Tensor<B, 3>>,
     /// Actions taken [`num_steps`, `num_envs`]
     pub actions: Tensor<B, 2, Int>,
     /// Rewards for acting player [`num_steps`, `num_envs`]
     pub rewards: Tensor<B, 2>,
     /// Episode done flags [`num_steps`, `num_envs`]
     pub dones: Tensor<B, 2>,
-    /// Value estimates for acting player [`num_steps`, `num_envs`]
+    /// Value estimates for acting player [`num_steps`, `num_envs`] (single scalar)
     pub values: Tensor<B, 2>,
     /// Log probabilities of actions [`num_steps`, `num_envs`]
     pub log_probs: Tensor<B, 2>,
 
     // Multi-player support fields
-    /// Values for ALL players [`num_steps`, `num_envs`, `num_players`]
-    pub all_values: Tensor<B, 3>,
     /// Rewards for ALL players [`num_steps`, `num_envs`, `num_players`]
+    /// (needed for reward attribution in GAE)
     pub all_rewards: Tensor<B, 3>,
     /// Which player acted each step [`num_steps`, `num_envs`]
     pub acting_players: Tensor<B, 2, Int>,
@@ -94,28 +93,27 @@ impl<B: Backend> RolloutBuffer<B> {
     /// Create empty buffer with given dimensions
     ///
     /// `num_players` must be <= 255 (stored as u8)
-    /// `global_state_dim`: Optional global state dimension for CTDE networks
+    /// `privileged_obs_dim`: Optional privileged observation dimension for CTDE networks
     pub fn new(
         num_steps: usize,
         num_envs: usize,
         obs_dim: usize,
-        global_state_dim: Option<usize>,
+        privileged_obs_dim: Option<usize>,
         num_players: u8,
         device: &B::Device,
     ) -> Self {
         let np = num_players as usize;
-        let global_states =
-            global_state_dim.map(|dim| Tensor::zeros([num_steps, num_envs, dim], device));
+        let privileged_obs =
+            privileged_obs_dim.map(|dim| Tensor::zeros([num_steps, num_envs, dim], device));
         Self {
             observations: Tensor::zeros([num_steps, num_envs, obs_dim], device),
-            global_states,
+            privileged_obs,
             actions: Tensor::zeros([num_steps, num_envs], device),
             rewards: Tensor::zeros([num_steps, num_envs], device),
             dones: Tensor::zeros([num_steps, num_envs], device),
             values: Tensor::zeros([num_steps, num_envs], device),
             log_probs: Tensor::zeros([num_steps, num_envs], device),
             // Multi-player fields
-            all_values: Tensor::zeros([num_steps, num_envs, np], device),
             all_rewards: Tensor::zeros([num_steps, num_envs, np], device),
             acting_players: Tensor::zeros([num_steps, num_envs], device),
             num_players,
@@ -181,10 +179,10 @@ impl<B: Backend> RolloutBuffer<B> {
             None
         };
 
-        // Reshape global states if present (for CTDE)
-        let global_states = self.global_states.as_ref().map(|gs| {
-            let [_num_steps, _num_envs, global_dim] = gs.dims();
-            gs.clone().reshape([batch_size, global_dim])
+        // Reshape privileged observations if present (for CTDE)
+        let privileged_obs = self.privileged_obs.as_ref().map(|po| {
+            let [_num_steps, _num_envs, priv_dim] = po.dims();
+            po.clone().reshape([batch_size, priv_dim])
         });
 
         (
@@ -196,7 +194,7 @@ impl<B: Backend> RolloutBuffer<B> {
             acting_players,
             old_values,
             valid_indices,
-            global_states,
+            privileged_obs,
         )
     }
 }
@@ -237,18 +235,17 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     let mut all_acting_values: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
     let mut all_log_probs: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
 
-    // Multi-player data
-    let mut all_values_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
+    // Multi-player data (only rewards need per-player tracking for attribution)
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
 
-    // Global states for CTDE (collected if buffer has global_states field)
-    let collect_global_states = buffer.global_states.is_some();
-    let mut all_global_states: Vec<f32> = if collect_global_states {
+    // Privileged observations for CTDE (collected if buffer has privileged_obs field)
+    let collect_privileged_obs = buffer.privileged_obs.is_some();
+    let mut all_privileged_obs: Vec<f32> = if collect_privileged_obs {
         // Get global state dim from first env
-        let first_global = vec_env.get_global_states();
-        let global_state_dim = first_global.len() / num_envs;
-        Vec::with_capacity(num_steps * num_envs * global_state_dim)
+        let first_global = vec_env.get_privileged_obs();
+        let privileged_obs_dim = first_global.len() / num_envs;
+        Vec::with_capacity(num_steps * num_envs * privileged_obs_dim)
     } else {
         Vec::new()
     };
@@ -277,9 +274,9 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         let mut obs_flat = vec_env.get_observations();
 
         // Get global states for CTDE (if enabled)
-        if collect_global_states {
-            let global_states_flat = vec_env.get_global_states();
-            all_global_states.extend_from_slice(&global_states_flat);
+        if collect_privileged_obs {
+            let privileged_obs_flat = vec_env.get_privileged_obs();
+            all_privileged_obs.extend_from_slice(&privileged_obs_flat);
         }
 
         // Store raw observations BEFORE normalization for stats update
@@ -311,7 +308,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 
         // Model inference: forward pass, sample actions, compute log probs, sync to CPU
         // All GPU ops batched together - timing includes actual compute (sync at end)
-        let (actions_data, acting_values_data, log_probs_data, values_all_data) = {
+        let (actions_data, acting_values_data, log_probs_data) = {
             profile_scope!("model_inference");
 
             let obs_tensor: Tensor<B, 2> = Tensor::<B, 1>::from_floats(obs_flat.as_slice(), device)
@@ -319,18 +316,18 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 
             // Handle CTDE networks: separate forward passes for actor and critic
             let (logits, values) = if model.is_ctde() {
-                let global_states_flat = vec_env.get_global_states();
-                let global_state_dim = global_states_flat.len() / num_envs;
-                let global_state_tensor =
-                    Tensor::<B, 1>::from_floats(global_states_flat.as_slice(), device)
-                        .reshape([num_envs, global_state_dim]);
+                let privileged_obs_flat = vec_env.get_privileged_obs();
+                let privileged_obs_dim = privileged_obs_flat.len() / num_envs;
+                let privileged_obs_tensor =
+                    Tensor::<B, 1>::from_floats(privileged_obs_flat.as_slice(), device)
+                        .reshape([num_envs, privileged_obs_dim]);
                 let logits = model.forward_actor(obs_tensor.clone());
-                let values = model.forward_critic(global_state_tensor, obs_tensor);
+                let values = model.forward_critic(privileged_obs_tensor, obs_tensor);
                 (logits, values)
             } else {
                 model.forward(obs_tensor)
             };
-            // values is [num_envs, num_players]
+            // values is [num_envs, 1] - single scalar per environment (acting player's value)
 
             // Apply action mask to prevent sampling invalid actions
             let masked_logits = apply_action_mask(logits, action_masks);
@@ -347,30 +344,19 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
                 .map(|x| x as i64)
                 .collect();
 
-            // Get all player values [num_envs * num_players]
-            let mut values_all_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
+            // Get scalar values [num_envs] - already the acting player's value
+            let mut acting_values_data: Vec<f32> =
+                values.into_data().to_vec().expect("values to vec");
 
             // Denormalize values if PopArt is active
             // After rescaling, model outputs normalized values - convert back to raw for GAE
             if let Some(popart_norm) = popart {
-                popart_norm.denormalize_all_players(&mut values_all_data, num_players);
+                popart_norm.denormalize(&mut acting_values_data);
             }
-
-            // Extract acting player's value for each env
-            let acting_values_data: Vec<f32> = current_players
-                .iter()
-                .enumerate()
-                .map(|(e, &p)| values_all_data[e * num_players + p])
-                .collect();
 
             let log_probs_data: Vec<f32> =
                 log_probs.into_data().to_vec().expect("log_probs to vec");
-            (
-                actions_data,
-                acting_values_data,
-                log_probs_data,
-                values_all_data,
-            )
+            (actions_data, acting_values_data, log_probs_data)
         };
 
         // Convert actions to Vec<usize> for environment
@@ -441,8 +427,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         all_acting_values.extend_from_slice(&acting_values_data);
         all_log_probs.extend_from_slice(&log_probs_data);
 
-        // Multi-player data
-        all_values_flat.extend_from_slice(&values_all_data);
+        // Multi-player data (per-player rewards for attribution)
         all_rewards_flat.extend_from_slice(&rewards_flat);
         all_acting_players.extend(current_players.iter().map(|&p| p as i64));
     }
@@ -454,13 +439,13 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
             .reshape([num_steps, num_envs, obs_dim]);
 
         // Populate global states if CTDE is enabled
-        if let Some(ref mut global_states_tensor) = buffer.global_states {
-            let global_state_dim = all_global_states.len() / (num_steps * num_envs);
-            *global_states_tensor =
-                Tensor::<B, 1>::from_floats(all_global_states.as_slice(), device).reshape([
+        if let Some(ref mut privileged_obs_tensor) = buffer.privileged_obs {
+            let privileged_obs_dim = all_privileged_obs.len() / (num_steps * num_envs);
+            *privileged_obs_tensor =
+                Tensor::<B, 1>::from_floats(all_privileged_obs.as_slice(), device).reshape([
                     num_steps,
                     num_envs,
-                    global_state_dim,
+                    privileged_obs_dim,
                 ]);
         }
 
@@ -475,9 +460,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         buffer.log_probs = Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device)
             .reshape([num_steps, num_envs]);
 
-        // Multi-player data
-        buffer.all_values = Tensor::<B, 1>::from_floats(all_values_flat.as_slice(), device)
-            .reshape([num_steps, num_envs, num_players]);
+        // Multi-player data (per-player rewards for attribution)
         buffer.all_rewards = Tensor::<B, 1>::from_floats(all_rewards_flat.as_slice(), device)
             .reshape([num_steps, num_envs, num_players]);
         buffer.acting_players =
@@ -576,8 +559,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     let mut all_acting_values: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
     let mut all_log_probs: Vec<f32> = Vec::with_capacity(num_steps * num_envs);
 
-    // Multi-player data
-    let mut all_values_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
+    // Multi-player data (only rewards need per-player tracking for attribution)
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
 
@@ -585,13 +567,13 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     let mut collected_action_masks: Option<Vec<f32>> = None;
     let mut stored_action_count: usize = 0;
 
-    // Global states for CTDE (collected if buffer has global_states field)
-    let collect_global_states = buffer.global_states.is_some();
-    let mut all_global_states: Vec<f32> = if collect_global_states {
+    // Privileged observations for CTDE (collected if buffer has privileged_obs field)
+    let collect_privileged_obs = buffer.privileged_obs.is_some();
+    let mut all_privileged_obs: Vec<f32> = if collect_privileged_obs {
         // Get global state dim from first env
-        let first_global = vec_env.get_global_states();
-        let global_state_dim = first_global.len() / num_envs;
-        Vec::with_capacity(num_steps * num_envs * global_state_dim)
+        let first_global = vec_env.get_privileged_obs();
+        let privileged_obs_dim = first_global.len() / num_envs;
+        Vec::with_capacity(num_steps * num_envs * privileged_obs_dim)
     } else {
         Vec::new()
     };
@@ -619,9 +601,9 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
         }
 
         // Get global states for CTDE (if enabled)
-        if collect_global_states {
-            let global_states_flat = vec_env.get_global_states();
-            all_global_states.extend_from_slice(&global_states_flat);
+        if collect_privileged_obs {
+            let privileged_obs_flat = vec_env.get_privileged_obs();
+            all_privileged_obs.extend_from_slice(&privileged_obs_flat);
         }
 
         // Partition envs by which model should act
@@ -667,7 +649,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
 
         // Prepare actions for all envs (will be filled in by model forward passes)
         let mut all_env_actions: Vec<usize> = vec![0; num_envs];
-        let mut all_env_values: Vec<Vec<f32>> = vec![vec![0.0; num_players]; num_envs];
+        let mut all_env_values: Vec<f32> = vec![0.0; num_envs]; // Single scalar per env
         let mut all_env_log_probs: Vec<f32> = vec![0.0; num_envs];
 
         // Forward pass for learner model
@@ -707,25 +689,25 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             // Handle CTDE networks: separate forward passes for actor and critic
             let (logits, values) = if model.is_ctde() {
                 // Get full global states (all envs)
-                let all_global_states_flat = vec_env.get_global_states();
-                let global_state_dim = all_global_states_flat.len() / num_envs;
+                let all_privileged_obs_flat = vec_env.get_privileged_obs();
+                let privileged_obs_dim = all_privileged_obs_flat.len() / num_envs;
 
                 // Extract global states for learner envs
-                let learner_global_states: Vec<f32> = learner_env_indices
+                let learner_privileged_obs: Vec<f32> = learner_env_indices
                     .iter()
                     .flat_map(|&env_idx| {
-                        let start = env_idx * global_state_dim;
-                        all_global_states_flat[start..start + global_state_dim]
+                        let start = env_idx * privileged_obs_dim;
+                        all_privileged_obs_flat[start..start + privileged_obs_dim]
                             .iter()
                             .copied()
                     })
                     .collect();
 
-                let global_state_tensor =
-                    Tensor::<B, 1>::from_floats(learner_global_states.as_slice(), device)
-                        .reshape([batch_size, global_state_dim]);
+                let privileged_obs_tensor =
+                    Tensor::<B, 1>::from_floats(learner_privileged_obs.as_slice(), device)
+                        .reshape([batch_size, privileged_obs_dim]);
                 let logits = model.forward_actor(obs_tensor.clone());
-                let values = model.forward_critic(global_state_tensor, obs_tensor);
+                let values = model.forward_critic(privileged_obs_tensor, obs_tensor);
                 (logits, values)
             } else {
                 model.forward(obs_tensor)
@@ -752,18 +734,14 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             // Denormalize values if PopArt is active
             // After rescaling, model outputs normalized values - convert back to raw for GAE
             if let Some(popart_norm) = popart {
-                popart_norm.denormalize_all_players(&mut values_data, num_players);
+                popart_norm.denormalize(&mut values_data);
             }
 
-            // Scatter results back to env arrays
+            // Scatter results back to env arrays (values are already scalars)
             for (batch_idx, &env_idx) in learner_env_indices.iter().enumerate() {
                 all_env_actions[env_idx] = actions_data[batch_idx] as usize;
                 all_env_log_probs[env_idx] = log_probs_data[batch_idx];
-
-                // Extract all player values for this env
-                let value_start = batch_idx * num_players;
-                all_env_values[env_idx] =
-                    values_data[value_start..value_start + num_players].to_vec();
+                all_env_values[env_idx] = values_data[batch_idx];
             }
         }
 
@@ -812,25 +790,25 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             // Handle CTDE opponent models: separate forward passes for actor and critic
             let (logits, _values) = if opp_model.is_ctde() {
                 // Get full global states (all envs)
-                let all_global_states_flat = vec_env.get_global_states();
-                let global_state_dim = all_global_states_flat.len() / num_envs;
+                let all_privileged_obs_flat = vec_env.get_privileged_obs();
+                let privileged_obs_dim = all_privileged_obs_flat.len() / num_envs;
 
                 // Extract global states for opponent envs
-                let opp_global_states: Vec<f32> = env_indices
+                let opp_privileged_obs: Vec<f32> = env_indices
                     .iter()
                     .flat_map(|&env_idx| {
-                        let start = env_idx * global_state_dim;
-                        all_global_states_flat[start..start + global_state_dim]
+                        let start = env_idx * privileged_obs_dim;
+                        all_privileged_obs_flat[start..start + privileged_obs_dim]
                             .iter()
                             .copied()
                     })
                     .collect();
 
-                let global_state_tensor =
-                    Tensor::<B, 1>::from_floats(opp_global_states.as_slice(), device)
-                        .reshape([batch_size, global_state_dim]);
+                let privileged_obs_tensor =
+                    Tensor::<B, 1>::from_floats(opp_privileged_obs.as_slice(), device)
+                        .reshape([batch_size, privileged_obs_dim]);
                 let logits = opp_model.forward_actor(obs_tensor.clone());
-                let values = opp_model.forward_critic(global_state_tensor, obs_tensor);
+                let values = opp_model.forward_critic(privileged_obs_tensor, obs_tensor);
                 (logits, values)
             } else {
                 opp_model.forward(obs_tensor)
@@ -965,17 +943,13 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             }
             all_acting_rewards.push(acting_reward);
 
-            let acting_value = all_env_values
-                .get(env_idx)
-                .and_then(|v| v.get(current_player))
-                .copied()
-                .unwrap_or(0.0);
+            // Value is already scalar (acting player's value)
+            let acting_value = all_env_values.get(env_idx).copied().unwrap_or(0.0);
             all_acting_values.push(acting_value);
 
             all_dones.push(if done { 1.0 } else { 0.0 });
 
-            // Multi-player data
-            all_values_flat.extend_from_slice(&all_env_values[env_idx]);
+            // Multi-player data (per-player rewards for attribution)
             // Use normalized acting_reward for consistency
             let rewards_flat: Vec<f32> = (0..num_players)
                 .map(|p| {
@@ -1004,13 +978,13 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             .reshape([num_steps, num_envs, obs_dim]);
 
         // Populate global states if CTDE is enabled
-        if let Some(ref mut global_states_tensor) = buffer.global_states {
-            let global_state_dim = all_global_states.len() / (num_steps * num_envs);
-            *global_states_tensor =
-                Tensor::<B, 1>::from_floats(all_global_states.as_slice(), device).reshape([
+        if let Some(ref mut privileged_obs_tensor) = buffer.privileged_obs {
+            let privileged_obs_dim = all_privileged_obs.len() / (num_steps * num_envs);
+            *privileged_obs_tensor =
+                Tensor::<B, 1>::from_floats(all_privileged_obs.as_slice(), device).reshape([
                     num_steps,
                     num_envs,
-                    global_state_dim,
+                    privileged_obs_dim,
                 ]);
         }
 
@@ -1025,8 +999,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
         buffer.log_probs = Tensor::<B, 1>::from_floats(all_log_probs.as_slice(), device)
             .reshape([num_steps, num_envs]);
 
-        buffer.all_values = Tensor::<B, 1>::from_floats(all_values_flat.as_slice(), device)
-            .reshape([num_steps, num_envs, num_players]);
+        // Multi-player data (per-player rewards for attribution)
         buffer.all_rewards = Tensor::<B, 1>::from_floats(all_rewards_flat.as_slice(), device)
             .reshape([num_steps, num_envs, num_players]);
         buffer.acting_players =
@@ -1133,7 +1106,7 @@ pub fn compute_gae<B: Backend>(
 #[expect(clippy::cast_sign_loss, reason = "tensor indices are non-negative")]
 pub fn compute_gae_multiplayer<B: Backend>(
     buffer: &mut RolloutBuffer<B>,
-    last_values: Tensor<B, 2>, // [num_envs, num_players]
+    last_values: Tensor<B, 1>, // [num_envs] - scalar bootstrap value per env
     gamma: f32,
     gae_lambda: f32,
     num_players: u8,
@@ -1150,12 +1123,8 @@ pub fn compute_gae_multiplayer<B: Backend>(
         .into_data()
         .to_vec()
         .expect("all_rewards");
-    let all_values_data: Vec<f32> = buffer
-        .all_values
-        .clone()
-        .into_data()
-        .to_vec()
-        .expect("all_values");
+    // Values are already scalar per step (acting player's value)
+    let values_data: Vec<f32> = buffer.values.clone().into_data().to_vec().expect("values");
     let dones_data: Vec<f32> = buffer.dones.clone().into_data().to_vec().expect("dones");
     // Convert through float to avoid IntElem type mismatches between backends
     let acting_players_data: Vec<usize> = buffer
@@ -1168,6 +1137,7 @@ pub fn compute_gae_multiplayer<B: Backend>(
         .into_iter()
         .map(|x| x as usize)
         .collect();
+    // last_values is now scalar per env (acting player's value at final step)
     let last_values_data: Vec<f32> = last_values.into_data().to_vec().expect("last_values");
 
     // Pass 1: Attribute cumulative rewards to acting player
@@ -1202,16 +1172,18 @@ pub fn compute_gae_multiplayer<B: Backend>(
     }
 
     // Pass 2: Compute GAE using per-player value chains
+    // Note: Even with single value output, we still track per-player GAE carry
+    // because different players may have different "continuation" values when
+    // the acting player changes between steps.
     let mut advantages = vec![0.0_f32; num_steps * num_envs];
     let mut gae_carry = vec![vec![0.0_f32; num_players]; num_envs];
 
-    // Initialize next_value from bootstrap values
+    // Initialize next_value from bootstrap values (scalar per env)
+    // With single value output, we only have the final acting player's value,
+    // so we initialize all players to this value and they'll get overwritten
+    // as we iterate backwards through steps where each player acts.
     let mut next_value: Vec<Vec<f32>> = (0..num_envs)
-        .map(|e| {
-            (0..num_players)
-                .map(|p| last_values_data[e * num_players + p])
-                .collect()
-        })
+        .map(|e| vec![last_values_data[e]; num_players])
         .collect();
 
     for t in (0..num_steps).rev() {
@@ -1219,7 +1191,8 @@ pub fn compute_gae_multiplayer<B: Backend>(
             let idx = t * num_envs + e;
             let player = acting_players_data[idx];
             let reward = attributed_rewards[idx];
-            let value = all_values_data[(t * num_envs + e) * num_players + player];
+            // Value is already scalar (acting player's value at this step)
+            let value = values_data[idx];
             let done = dones_data[idx];
 
             // Reset BEFORE processing: clears carry from future episodes
@@ -1255,17 +1228,8 @@ pub fn compute_gae_multiplayer<B: Backend>(
     let advantages_tensor: Tensor<B, 2> =
         Tensor::<B, 1>::from_floats(advantages.as_slice(), device).reshape([num_steps, num_envs]);
 
-    // Compute returns = advantages + acting player's value
-    let values_flat: Vec<f32> = (0..num_steps * num_envs)
-        .map(|i| {
-            let t = i / num_envs;
-            let e = i % num_envs;
-            let p = acting_players_data[t * num_envs + e];
-            all_values_data[(t * num_envs + e) * num_players + p]
-        })
-        .collect();
-    let values_tensor: Tensor<B, 2> =
-        Tensor::<B, 1>::from_floats(values_flat.as_slice(), device).reshape([num_steps, num_envs]);
+    // Compute returns = advantages + value (already scalar per step)
+    let values_tensor = buffer.values.clone();
 
     buffer.advantages = Some(advantages_tensor.clone());
     buffer.returns = Some(advantages_tensor + values_tensor);
@@ -1384,13 +1348,13 @@ pub struct UpdateMetrics {
 fn compute_minibatch_loss<B: burn::tensor::backend::AutodiffBackend>(
     model: &ActorCritic<B>,
     mb_obs: Tensor<B::InnerBackend, 2>,
-    mb_global_states: Option<Tensor<B::InnerBackend, 2>>,
+    mb_privileged_obs: Option<Tensor<B::InnerBackend, 2>>,
     mb_actions: Tensor<B::InnerBackend, 1, Int>,
     mb_old_log_probs: Tensor<B::InnerBackend, 1>,
     mb_advantages_normalized: Tensor<B::InnerBackend, 1>,
     mb_returns: Tensor<B::InnerBackend, 1>,
     mb_old_values: Tensor<B::InnerBackend, 1>,
-    mb_acting_players: Tensor<B::InnerBackend, 1, Int>,
+    _mb_acting_players: &Tensor<B::InnerBackend, 1, Int>,
     mb_action_masks: Option<Tensor<B::InnerBackend, 2>>,
     config: &Config,
     entropy_coef: f64,
@@ -1407,27 +1371,21 @@ where
     // Forward pass (creates autodiff tensors)
     // For CTDE: use separate actor/critic forward passes
     // For non-CTDE: use standard forward pass
-    let (logits, all_values) = if model.is_ctde() {
+    let (logits, values_2d) = if model.is_ctde() {
         let local_obs_autodiff = Tensor::from_inner(mb_obs);
-        let global_states_autodiff =
-            Tensor::from_inner(mb_global_states.expect("CTDE requires global_states in buffer"));
+        let privileged_obs_autodiff =
+            Tensor::from_inner(mb_privileged_obs.expect("CTDE requires privileged_obs in buffer"));
         let logits = model.forward_actor(local_obs_autodiff.clone());
-        let all_values = model.forward_critic(global_states_autodiff, local_obs_autodiff);
-        (logits, all_values)
+        let values = model.forward_critic(privileged_obs_autodiff, local_obs_autodiff);
+        (logits, values)
     } else {
         model.forward(Tensor::from_inner(mb_obs))
     };
 
-    // Extract acting player values
+    // Values are already scalar per sample [batch, 1] -> flatten to [batch]
     let mb_size = logits.dims()[0];
-    let values: Tensor<B, 1> = if num_players == 1 {
-        all_values.slice([0..mb_size, 0..1]).flatten(0, 1)
-    } else {
-        let indices_2d = mb_acting_players.unsqueeze_dim(1);
-        all_values
-            .gather(1, Tensor::from_inner(indices_2d))
-            .squeeze_dims(&[1])
-    };
+    let _ = num_players; // unused with single value output
+    let values: Tensor<B, 1> = values_2d.slice([0..mb_size, 0..1]).flatten(0, 1);
 
     // IMMEDIATELY extract inner for metrics (before loss uses it)
     let values_inner = values.clone().inner();
@@ -1571,56 +1529,53 @@ where
 /// When normalization statistics change, we rescale the value head to preserve
 /// output semantics. This ensures value predictions when denormalized remain
 /// consistent, preventing catastrophic forgetting when normalization statistics shift.
+///
+/// With single value output, the value head outputs a scalar per sample, so we
+/// use player 0's statistics (unified across all players).
 pub fn rescale_value_head_for_popart<B: Backend>(
     model: ActorCritic<B>,
     old_means: &[f64],
     old_stds: &[f64],
     new_means: &[f64],
     new_stds: &[f64],
-    num_players: usize,
+    _num_players: usize, // Kept for API compatibility but not used (single value output)
 ) -> ActorCritic<B> {
     let value_head = model.value_head();
     let device = value_head.weight.device();
 
     // Get weight shape and data
-    // weight shape: [input_dim, num_players]
+    // weight shape: [input_dim, 1] (single value output)
     let weight = value_head.weight.val();
     let weight_shape = weight.shape();
     let input_dim = weight_shape.dims[0];
+    let output_dim = weight_shape.dims[1]; // Should be 1 for single value output
     let weight_data: Vec<f32> = weight.into_data().to_vec().expect("weight data");
 
-    // Compute scale factors per player: σ_old / σ_new
-    let scales: Vec<f64> = (0..num_players)
-        .map(|p| old_stds[p] / new_stds[p])
-        .collect();
+    // Compute scale factor using player 0's stats (unified for single value output)
+    let scale = old_stds[0] / new_stds[0];
 
-    // Rescale weights: W_new[i, p] = W_old[i, p] * scale[p]
-    // Data is stored row-major: [row0_col0, row0_col1, ..., row1_col0, ...]
+    // Rescale weights: W_new = W_old * scale
     let new_weight_data: Vec<f32> = weight_data
-        .chunks(num_players)
-        .flat_map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(p, &w)| (f64::from(w) * scales[p]) as f32)
-        })
+        .iter()
+        .map(|&w| (f64::from(w) * scale) as f32)
         .collect();
 
-    // Compute new biases: b_new = (b_old * σ_old + μ_old - μ_new) / σ_new
+    // Compute new bias: b_new = (b_old * σ_old + μ_old - μ_new) / σ_new
     let bias_data: Vec<f32> = value_head.bias.as_ref().map_or_else(
-        || vec![0.0; num_players],
+        || vec![0.0; output_dim],
         |b| b.val().into_data().to_vec().expect("bias data"),
     );
 
-    let new_bias_data: Vec<f32> = (0..num_players)
-        .map(|p| {
-            let b_old = bias_data.get(p).copied().unwrap_or(0.0);
-            ((f64::from(b_old) * old_stds[p] + old_means[p] - new_means[p]) / new_stds[p]) as f32
+    let new_bias_data: Vec<f32> = bias_data
+        .iter()
+        .map(|&b_old| {
+            ((f64::from(b_old) * old_stds[0] + old_means[0] - new_means[0]) / new_stds[0]) as f32
         })
         .collect();
 
     // Create fresh tensors from the computed data (these are leaf tensors)
     let new_weight_1d: Tensor<B, 1> = Tensor::from_floats(new_weight_data.as_slice(), &device);
-    let new_weight: Tensor<B, 2> = new_weight_1d.reshape([input_dim, num_players]);
+    let new_weight: Tensor<B, 2> = new_weight_1d.reshape([input_dim, output_dim]);
     let new_bias: Tensor<B, 1> = Tensor::from_floats(new_bias_data.as_slice(), &device);
 
     // Use map() to preserve ParamIds - this keeps optimizer momentum/velocity state
@@ -1672,7 +1627,7 @@ where
         acting_players_inner,
         old_values_inner,
         valid_indices,
-        global_states_inner,
+        privileged_obs_inner,
     ) = buffer.flatten();
 
     // If opponent pool training, filter to only learner turn data
@@ -1685,7 +1640,7 @@ where
         returns_inner,
         acting_players_inner,
         old_values_inner,
-        global_states_inner,
+        privileged_obs_inner,
     ) = if let Some(indices) = valid_indices {
         (
             obs_inner.select(0, indices.clone()),
@@ -1695,7 +1650,7 @@ where
             returns_inner.select(0, indices.clone()),
             acting_players_inner.select(0, indices.clone()),
             old_values_inner.select(0, indices.clone()),
-            global_states_inner.map(|gs| gs.select(0, indices)),
+            privileged_obs_inner.map(|gs| gs.select(0, indices)),
         )
     } else {
         (
@@ -1706,7 +1661,7 @@ where
             returns_inner,
             acting_players_inner,
             old_values_inner,
-            global_states_inner,
+            privileged_obs_inner,
         )
     };
 
@@ -1853,7 +1808,7 @@ where
                 .clone()
                 .select(0, mb_indices_inner.clone());
             let mb_old_values_inner = old_values_inner.clone().select(0, mb_indices_inner.clone());
-            let mb_global_states_inner = global_states_inner
+            let mb_privileged_obs_inner = privileged_obs_inner
                 .as_ref()
                 .map(|gs| gs.clone().select(0, mb_indices_inner.clone()));
 
@@ -1934,13 +1889,13 @@ where
                 let out = compute_minibatch_loss(
                     &model,
                     mb_obs_inner,
-                    mb_global_states_inner,
+                    mb_privileged_obs_inner,
                     mb_actions_inner,
                     mb_old_log_probs_inner,
                     mb_advantages_normalized,
                     mb_returns_inner,
                     mb_old_values_inner,
-                    mb_acting_players_inner,
+                    &mb_acting_players_inner,
                     mb_action_masks_inner,
                     config,
                     entropy_coef,
@@ -2118,7 +2073,7 @@ mod tests {
         assert_eq!(buffer.observations.dims(), [128, 4, 4]);
         assert_eq!(buffer.actions.dims(), [128, 4]);
         assert_eq!(buffer.rewards.dims(), [128, 4]);
-        assert_eq!(buffer.all_values.dims(), [128, 4, 1]);
+        assert_eq!(buffer.values.dims(), [128, 4]); // Single value per step
         assert_eq!(buffer.all_rewards.dims(), [128, 4, 1]);
         assert_eq!(buffer.acting_players.dims(), [128, 4]);
     }
@@ -2129,7 +2084,7 @@ mod tests {
         let buffer: RolloutBuffer<TestBackend> = RolloutBuffer::new(64, 8, 86, None, 2u8, &device);
 
         assert_eq!(buffer.observations.dims(), [64, 8, 86]);
-        assert_eq!(buffer.all_values.dims(), [64, 8, 2]);
+        assert_eq!(buffer.values.dims(), [64, 8]); // Single value per step (not per-player)
         assert_eq!(buffer.all_rewards.dims(), [64, 8, 2]);
         assert_eq!(buffer.num_players(), 2u8);
     }
@@ -2189,22 +2144,16 @@ mod tests {
             ],
             &device,
         );
-        buffer.all_values = Tensor::from_floats(
-            [
-                [[0.5, 0.5], [0.5, 0.5]],
-                [[0.5, 0.5], [0.5, 0.5]],
-                [[0.5, 0.5], [0.5, 0.5]],
-                [[0.5, 0.5], [0.5, 0.5]],
-            ],
-            &device,
-        );
+        // Values: acting player's value estimate at each step (uniform 0.5 for all)
+        buffer.values =
+            Tensor::from_floats([[0.5, 0.5], [0.5, 0.5], [0.5, 0.5], [0.5, 0.5]], &device);
         // Alternating players: P0, P1, P0, P1
         buffer.acting_players = Tensor::from_ints([[0, 0], [1, 1], [0, 0], [1, 1]], &device);
         buffer.dones =
             Tensor::from_floats([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 1.0]], &device);
 
-        let last_values: Tensor<TestBackend, 2> = Tensor::from_floats(
-            [[0.0, 0.0], [0.0, 0.0]], // Terminal state, values don't matter
+        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats(
+            [0.0, 0.0], // Terminal state, values don't matter
             &device,
         );
 
@@ -2232,12 +2181,13 @@ mod tests {
         // P0 gets +1 reward at terminal step
         buffer.all_rewards = Tensor::from_floats([[[0.0, 0.0]], [[1.0, 0.0]]], &device);
 
-        buffer.all_values = Tensor::from_floats(
-            [[[0.5, 0.5]], [[0.8, 0.5]]], // P0 expects 0.8 at terminal
+        // Values: acting player's value at each step (P0 acts both steps)
+        buffer.values = Tensor::from_floats(
+            [[0.5], [0.8]], // P0 expects 0.5 at step 0, 0.8 at terminal
             &device,
         );
 
-        let last_values = Tensor::zeros([1, 2], &device);
+        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
         compute_gae_multiplayer(&mut buffer, last_values, gamma, lambda, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2290,16 +2240,13 @@ mod tests {
         );
 
         // Give Episode 2 P0 a high value to detect bleed
-        buffer.all_values = Tensor::from_floats(
-            [
-                [[0.0, 0.0]],
-                [[0.0, 0.0]],
-                [[0.9, 0.0]], // Episode 2: P0 expects 0.9
-            ],
+        // Values: acting player's value at each step (P0 at 0,2; P1 at 1)
+        buffer.values = Tensor::from_floats(
+            [[0.0], [0.0], [0.9]], // P0 value=0.0, P1 value=0.0, Episode 2 P0 expects 0.9
             &device,
         );
 
-        let last_values = Tensor::zeros([1, 2], &device);
+        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
         compute_gae_multiplayer(&mut buffer, last_values, gamma, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2348,9 +2295,9 @@ mod tests {
             &device,
         );
 
-        buffer.all_values = Tensor::zeros([4, 1, 2], &device);
+        buffer.values = Tensor::zeros([4, 1], &device);
 
-        let last_values = Tensor::zeros([1, 2], &device);
+        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
         compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2396,9 +2343,9 @@ mod tests {
             &device,
         );
 
-        buffer.all_values = Tensor::zeros([3, 1, 3], &device);
+        buffer.values = Tensor::zeros([3, 1], &device);
 
-        let last_values = Tensor::zeros([1, 3], &device);
+        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
         compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 3, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2452,20 +2399,14 @@ mod tests {
             &device,
         );
 
-        // Increasing value estimates for P0 (correctly predicting win)
-        buffer.all_values = Tensor::from_floats(
-            [
-                [[0.3, 0.7]],
-                [[0.4, 0.6]],
-                [[0.5, 0.5]],
-                [[0.6, 0.4]],
-                [[0.7, 0.3]],
-                [[0.8, 0.2]],
-            ],
+        // Values: acting player's value at each step (alternating P0/P1)
+        // P0 acts at 0,2,4; P1 acts at 1,3,5
+        buffer.values = Tensor::from_floats(
+            [[0.3], [0.6], [0.5], [0.4], [0.7], [0.2]], // P0:0.3, P1:0.6, P0:0.5, P1:0.4, P0:0.7, P1:0.2
             &device,
         );
 
-        let last_values = Tensor::zeros([1, 2], &device);
+        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
         compute_gae_multiplayer(&mut buffer, last_values, gamma, lambda, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2529,9 +2470,9 @@ mod tests {
         buffer.all_rewards = Tensor::from_floats([[[0.0, 0.0]], [[-1.0, 1.0]]], &device);
 
         // All values = 0 for simple calculation
-        buffer.all_values = Tensor::zeros([2, 1, 2], &device);
+        buffer.values = Tensor::zeros([2, 1], &device);
 
-        let last_values = Tensor::zeros([1, 2], &device);
+        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
         compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2573,17 +2514,13 @@ mod tests {
         buffer.all_rewards =
             Tensor::from_floats([[[0.0, 0.0]], [[-1.0, 0.0]], [[10.0, 0.0]]], &device);
 
-        // Different values to detect bleed
-        buffer.all_values = Tensor::from_floats(
-            [
-                [[0.0, 0.0]], // Step 0
-                [[0.0, 0.0]], // Step 1 (Episode 1 terminal)
-                [[5.0, 0.0]], // Step 2 (Episode 2) - high value
-            ],
+        // Different values to detect bleed (P0 acts all steps)
+        buffer.values = Tensor::from_floats(
+            [[0.0], [0.0], [5.0]], // Step 0: 0.0, Step 1: 0.0, Step 2 (Episode 2): high value 5.0
             &device,
         );
 
-        let last_values = Tensor::zeros([1, 2], &device);
+        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
         compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2636,12 +2573,13 @@ mod tests {
             &device,
         );
 
-        buffer.all_values = Tensor::from_floats(
-            [[[0.5, 0.5], [0.3, 0.3]], [[0.6, 0.4], [0.4, 0.4]]],
-            &device,
-        );
+        // Values: acting player's value at each step
+        // Step 0: P0 acts in both envs - env0=0.5 (P0's), env1=0.3 (P0's)
+        // Step 1: P1 acts in both envs - env0=0.4 (P1's), env1=0.4 (P1's)
+        buffer.values = Tensor::from_floats([[0.5, 0.3], [0.4, 0.4]], &device);
 
-        let last_values = Tensor::from_floats([[0.0, 0.0], [0.5, 0.5]], &device);
+        // Bootstrap: env0 is done (0.0 doesn't matter), env1 continues with P1 bootstrap=0.5
+        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats([0.0, 0.5], &device);
         compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2681,11 +2619,11 @@ mod tests {
         buffer.all_rewards =
             Tensor::from_floats([[[0.1, 0.0]], [[0.0, 0.2]], [[0.3, 0.0]]], &device);
 
-        buffer.all_values =
-            Tensor::from_floats([[[0.5, 0.5]], [[0.5, 0.5]], [[0.5, 0.5]]], &device);
+        // Values: acting player's value at each step (all 0.5)
+        buffer.values = Tensor::from_floats([[0.5], [0.5], [0.5]], &device);
 
-        // Bootstrap values
-        let last_values = Tensor::from_floats([[0.6, 0.6]], &device);
+        // Bootstrap values (next actor's value = 0.6)
+        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats([0.6], &device);
         compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
@@ -2725,7 +2663,7 @@ mod tests {
             acting_players,
             old_values,
             valid_indices,
-            global_states,
+            privileged_obs,
         ) = buffer.flatten();
 
         assert_eq!(obs.dims(), [8, 3]);
@@ -2740,8 +2678,8 @@ mod tests {
             "valid_indices should be None without valid_mask"
         );
         assert!(
-            global_states.is_none(),
-            "global_states should be None without CTDE"
+            privileged_obs.is_none(),
+            "privileged_obs should be None without CTDE"
         );
     }
 

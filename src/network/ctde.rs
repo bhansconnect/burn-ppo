@@ -2,8 +2,12 @@
 //!
 //! This module implements a MAPPO-style network architecture where:
 //! - Actor sees only local observations (decentralized execution)
-//! - Critic sees global game state (centralized training)
-//! - Both output per-player predictions for competitive games
+//! - Critic sees local obs + privileged observations (centralized training)
+//! - Value head outputs single scalar (acting player's value)
+//!
+//! Key terminology:
+//! - `obs`: What the acting player can see (player-relative)
+//! - `privileged_obs`: Hidden info not visible to actor (player-relative)
 
 use burn::prelude::*;
 
@@ -16,14 +20,15 @@ use crate::profile::{profile_function, profile_scope};
 /// Design philosophy:
 /// - Actor network is small and fast (used during deployment)
 /// - Critic network can be larger (only used during training)
-/// - Both networks trained end-to-end with PPO loss
+/// - Critic sees obs + `privileged_obs` (no redundancy)
+/// - Value head outputs single scalar (acting player's value)
 #[derive(Module, Debug)]
 pub struct CtdeActorCritic<B: Backend> {
-    // Actor network: local_obs -> policy_logits
+    // Actor network: obs -> policy_logits
     actor_layers: Vec<nn::Linear<B>>,
     policy_head: nn::Linear<B>,
 
-    // Critic network: global_state -> per_player_values
+    // Critic network: (privileged_obs, obs) -> value
     critic_layers: Vec<nn::Linear<B>>,
     pub value_head: nn::Linear<B>,
 
@@ -31,11 +36,9 @@ pub struct CtdeActorCritic<B: Backend> {
     #[module(skip)]
     use_relu: bool,
     #[module(skip)]
-    num_players: usize,
+    obs_dim: usize,
     #[module(skip)]
-    local_obs_dim: usize,
-    #[module(skip)]
-    global_state_dim: usize,
+    privileged_obs_dim: usize,
     #[module(skip)]
     action_count: usize,
 }
@@ -44,26 +47,24 @@ impl<B: Backend> CtdeActorCritic<B> {
     /// Create a new CTDE Actor-Critic network
     ///
     /// # Arguments
-    /// * `local_obs_dim` - Dimension of local observations (for actor)
-    /// * `global_state_dim` - Dimension of global state (for critic)
+    /// * `obs_dim` - Dimension of observations (for actor, player-relative)
+    /// * `privileged_obs_dim` - Dimension of privileged observations (hidden info, player-relative)
     /// * `action_count` - Number of discrete actions
-    /// * `num_players` - Number of players (for value head output)
     /// * `config` - Network configuration (hidden sizes, activation, etc.)
     /// * `device` - Device to create network on
     ///
     /// # Architecture
-    /// Actor: `local_obs` -> hidden -> ... -> hidden -> `policy_logits`
-    /// Critic: `global_state` -> hidden -> ... -> hidden -> `per_player_values`
+    /// Actor: `obs` -> hidden -> ... -> hidden -> `policy_logits`
+    /// Critic: `(privileged_obs, obs)` -> hidden -> ... -> hidden -> `value` (scalar)
     ///
     /// Orthogonal initialization:
     /// - Hidden layers: sqrt(2) for `ReLU`, 1.0 for tanh
     /// - Policy head: 0.01 (stable initial policy)
     /// - Value head: 1.0
     pub fn new(
-        local_obs_dim: usize,
-        global_state_dim: usize,
+        obs_dim: usize,
+        privileged_obs_dim: usize,
         action_count: usize,
-        num_players: usize,
         config: &Config,
         device: &B::Device,
     ) -> Self {
@@ -77,7 +78,7 @@ impl<B: Backend> CtdeActorCritic<B> {
 
         // Build actor network
         let mut actor_layers = Vec::with_capacity(num_hidden);
-        let mut in_size = local_obs_dim;
+        let mut in_size = obs_dim;
 
         for _ in 0..num_hidden {
             actor_layers.push(create_linear_orthogonal(
@@ -92,9 +93,9 @@ impl<B: Backend> CtdeActorCritic<B> {
         let policy_head = create_linear_orthogonal(in_size, action_count, 0.01, device);
 
         // Build critic network
-        // Critic sees global_state + local_obs (MAPPO-style agent-specific features)
+        // Critic sees privileged_obs + obs (full information, player-relative)
         let mut critic_layers = Vec::with_capacity(critic_num_hidden);
-        in_size = global_state_dim + local_obs_dim;
+        in_size = privileged_obs_dim + obs_dim;
 
         for _ in 0..critic_num_hidden {
             critic_layers.push(create_linear_orthogonal(
@@ -106,7 +107,8 @@ impl<B: Backend> CtdeActorCritic<B> {
             in_size = critic_hidden_size;
         }
 
-        let value_head = create_linear_orthogonal(in_size, num_players, 1.0, device);
+        // Single value output (acting player's value)
+        let value_head = create_linear_orthogonal(in_size, 1, 1.0, device);
 
         Self {
             actor_layers,
@@ -114,9 +116,8 @@ impl<B: Backend> CtdeActorCritic<B> {
             critic_layers,
             value_head,
             use_relu,
-            num_players,
-            local_obs_dim,
-            global_state_dim,
+            obs_dim,
+            privileged_obs_dim,
             action_count,
         }
     }
@@ -124,15 +125,15 @@ impl<B: Backend> CtdeActorCritic<B> {
     /// Forward pass through actor network only
     ///
     /// # Arguments
-    /// * `local_obs` - Local observations [`batch_size`, `local_obs_dim`]
+    /// * `obs` - Observations [`batch_size`, `obs_dim`] (player-relative)
     ///
     /// # Returns
     /// Policy logits [`batch_size`, `action_count`]
-    pub fn forward_actor(&self, local_obs: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward_actor(&self, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         profile_function!();
         profile_scope!("actor");
 
-        let mut x = local_obs;
+        let mut x = obs;
 
         // Actor hidden layers with activation
         for layer in &self.actor_layers {
@@ -151,25 +152,21 @@ impl<B: Backend> CtdeActorCritic<B> {
     /// Forward pass through critic network only
     ///
     /// # Arguments
-    /// * `global_state` - Global game state [`batch_size`, `global_state_dim`]
-    /// * `local_obs` - Local observations [`batch_size`, `local_obs_dim`]
+    /// * `privileged_obs` - Privileged observations [`batch_size`, `privileged_obs_dim`] (player-relative)
+    /// * `obs` - Observations [`batch_size`, `obs_dim`] (player-relative)
     ///
-    /// The critic sees both global state (privileged info) AND local observations
-    /// (what the agent knows). This MAPPO-style approach reduces value function bias
-    /// in partially observable games by conditioning on the agent's information set.
+    /// The critic sees `privileged_obs` (hidden info) + obs (what agent sees).
+    /// Both are player-relative (current player at index 0).
+    /// `privileged_obs` contains ONLY info not in obs (no redundancy).
     ///
     /// # Returns
-    /// Per-player values [`batch_size`, `num_players`]
-    pub fn forward_critic(
-        &self,
-        global_state: Tensor<B, 2>,
-        local_obs: Tensor<B, 2>,
-    ) -> Tensor<B, 2> {
+    /// Value [`batch_size`, 1] (acting player's value)
+    pub fn forward_critic(&self, privileged_obs: Tensor<B, 2>, obs: Tensor<B, 2>) -> Tensor<B, 2> {
         profile_function!();
         profile_scope!("critic");
 
-        // Concatenate global state with local observation (MAPPO agent-specific features)
-        let mut x = Tensor::cat(vec![global_state, local_obs], 1);
+        // Concatenate privileged observations with regular observations
+        let mut x = Tensor::cat(vec![privileged_obs, obs], 1);
 
         // Critic hidden layers with activation
         for layer in &self.critic_layers {
@@ -181,19 +178,14 @@ impl<B: Backend> CtdeActorCritic<B> {
             };
         }
 
-        // Value head (no activation - raw value predictions)
+        // Value head (no activation - raw value prediction)
         self.value_head.forward(x)
     }
 
     /// Get dimensions for debugging/validation
     #[cfg(test)]
-    pub fn dimensions(&self) -> (usize, usize, usize, usize) {
-        (
-            self.local_obs_dim,
-            self.global_state_dim,
-            self.action_count,
-            self.num_players,
-        )
+    pub fn dimensions(&self) -> (usize, usize, usize) {
+        (self.obs_dim, self.privileged_obs_dim, self.action_count)
     }
 }
 
@@ -217,18 +209,16 @@ mod tests {
         };
 
         let network = CtdeActorCritic::<TestBackend>::new(
-            135, // local_obs_dim (e.g., Skull)
-            540, // global_state_dim (e.g., Skull 4-player concat)
+            135, // obs_dim (e.g., Skull)
+            50,  // privileged_obs_dim (hidden info only)
             7,   // action_count
-            4,   // num_players
             &config, &device,
         );
 
-        let (local, global, actions, players) = network.dimensions();
-        assert_eq!(local, 135);
-        assert_eq!(global, 540);
+        let (obs, priv_obs, actions) = network.dimensions();
+        assert_eq!(obs, 135);
+        assert_eq!(priv_obs, 50);
         assert_eq!(actions, 7);
-        assert_eq!(players, 4);
     }
 
     #[test]
@@ -242,16 +232,15 @@ mod tests {
         };
 
         let network = CtdeActorCritic::<TestBackend>::new(
-            10, // local_obs_dim
-            20, // global_state_dim
+            10, // obs_dim
+            20, // privileged_obs_dim
             5,  // action_count
-            2,  // num_players
             &config, &device,
         );
 
         let batch_size = 8;
-        let local_obs = Tensor::<TestBackend, 2>::zeros([batch_size, 10], &device);
-        let logits = network.forward_actor(local_obs);
+        let obs = Tensor::<TestBackend, 2>::zeros([batch_size, 10], &device);
+        let logits = network.forward_actor(obs);
 
         assert_eq!(logits.dims(), [batch_size, 5]);
     }
@@ -267,19 +256,18 @@ mod tests {
         };
 
         let network = CtdeActorCritic::<TestBackend>::new(
-            10, // local_obs_dim
-            20, // global_state_dim
+            10, // obs_dim
+            20, // privileged_obs_dim
             5,  // action_count
-            2,  // num_players
             &config, &device,
         );
 
         let batch_size = 8;
-        let global_state = Tensor::<TestBackend, 2>::zeros([batch_size, 20], &device);
-        let local_obs = Tensor::<TestBackend, 2>::zeros([batch_size, 10], &device);
-        let values = network.forward_critic(global_state, local_obs);
+        let privileged_obs = Tensor::<TestBackend, 2>::zeros([batch_size, 20], &device);
+        let obs = Tensor::<TestBackend, 2>::zeros([batch_size, 10], &device);
+        let values = network.forward_critic(privileged_obs, obs);
 
-        assert_eq!(values.dims(), [batch_size, 2]);
+        assert_eq!(values.dims(), [batch_size, 1]); // Single scalar value
     }
 
     #[test]
@@ -295,10 +283,9 @@ mod tests {
         };
 
         let network = CtdeActorCritic::<TestBackend>::new(
-            10, // local_obs_dim
-            20, // global_state_dim
+            10, // obs_dim
+            20, // privileged_obs_dim
             5,  // action_count
-            2,  // num_players
             &config, &device,
         );
 

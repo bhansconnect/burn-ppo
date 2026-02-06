@@ -46,7 +46,7 @@ const OBSERVATION_DIM: usize = OBS_OWN_DICE
     + OBS_BID_HISTORY; // 78 + 192 = 270
 
 // Global state dimension components (exact calculation for CTDE)
-// These constants document the structure of the global_state() output
+// These constants document the structure of the privileged_obs() output
 const GS_CURRENT_PLAYER: usize = 1;
 const GS_CURRENT_BID: usize = 2; // quantity + face
 const GS_LAST_BIDDER: usize = 1;
@@ -55,7 +55,7 @@ const GS_BID_HISTORY: usize = 16 * 3; // 16 entries × 3 floats each (bidder + q
 const GS_GAME_OVER: usize = 1;
 const GS_PER_PLAYER: usize = 14; // dice_count + is_alive + (2 dice × 6 faces one-hot)
 
-const GLOBAL_STATE_DIM_EXACT: usize = GS_CURRENT_PLAYER
+const PRIVILEGED_OBS_DIM_EXACT: usize = GS_CURRENT_PLAYER
     + GS_CURRENT_BID
     + GS_LAST_BIDDER
     + GS_BID_COUNT
@@ -454,9 +454,9 @@ impl Environment for LiarsDice {
     const EVAL_TEMP: f32 = 1.0; // Stochastic play essential for bluffing
 
     // Canonical global state for CTDE: shared game state + per-player private dice
-    // Actual dimension (GLOBAL_STATE_DIM_EXACT) = 110 floats
+    // Actual dimension (PRIVILEGED_OBS_DIM_EXACT) = 110 floats
     // CRITICAL FIX: Increased from 100 to 120 (was causing truncation!)
-    const GLOBAL_STATE_DIM: Option<usize> = Some(120);
+    const PRIVILEGED_OBS_DIM: Option<usize> = Some(120);
 
     fn new(seed: u64) -> Self {
         Self::new_with_config(seed, Schedule::constant(0.0)) // Default: no reward shaping
@@ -636,7 +636,7 @@ impl Environment for LiarsDice {
         self.current_step = step;
     }
 
-    fn global_state(&self) -> Vec<f32> {
+    fn privileged_obs(&self) -> Vec<f32> {
         let mut global = Vec::new();
 
         // ===== SHARED GAME STATE (absolute indexing, ONE copy) =====
@@ -710,8 +710,8 @@ impl Environment for LiarsDice {
             }
         }
 
-        // Pad to GLOBAL_STATE_DIM if needed for fixed tensor size
-        let target_dim = Self::GLOBAL_STATE_DIM.expect("GLOBAL_STATE_DIM must be set for CTDE");
+        // Pad to PRIVILEGED_OBS_DIM if needed for fixed tensor size
+        let target_dim = Self::PRIVILEGED_OBS_DIM.expect("PRIVILEGED_OBS_DIM must be set for CTDE");
         let actual_len = global.len();
 
         if actual_len < target_dim {
@@ -728,10 +728,10 @@ impl Environment for LiarsDice {
         );
 
         // Sanity check: actual size shouldn't greatly exceed exact calculation
-        // This catches bugs where global_state() implementation adds more floats than expected
-        assert!(actual_len <= GLOBAL_STATE_DIM_EXACT + 10,
+        // This catches bugs where privileged_obs() implementation adds more floats than expected
+        assert!(actual_len <= PRIVILEGED_OBS_DIM_EXACT + 10,
             "Global state dimension calculation error in Liar's Dice.\n\
-             Expected ~{GLOBAL_STATE_DIM_EXACT} floats (GLOBAL_STATE_DIM_EXACT), got {actual_len} before padding.\n\
+             Expected ~{PRIVILEGED_OBS_DIM_EXACT} floats (PRIVILEGED_OBS_DIM_EXACT), got {actual_len} before padding.\n\
              Update dimension constants in src/envs/liars_dice.rs"
         );
 
@@ -1559,34 +1559,34 @@ mod tests {
     }
 
     #[test]
-    fn test_global_state_dimension() {
+    fn test_privileged_obs_dimension() {
         let mut env = LiarsDice::new(42);
         env.reset();
 
-        let global_state = env.global_state();
-        let expected_dim = LiarsDice::GLOBAL_STATE_DIM.unwrap();
+        let privileged_obs = env.privileged_obs();
+        let expected_dim = LiarsDice::PRIVILEGED_OBS_DIM.unwrap();
 
         assert_eq!(
-            global_state.len(),
+            privileged_obs.len(),
             expected_dim,
-            "Liar's Dice global state should match GLOBAL_STATE_DIM"
+            "Liar's Dice global state should match PRIVILEGED_OBS_DIM"
         );
 
         // CRITICAL: Verify the fix for the truncation bug
-        // The exact dimension is GLOBAL_STATE_DIM_EXACT (110), so 120 should accommodate it
+        // The exact dimension is PRIVILEGED_OBS_DIM_EXACT (110), so 120 should accommodate it
         assert!(
-            expected_dim >= GLOBAL_STATE_DIM_EXACT,
-            "Liar's Dice GLOBAL_STATE_DIM ({expected_dim}) should accommodate GLOBAL_STATE_DIM_EXACT ({GLOBAL_STATE_DIM_EXACT}) floats"
+            expected_dim >= PRIVILEGED_OBS_DIM_EXACT,
+            "Liar's Dice PRIVILEGED_OBS_DIM ({expected_dim}) should accommodate PRIVILEGED_OBS_DIM_EXACT ({PRIVILEGED_OBS_DIM_EXACT}) floats"
         );
 
-        // Verify GLOBAL_STATE_DIM was increased from 100 to 120
+        // Verify PRIVILEGED_OBS_DIM was increased from 100 to 120
         assert_eq!(
             expected_dim, 120,
-            "Liar's Dice GLOBAL_STATE_DIM should be 120 (bug fix from 100)"
+            "Liar's Dice PRIVILEGED_OBS_DIM should be 120 (bug fix from 100)"
         );
 
         // No truncation - all values after the actual data should be padding zeros
-        let padding = &global_state[GLOBAL_STATE_DIM_EXACT..];
+        let padding = &privileged_obs[PRIVILEGED_OBS_DIM_EXACT..];
         assert!(
             padding.iter().all(|&x| x == 0.0),
             "Padding region should be all zeros (no truncation)"

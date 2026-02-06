@@ -64,7 +64,7 @@ const OBSERVATION_DIM: usize = OBS_OWN_HAND
     + OBS_BID_HISTORY; // 4+4+6+6+6+6+6+3+1+6+6+6+6+5+64 = 135
 
 // Global state dimension components (exact calculation for CTDE)
-// These constants document the structure of the global_state() output
+// These constants document the structure of the privileged_obs() output
 const GS_PHASE: usize = 3;
 const GS_CURRENT_PLAYER: usize = 1;
 const GS_ROUND_STARTER: usize = 1;
@@ -74,7 +74,7 @@ const GS_GAME_OVER: usize = 1;
 const GS_NUM_PLAYERS_ONEHOT: usize = 5; // One-hot for 2-6 players
 const GS_PER_PLAYER: usize = 10; // exists + wins + alive + trap + roses + stack + skulls_stack + roses_stack + passed + revealed
 
-const GLOBAL_STATE_DIM_EXACT: usize = GS_PHASE
+const PRIVILEGED_OBS_DIM_EXACT: usize = GS_PHASE
     + GS_CURRENT_PLAYER
     + GS_ROUND_STARTER
     + GS_BID_STATE
@@ -1055,9 +1055,9 @@ impl Environment for Skull {
     const VARIABLE_PLAYER_COUNT: bool = true;
 
     // Canonical global state for CTDE: shared game state + per-player private info
-    // Actual dimension (GLOBAL_STATE_DIM_EXACT) = 103 floats
+    // Actual dimension (PRIVILEGED_OBS_DIM_EXACT) = 103 floats
     // Conservative upper bound (200) allows padding for tensor alignment
-    const GLOBAL_STATE_DIM: Option<usize> = Some(200);
+    const PRIVILEGED_OBS_DIM: Option<usize> = Some(200);
 
     fn new(seed: u64) -> Self {
         // Default to 4 players
@@ -1457,7 +1457,7 @@ impl Environment for Skull {
         self.current_step = step;
     }
 
-    fn global_state(&self) -> Vec<f32> {
+    fn privileged_obs(&self) -> Vec<f32> {
         let mut global = Vec::new();
 
         // ===== SHARED GAME STATE (absolute indexing, ONE copy) =====
@@ -1556,8 +1556,8 @@ impl Environment for Skull {
             global.push(self.revealed[seat] as f32 / CARDS_PER_PLAYER as f32);
         }
 
-        // Pad to GLOBAL_STATE_DIM if needed for fixed tensor size
-        let target_dim = Self::GLOBAL_STATE_DIM.expect("GLOBAL_STATE_DIM must be set for CTDE");
+        // Pad to PRIVILEGED_OBS_DIM if needed for fixed tensor size
+        let target_dim = Self::PRIVILEGED_OBS_DIM.expect("PRIVILEGED_OBS_DIM must be set for CTDE");
         let actual_len = global.len();
 
         if actual_len < target_dim {
@@ -1574,10 +1574,10 @@ impl Environment for Skull {
         );
 
         // Sanity check: actual size shouldn't greatly exceed exact calculation
-        // This catches bugs where global_state() implementation adds more floats than expected
-        assert!(actual_len <= GLOBAL_STATE_DIM_EXACT + 10,
+        // This catches bugs where privileged_obs() implementation adds more floats than expected
+        assert!(actual_len <= PRIVILEGED_OBS_DIM_EXACT + 10,
             "Global state dimension calculation error in Skull.\n\
-             Expected ~{GLOBAL_STATE_DIM_EXACT} floats (GLOBAL_STATE_DIM_EXACT), got {actual_len} before padding.\n\
+             Expected ~{PRIVILEGED_OBS_DIM_EXACT} floats (PRIVILEGED_OBS_DIM_EXACT), got {actual_len} before padding.\n\
              Update dimension constants in src/envs/skull.rs"
         );
 
@@ -3051,47 +3051,47 @@ mod tests {
     }
 
     #[test]
-    fn test_global_state_dimension() {
+    fn test_privileged_obs_dimension() {
         let mut env = Skull::new(42);
         env.set_num_players(4);
         env.reset();
 
-        let global_state = env.global_state();
-        let expected_dim = Skull::GLOBAL_STATE_DIM.unwrap();
+        let privileged_obs = env.privileged_obs();
+        let expected_dim = Skull::PRIVILEGED_OBS_DIM.unwrap();
 
         assert_eq!(
-            global_state.len(),
+            privileged_obs.len(),
             expected_dim,
-            "Skull global state should match GLOBAL_STATE_DIM"
+            "Skull global state should match PRIVILEGED_OBS_DIM"
         );
 
         // Verify it's not truncating (actual dimension should be <= target)
         // The exact dimension is ~103, so 200 should accommodate it with room to spare
         assert!(
-            expected_dim >= GLOBAL_STATE_DIM_EXACT,
-            "Skull GLOBAL_STATE_DIM ({expected_dim}) should accommodate GLOBAL_STATE_DIM_EXACT ({GLOBAL_STATE_DIM_EXACT}) floats"
+            expected_dim >= PRIVILEGED_OBS_DIM_EXACT,
+            "Skull PRIVILEGED_OBS_DIM ({expected_dim}) should accommodate PRIVILEGED_OBS_DIM_EXACT ({PRIVILEGED_OBS_DIM_EXACT}) floats"
         );
     }
 
     #[test]
-    fn test_global_state_no_truncation() {
+    fn test_privileged_obs_no_truncation() {
         // Test with max players to ensure worst-case dimension is handled
         let mut env = Skull::new(42);
         env.set_num_players(6);
         env.reset();
 
-        let global_state = env.global_state();
-        let expected_dim = Skull::GLOBAL_STATE_DIM.unwrap();
+        let privileged_obs = env.privileged_obs();
+        let expected_dim = Skull::PRIVILEGED_OBS_DIM.unwrap();
 
         assert_eq!(
-            global_state.len(),
+            privileged_obs.len(),
             expected_dim,
-            "Skull global state with 6 players should match GLOBAL_STATE_DIM"
+            "Skull global state with 6 players should match PRIVILEGED_OBS_DIM"
         );
 
         // No truncation - all values after the actual data should be padding zeros
-        // The exact dimension is GLOBAL_STATE_DIM_EXACT, so everything after should be 0.0
-        let padding = &global_state[GLOBAL_STATE_DIM_EXACT..];
+        // The exact dimension is PRIVILEGED_OBS_DIM_EXACT, so everything after should be 0.0
+        let padding = &privileged_obs[PRIVILEGED_OBS_DIM_EXACT..];
         assert!(
             padding.iter().all(|&x| x == 0.0),
             "Padding region should be all zeros (no truncation)"

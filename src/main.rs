@@ -211,18 +211,18 @@ where
         );
     }
 
-    // Resolve global_state_dim from environment for CTDE networks
-    let global_state_dim: Option<usize> = if config.network_type == "ctde" {
-        match E::GLOBAL_STATE_DIM {
+    // Resolve privileged_obs_dim from environment for CTDE networks
+    let privileged_obs_dim: Option<usize> = if config.network_type == "ctde" {
+        match E::PRIVILEGED_OBS_DIM {
             Some(dim) => {
                 if !quiet {
-                    println!("CTDE enabled with global_state_dim={dim} (from environment)");
+                    println!("CTDE enabled with privileged_obs_dim={dim} (from environment)");
                 }
                 Some(dim)
             }
             None => {
                 bail!(
-                    "Environment '{}' does not support CTDE (GLOBAL_STATE_DIM is None). \
+                    "Environment '{}' does not support CTDE (PRIVILEGED_OBS_DIM is None). \
                      Use network_type='mlp' instead.",
                     E::NAME
                 );
@@ -281,8 +281,7 @@ where
                 obs_dim,
                 obs_shape,
                 action_count,
-                num_players as usize,
-                global_state_dim,
+                privileged_obs_dim,
                 config,
                 device,
             );
@@ -416,12 +415,12 @@ where
 
     // Create rollout buffer with inference backend (non-autodiff)
     // This prevents memory accumulation from autodiff graph during rollout
-    // For CTDE networks, also allocate space for global states (global_state_dim resolved earlier)
+    // For CTDE networks, also allocate space for privileged obs (privileged_obs_dim resolved earlier)
     let mut buffer: RolloutBuffer<TB::InnerBackend> = RolloutBuffer::new(
         config.num_steps,
         num_envs,
         obs_dim,
-        global_state_dim,
+        privileged_obs_dim,
         num_players,
         device,
     );
@@ -469,7 +468,7 @@ where
             kernel_size: config.kernel_size,
             cnn_fc_hidden_size: config.cnn_fc_hidden_size,
             cnn_num_fc_layers: config.cnn_num_fc_layers,
-            global_state_dim,
+            privileged_obs_dim,
             critic_hidden_size: config.critic_hidden_size,
             critic_num_hidden: config.critic_num_hidden,
             obs_shape,
@@ -884,45 +883,46 @@ where
             Tensor::<TB::InnerBackend, 1>::from_floats(obs_flat.as_slice(), device)
                 .reshape([num_envs, obs_dim]);
 
-        // Handle CTDE networks: use critic network with global states + local obs
-        let all_values = if inference_model.is_ctde() {
-            let global_states_flat = vec_env.get_global_states();
-            let global_state_dim = global_states_flat.len() / num_envs;
-            let global_state_tensor =
-                Tensor::<TB::InnerBackend, 1>::from_floats(global_states_flat.as_slice(), device)
-                    .reshape([num_envs, global_state_dim]);
-            inference_model.forward_critic(global_state_tensor, obs_tensor)
+        // Handle CTDE networks: use critic network with privileged obs + local obs
+        let bootstrap_values = if inference_model.is_ctde() {
+            let privileged_obs_flat = vec_env.get_privileged_obs();
+            let priv_obs_dim = privileged_obs_flat.len() / num_envs;
+            let privileged_obs_tensor =
+                Tensor::<TB::InnerBackend, 1>::from_floats(privileged_obs_flat.as_slice(), device)
+                    .reshape([num_envs, priv_obs_dim]);
+            inference_model.forward_critic(privileged_obs_tensor, obs_tensor)
         } else {
             inference_model.forward(obs_tensor).1
         };
 
         // Denormalize bootstrap values if PopArt is active
         // After rescaling, model outputs normalized values - convert back to raw for GAE
-        let all_values = if let Some(ref popart) = popart_normalizer {
-            let mut values_data: Vec<f32> = all_values.into_data().to_vec().expect("values");
-            popart.denormalize_all_players(&mut values_data, num_players as usize);
+        let bootstrap_values = if let Some(ref popart) = popart_normalizer {
+            let mut values_data: Vec<f32> = bootstrap_values.into_data().to_vec().expect("values");
+            popart.denormalize(&mut values_data);
             Tensor::<TB::InnerBackend, 1>::from_floats(values_data.as_slice(), device)
-                .reshape([num_envs, num_players as usize])
+                .reshape([num_envs, 1])
         } else {
-            all_values
+            bootstrap_values
         };
 
         // Compute GAE - dispatch based on number of players
         let gae_start = std::time::Instant::now();
+        // bootstrap_values is [num_envs, 1] - extract to [num_envs]
+        let last_values: Tensor<TB::InnerBackend, 1> =
+            bootstrap_values.slice([0..num_envs, 0..1]).flatten(0, 1);
         if num_players > 1 {
-            // Multi-player: use full values tensor [num_envs, num_players]
+            // Multi-player: attribute rewards to acting player
             compute_gae_multiplayer(
                 &mut buffer,
-                all_values,
+                last_values,
                 config.gamma as f32,
                 config.gae_lambda as f32,
                 num_players,
                 device,
             );
         } else {
-            // Single-player: extract player 0's values [num_envs]
-            let last_values: Tensor<TB::InnerBackend, 1> =
-                all_values.slice([0..num_envs, 0..1]).flatten(0, 1);
+            // Single-player
             compute_gae(
                 &mut buffer,
                 last_values,
@@ -1254,7 +1254,7 @@ where
                 kernel_size: config.kernel_size,
                 cnn_fc_hidden_size: config.cnn_fc_hidden_size,
                 cnn_num_fc_layers: config.cnn_num_fc_layers,
-                global_state_dim,
+                privileged_obs_dim,
                 critic_hidden_size: config.critic_hidden_size,
                 critic_num_hidden: config.critic_num_hidden,
                 obs_shape,
@@ -1451,7 +1451,7 @@ where
             kernel_size: config.kernel_size,
             cnn_fc_hidden_size: config.cnn_fc_hidden_size,
             cnn_num_fc_layers: config.cnn_num_fc_layers,
-            global_state_dim,
+            privileged_obs_dim,
             critic_hidden_size: config.critic_hidden_size,
             critic_num_hidden: config.critic_num_hidden,
             obs_shape,

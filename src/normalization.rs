@@ -390,7 +390,7 @@ impl PopArtNormalizer {
     /// # Returns
     /// Denormalized (raw) values (identity if not initialized)
     #[cfg(test)]
-    pub fn denormalize(&self, values: &[f32], acting_players: &[usize]) -> Vec<f32> {
+    pub fn denormalize_per_player(&self, values: &[f32], acting_players: &[usize]) -> Vec<f32> {
         values
             .iter()
             .zip(acting_players.iter())
@@ -405,7 +405,7 @@ impl PopArtNormalizer {
             .collect()
     }
 
-    /// Denormalize all player values in-place
+    /// Denormalize all player values in-place (legacy - for per-player value tensors)
     ///
     /// For tensors with shape `[num_envs, num_players]` flattened to `[num_envs * num_players]`,
     /// applies denormalization per player in-place.
@@ -413,6 +413,7 @@ impl PopArtNormalizer {
     /// # Arguments
     /// * `values` - Flattened values array, modified in-place
     /// * `num_players` - Number of players (stride for chunking)
+    #[cfg(test)]
     pub fn denormalize_all_players(&self, values: &mut [f32], num_players: usize) {
         for chunk in values.chunks_mut(num_players) {
             for (p, v) in chunk.iter_mut().enumerate() {
@@ -420,6 +421,27 @@ impl PopArtNormalizer {
                     *v = (f64::from(*v) * self.std(p) + self.mean[p]) as f32;
                 }
             }
+        }
+    }
+
+    /// Denormalize scalar values in-place (for single value output networks)
+    ///
+    /// Applies denormalization using player 0's statistics. With single value output,
+    /// all value estimates are from the acting player's perspective, so we use
+    /// unified statistics (player 0).
+    ///
+    /// # Arguments
+    /// * `values` - Scalar values array (one per sample), modified in-place
+    pub fn denormalize(&self, values: &mut [f32]) {
+        // Use player 0 stats for single value output
+        // (all values represent acting player's value, using unified statistics)
+        if self.count[0] < 2.0 {
+            return; // Not initialized
+        }
+        let std = self.std(0);
+        let mean = self.mean[0];
+        for v in values.iter_mut() {
+            *v = (f64::from(*v) * std + mean) as f32;
         }
     }
 }
@@ -892,7 +914,7 @@ mod tests {
 
         // Normalize then denormalize should recover original
         let normalized = norm.normalize(&original, &players);
-        let denormalized = norm.denormalize(&normalized, &players);
+        let denormalized = norm.denormalize_per_player(&normalized, &players);
 
         for (o, d) in original.iter().zip(denormalized.iter()) {
             assert!((o - d).abs() < 1e-4, "Expected {o}, got {d}");
@@ -943,7 +965,7 @@ mod tests {
         assert!(!norm.is_initialized());
 
         // Should return identity (unmodified)
-        let result = norm.denormalize(&[5.0], &[0]);
+        let result = norm.denormalize_per_player(&[5.0], &[0]);
         assert_eq!(result[0], 5.0);
     }
 
