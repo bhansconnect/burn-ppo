@@ -731,11 +731,11 @@ where
             .as_ref()
             .is_some_and(|p| p.has_opponents() && !env_states.is_empty());
 
-        let completed_episodes = if use_opponent_pool {
+        let (completed_episodes, last_value_per_player) = if use_opponent_pool {
             let pool = opponent_pool
                 .as_mut()
                 .expect("opponent_pool verified above");
-            let (episodes, opponent_completions) = collect_rollouts_with_opponents(
+            let (episodes, opponent_completions, last_values) = collect_rollouts_with_opponents(
                 &inference_model,
                 pool,
                 &mut vec_env,
@@ -823,7 +823,7 @@ where
                 .collect();
             pool.unload_unused(&in_use);
 
-            episodes
+            (episodes, last_values)
         } else {
             collect_rollouts(
                 &inference_model,
@@ -912,10 +912,23 @@ where
         let last_values: Tensor<TB::InnerBackend, 1> =
             bootstrap_values.slice([0..num_envs, 0..1]).flatten(0, 1);
         if num_players > 1 {
-            // Multi-player: attribute rewards to acting player
+            // Multi-player: merge bootstrap values for final actors with per-player tracking
+            // The rollout collection stored each player's value from their last action.
+            // For the current actors (at rollout end), update with fresh bootstrap values.
+            let mut last_value_per_player = last_value_per_player;
+            let bootstrap_data: Vec<f32> = last_values
+                .clone()
+                .into_data()
+                .to_vec()
+                .expect("bootstrap values");
+            let current_players = vec_env.get_current_players();
+            for (e, &player) in current_players.iter().enumerate() {
+                last_value_per_player[e][player] = bootstrap_data[e];
+            }
+
             compute_gae_multiplayer(
                 &mut buffer,
-                last_values,
+                &last_value_per_player,
                 config.gamma as f32,
                 config.gae_lambda as f32,
                 num_players,

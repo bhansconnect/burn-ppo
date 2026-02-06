@@ -220,7 +220,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     mut normalizer: Option<&mut ObsNormalizer>,
     mut return_normalizer: Option<&mut ReturnNormalizer>,
     popart: Option<&PopArtNormalizer>,
-) -> Vec<EpisodeStats> {
+) -> (Vec<EpisodeStats>, Vec<Vec<f32>>) {
     profile_function!();
     let num_envs = vec_env.num_envs();
     let obs_dim = E::OBSERVATION_DIM;
@@ -238,6 +238,10 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
     // Multi-player data (only rewards need per-player tracking for attribution)
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
+
+    // Track each player's last value prediction for GAE bootstrap
+    // From each player's perspective, the rollout "ends" at their last action
+    let mut last_value_per_player: Vec<Vec<f32>> = vec![vec![0.0; num_players]; num_envs];
 
     // Privileged observations for CTDE (collected if buffer has privileged_obs field)
     let collect_privileged_obs = buffer.privileged_obs.is_some();
@@ -430,6 +434,11 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         // Multi-player data (per-player rewards for attribution)
         all_rewards_flat.extend_from_slice(&rewards_flat);
         all_acting_players.extend(current_players.iter().map(|&p| p as i64));
+
+        // Update each player's last value when they act
+        for (e, &player) in current_players.iter().enumerate() {
+            last_value_per_player[e][player] = acting_values_data[e];
+        }
     }
 
     // Batch transfer to GPU
@@ -483,7 +492,7 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
         norm.update_batch(&raw_obs_for_stats, obs_dim);
     }
 
-    all_completed
+    (all_completed, last_value_per_player)
 }
 
 /// Information about a completed episode in opponent pool training
@@ -536,7 +545,11 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     _current_step: usize,
     popart: Option<&PopArtNormalizer>,
     actual_player_count: Option<usize>,
-) -> (Vec<EpisodeStats>, Vec<OpponentEpisodeCompletion>) {
+) -> (
+    Vec<EpisodeStats>,
+    Vec<OpponentEpisodeCompletion>,
+    Vec<Vec<f32>>,
+) {
     profile_function!();
     let num_envs = vec_env.num_envs();
     let obs_dim = E::OBSERVATION_DIM;
@@ -562,6 +575,10 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
     // Multi-player data (only rewards need per-player tracking for attribution)
     let mut all_rewards_flat: Vec<f32> = Vec::with_capacity(num_steps * num_envs * num_players);
     let mut all_acting_players: Vec<i64> = Vec::with_capacity(num_steps * num_envs);
+
+    // Track each player's last value prediction for GAE bootstrap
+    // From each player's perspective, the rollout "ends" at their last action
+    let mut last_value_per_player: Vec<Vec<f32>> = vec![vec![0.0; num_players]; num_envs];
 
     // Action masks (collected if environment provides them)
     let mut collected_action_masks: Option<Vec<f32>> = None;
@@ -742,6 +759,9 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
                 all_env_actions[env_idx] = actions_data[batch_idx] as usize;
                 all_env_log_probs[env_idx] = log_probs_data[batch_idx];
                 all_env_values[env_idx] = values_data[batch_idx];
+                // Update this player's last value for GAE bootstrap
+                let player = current_players[env_idx];
+                last_value_per_player[env_idx][player] = values_data[batch_idx];
             }
         }
 
@@ -1031,7 +1051,7 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
         norm.update_batch(&raw_obs_for_stats, obs_dim);
     }
 
-    (all_completed, opponent_completions)
+    (all_completed, opponent_completions, last_value_per_player)
 }
 
 /// Compute Generalized Advantage Estimation
@@ -1103,10 +1123,15 @@ pub fn compute_gae<B: Backend>(
 ///
 /// This handles games where players take turns and rewards from other players'
 /// actions should be attributed to the acting player's previous action.
+///
+/// # Bootstrap values
+/// `last_value_per_player` contains each player's last value prediction from the rollout.
+/// From each player's perspective, the rollout "ends" at their last action.
+/// Players who never acted in the rollout have 0 bootstrap (conservative: no future estimate).
 #[expect(clippy::cast_sign_loss, reason = "tensor indices are non-negative")]
 pub fn compute_gae_multiplayer<B: Backend>(
     buffer: &mut RolloutBuffer<B>,
-    last_values: Tensor<B, 1>, // [num_envs] - scalar bootstrap value per env
+    last_value_per_player: &[Vec<f32>], // [num_envs][num_players] - each player's last value
     gamma: f32,
     gae_lambda: f32,
     num_players: u8,
@@ -1137,8 +1162,6 @@ pub fn compute_gae_multiplayer<B: Backend>(
         .into_iter()
         .map(|x| x as usize)
         .collect();
-    // last_values is now scalar per env (acting player's value at final step)
-    let last_values_data: Vec<f32> = last_values.into_data().to_vec().expect("last_values");
 
     // Pass 1: Attribute cumulative rewards to acting player
     // Walk backwards, accumulating rewards for each player until they act
@@ -1178,13 +1201,10 @@ pub fn compute_gae_multiplayer<B: Backend>(
     let mut advantages = vec![0.0_f32; num_steps * num_envs];
     let mut gae_carry = vec![vec![0.0_f32; num_players]; num_envs];
 
-    // Initialize next_value from bootstrap values (scalar per env)
-    // With single value output, we only have the final acting player's value,
-    // so we initialize all players to this value and they'll get overwritten
-    // as we iterate backwards through steps where each player acts.
-    let mut next_value: Vec<Vec<f32>> = (0..num_envs)
-        .map(|e| vec![last_values_data[e]; num_players])
-        .collect();
+    // Initialize next_value from each player's last value prediction
+    // From each player's perspective, the rollout "ends" at their last action.
+    // Players who never acted have 0 (conservative: no future estimate beyond rollout).
+    let mut next_value: Vec<Vec<f32>> = last_value_per_player.to_vec();
 
     for t in (0..num_steps).rev() {
         for e in 0..num_envs {
@@ -2152,12 +2172,19 @@ mod tests {
         buffer.dones =
             Tensor::from_floats([[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [1.0, 1.0]], &device);
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats(
-            [0.0, 0.0], // Terminal state, values don't matter
+        // Terminal state - bootstrap values don't matter, use zeros
+        // Each player's last value from the rollout (P0 at step 2, P1 at step 3)
+        // Terminal so these don't affect the result
+        let last_value_per_player = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+
+        compute_gae_multiplayer(
+            &mut buffer,
+            &last_value_per_player,
+            0.99,
+            0.95,
+            num_players,
             &device,
         );
-
-        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, num_players, &device);
 
         assert!(buffer.advantages.is_some());
         assert!(buffer.returns.is_some());
@@ -2187,8 +2214,16 @@ mod tests {
             &device,
         );
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, gamma, lambda, 2, &device);
+        // Terminal state - P0's last value was 0.8 at step 1, P1 never acted (gets 0)
+        let last_value_per_player = vec![vec![0.8, 0.0]]; // [env][player]
+        compute_gae_multiplayer(
+            &mut buffer,
+            &last_value_per_player,
+            gamma,
+            lambda,
+            2,
+            &device,
+        );
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2246,8 +2281,9 @@ mod tests {
             &device,
         );
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, gamma, 0.95, 2, &device);
+        // Terminal at step 2 - P0's last value was 0.9, P1's was 0.0
+        let last_value_per_player = vec![vec![0.9, 0.0]]; // [env][player]
+        compute_gae_multiplayer(&mut buffer, &last_value_per_player, gamma, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2297,8 +2333,9 @@ mod tests {
 
         buffer.values = Tensor::zeros([4, 1], &device);
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+        // Terminal at step 3 - all players had 0 values
+        let last_value_per_player = vec![vec![0.0, 0.0]]; // [env][player]
+        compute_gae_multiplayer(&mut buffer, &last_value_per_player, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2345,8 +2382,9 @@ mod tests {
 
         buffer.values = Tensor::zeros([3, 1], &device);
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 3, &device);
+        // Terminal at step 2 - all players had 0 values (3 players)
+        let last_value_per_player = vec![vec![0.0, 0.0, 0.0]]; // [env][player]
+        compute_gae_multiplayer(&mut buffer, &last_value_per_player, 0.99, 0.95, 3, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2406,8 +2444,16 @@ mod tests {
             &device,
         );
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, gamma, lambda, 2, &device);
+        // Terminal at step 5 - P0's last value was 0.7 (step 4), P1's was 0.2 (step 5)
+        let last_value_per_player = vec![vec![0.7, 0.2]]; // [env][player]
+        compute_gae_multiplayer(
+            &mut buffer,
+            &last_value_per_player,
+            gamma,
+            lambda,
+            2,
+            &device,
+        );
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2472,8 +2518,9 @@ mod tests {
         // All values = 0 for simple calculation
         buffer.values = Tensor::zeros([2, 1], &device);
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+        // Terminal at step 1 - both players had 0 values
+        let last_value_per_player = vec![vec![0.0, 0.0]]; // [env][player]
+        compute_gae_multiplayer(&mut buffer, &last_value_per_player, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2520,8 +2567,9 @@ mod tests {
             &device,
         );
 
-        let last_values: Tensor<TestBackend, 1> = Tensor::zeros([1], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+        // Terminal at step 2 - P0's last value was 5.0, P1 never acted (0)
+        let last_value_per_player = vec![vec![5.0, 0.0]]; // [env][player]
+        compute_gae_multiplayer(&mut buffer, &last_value_per_player, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2578,9 +2626,14 @@ mod tests {
         // Step 1: P1 acts in both envs - env0=0.4 (P1's), env1=0.4 (P1's)
         buffer.values = Tensor::from_floats([[0.5, 0.3], [0.4, 0.4]], &device);
 
-        // Bootstrap: env0 is done (0.0 doesn't matter), env1 continues with P1 bootstrap=0.5
-        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats([0.0, 0.5], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+        // Per-player bootstrap values:
+        // Env 0: done at step 1, P0's last value=0.5, P1's last value=0.4
+        // Env 1: not done, P0's last value=0.3, P1's last value=0.5 (bootstrap for continuation)
+        let last_value_per_player = vec![
+            vec![0.5, 0.4], // Env 0
+            vec![0.3, 0.5], // Env 1 - P1 continues, bootstrap 0.5
+        ];
+        compute_gae_multiplayer(&mut buffer, &last_value_per_player, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2622,9 +2675,11 @@ mod tests {
         // Values: acting player's value at each step (all 0.5)
         buffer.values = Tensor::from_floats([[0.5], [0.5], [0.5]], &device);
 
-        // Bootstrap values (next actor's value = 0.6)
-        let last_values: Tensor<TestBackend, 1> = Tensor::from_floats([0.6], &device);
-        compute_gae_multiplayer(&mut buffer, last_values, 0.99, 0.95, 2, &device);
+        // No done flags - rollout ends with P0 at step 2
+        // P0's last value=0.5 (step 2), P1's last value=0.5 (step 1)
+        // Bootstrap with fresh value for next actor (P1) = 0.6
+        let last_value_per_player = vec![vec![0.5, 0.6]]; // [env][player]
+        compute_gae_multiplayer(&mut buffer, &last_value_per_player, 0.99, 0.95, 2, &device);
 
         let advs = buffer.advantages.unwrap().to_data();
         let advs = advs.as_slice::<f32>().unwrap();
@@ -2634,8 +2689,9 @@ mod tests {
         assert!(advs[1].is_finite(), "Step 1 advantage should be finite");
         assert!(advs[2].is_finite(), "Step 2 advantage should be finite");
 
-        // Step 2 (P0): delta = 0.3 + gamma * 0.6 - 0.5 = 0.3 + 0.594 - 0.5 = 0.394
-        let step2_delta = 0.3 + 0.99 * 0.6 - 0.5;
+        // Step 2 (P0): With per-player bootstrap, P0 uses their own last value (0.5)
+        // delta = 0.3 + gamma * 0.5 - 0.5 = 0.3 + 0.495 - 0.5 = 0.295
+        let step2_delta = 0.3 + 0.99 * 0.5 - 0.5;
         assert!(
             (advs[2] - step2_delta).abs() < 1e-4,
             "Step 2 advantage should be ~{}, got {}",
