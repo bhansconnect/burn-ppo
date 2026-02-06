@@ -120,7 +120,7 @@ pub struct TrainArgs {
     #[arg(long, hide = true, default_value = "0")]
     pub max_checkpoints_this_run: usize,
 
-    #[arg(long, help = "Random seed (default: 42)")]
+    #[arg(long, help = "Random seed (default: random)")]
     pub seed: Option<u64>,
 
     #[arg(
@@ -1012,8 +1012,8 @@ const fn default_checkpoint_freq() -> usize {
 const fn default_log_freq() -> usize {
     1_000
 }
-const fn default_seed() -> u64 {
-    42
+fn default_seed() -> u64 {
+    rand::random()
 }
 
 // Opponent pool defaults
@@ -1078,7 +1078,7 @@ impl Default for Config {
             opponent_select_alpha: default_opponent_select_alpha(),
             opponent_select_exponent: default_opponent_select_exponent(),
             debug_opponents: false,
-            seed: default_seed(),
+            seed: 42,
             run_name: None,
             forked_from: None,
         }

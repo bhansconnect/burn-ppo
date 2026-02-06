@@ -1003,7 +1003,7 @@ fn run_interactive_evaluation<B: Backend>(
     }
 
     // Setup
-    let seed = args.seed.unwrap_or(42);
+    let seed = args.seed.unwrap_or_else(rand::random);
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Default to 1 game for interactive human play or watch mode
@@ -1075,7 +1075,7 @@ fn run_watch_mode<B: Backend>(
     args: &EvalArgs,
     device: &B::Device,
 ) -> Result<()> {
-    let seed = args.seed.unwrap_or(42);
+    let seed = args.seed.unwrap_or_else(rand::random);
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Dispatch based on env_name stored in checkpoint metadata
@@ -1548,7 +1548,7 @@ fn run_stats_mode<B: Backend>(
     args: &EvalArgs,
     device: &B::Device,
 ) -> Result<()> {
-    let seed = args.seed.unwrap_or(42);
+    let seed = args.seed.unwrap_or_else(rand::random);
     let mut rng = StdRng::seed_from_u64(seed);
 
     // Dispatch based on env_name stored in checkpoint metadata
