@@ -320,7 +320,7 @@ impl PopArtNormalizer {
     /// Uses Welford's online algorithm for numerically stable mean/variance computation.
     ///
     /// # Returns
-    /// Tuple of (old_mean, old_std) for value head rescaling
+    /// Tuple of (`old_mean`, `old_std`) for value head rescaling
     pub fn update(&mut self, returns: &[f32]) -> (f64, f64) {
         let old_mean = self.mean;
         let old_std = self.std();

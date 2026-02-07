@@ -964,7 +964,7 @@ const fn default_return_clip() -> f32 {
     10.0 // Standard VecNormalize default
 }
 const fn default_normalize_values() -> bool {
-    true
+    false
 }
 const fn default_total_steps() -> usize {
     1_000_000
