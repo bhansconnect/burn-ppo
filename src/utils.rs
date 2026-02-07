@@ -104,7 +104,7 @@ pub fn apply_action_mask<B: Backend>(
     let [batch, num_actions] = logits.dims();
     let device = logits.device();
 
-    // Fast debug assertions: check mask validity
+    // Check mask validity
     debug_assert_eq!(
         mask.len(),
         batch * num_actions,
@@ -112,10 +112,15 @@ pub fn apply_action_mask<B: Backend>(
         batch * num_actions,
         mask.len()
     );
-    debug_assert!(
-        mask.iter().any(|&v| v),
-        "Empty action mask: no valid actions in entire batch"
-    );
+    for env_idx in 0..batch {
+        let start = env_idx * num_actions;
+        let end = start + num_actions;
+        assert!(
+            mask[start..end].iter().any(|&v| v),
+            "Empty action mask: env {env_idx} has no valid actions \
+             (batch={batch}, num_actions={num_actions})"
+        );
+    }
 
     // Convert bool mask to f32: true -> 0.0, false -> -1e9
     let mask_values: Vec<f32> = mask
@@ -236,6 +241,16 @@ mod tests {
         assert!(result[1] < -1e8); // Invalid, very negative
         assert_eq!(result[2], 3.0); // Valid, unchanged
         assert!(result[3] < -1e8); // Invalid, very negative
+    }
+
+    #[test]
+    #[should_panic(expected = "Empty action mask: env 1 has no valid actions")]
+    fn test_apply_action_mask_empty_env_panics() {
+        let device = Default::default();
+        // 2-env batch, 3 actions each. Env 0 has valid actions, env 1 is all-false.
+        let logits: Tensor<TestBackend, 2> = Tensor::zeros([2, 3], &device);
+        let mask = vec![true, false, true, false, false, false];
+        let _ = apply_action_mask(logits, Some(mask));
     }
 
     #[test]

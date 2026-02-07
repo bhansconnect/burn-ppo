@@ -1114,9 +1114,17 @@ impl Environment for Skull {
             .action_mask()
             .expect("action_mask should always return Some");
         if action >= ACTION_COUNT || !mask[action] {
-            // Invalid action - game over with no rewards
-            self.game_over = true;
-            return (self.get_observation(), rewards, true);
+            let state = self.render().unwrap_or_default();
+            let valid: Vec<_> = mask
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v)
+                .map(|(i, _)| i.to_string())
+                .collect();
+            panic!(
+                "Invalid action {action} in Skull!\nValid: [{}]\n{state}",
+                valid.join(", ")
+            );
         }
 
         match self.phase {
@@ -1310,6 +1318,18 @@ impl Environment for Skull {
                     }
                 }
             }
+        }
+
+        if !self.game_over {
+            assert!(
+                mask.iter().any(|&v| v),
+                "No valid actions for non-game-over state!\n\
+                 Phase: {:?}, Player: {}, Alive: {}\n{}",
+                self.phase,
+                self.current_player,
+                self.alive_count(),
+                self.render().unwrap_or_default()
+            );
         }
 
         Some(mask)
@@ -1588,6 +1608,16 @@ impl Environment for Skull {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "Invalid action")]
+    fn test_invalid_action_panics() {
+        let mut env = Skull::new(42);
+        env.reset();
+        // Action 0 is PLACE_SKULL, which may or may not be valid.
+        // Use an out-of-range action that's definitely invalid.
+        env.step(ACTION_COUNT + 1);
+    }
 
     #[test]
     fn test_observation_dim_matches_constant() {
@@ -2133,13 +2163,13 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Invalid action")]
     fn test_invalid_action_handling() {
         let mut env = Skull::new_with_players(4, Schedule::constant(0.0), 42);
         env.reset();
 
-        // Invalid action index
-        let (_, _, done) = env.step(ACTION_COUNT + 10);
-        assert!(done, "Invalid action should end game");
+        // Invalid action index - now panics instead of silently ending game
+        env.step(ACTION_COUNT + 10);
     }
 
     #[test]

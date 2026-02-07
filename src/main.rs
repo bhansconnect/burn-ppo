@@ -255,7 +255,7 @@ where
 
     // Create PopArt normalizer if enabled
     let mut popart_normalizer: Option<PopArtNormalizer> = if config.normalize_values {
-        Some(PopArtNormalizer::new(num_players as usize))
+        Some(PopArtNormalizer::new())
     } else {
         None
     };
@@ -1076,19 +1076,8 @@ where
 
             // Value normalization metrics (when enabled)
             if let Some(ref norm) = popart_normalizer {
-                // Per-player statistics
-                for p in 0..norm.num_players() {
-                    logger.log_scalar(
-                        &format!("value_norm/mean_p{p}"),
-                        norm.mean(p) as f32,
-                        global_step,
-                    )?;
-                    logger.log_scalar(
-                        &format!("value_norm/std_p{p}"),
-                        norm.std(p) as f32,
-                        global_step,
-                    )?;
-                }
+                logger.log_scalar("value_norm/mean", norm.mean() as f32, global_step)?;
+                logger.log_scalar("value_norm/std", norm.std() as f32, global_step)?;
             }
             if let Some(target_mean) = metrics.value_norm_target_mean {
                 logger.log_scalar("value_norm/target_mean", target_mean, global_step)?;

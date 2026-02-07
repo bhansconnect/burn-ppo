@@ -360,6 +360,10 @@ pub fn collect_rollouts<B: Backend, E: Environment>(
 
             let log_probs_data: Vec<f32> =
                 log_probs.into_data().to_vec().expect("log_probs to vec");
+            assert!(
+                log_probs_data.iter().all(|x| x.is_finite()),
+                "NaN/Inf in log probs — model producing corrupt logits"
+            );
             (actions_data, acting_values_data, log_probs_data)
         };
 
@@ -747,6 +751,10 @@ pub fn collect_rollouts_with_opponents<B: Backend, E: Environment>(
             let mut values_data: Vec<f32> = values.into_data().to_vec().expect("values to vec");
             let log_probs_data: Vec<f32> =
                 log_probs.into_data().to_vec().expect("log_probs to vec");
+            assert!(
+                log_probs_data.iter().all(|x| x.is_finite()),
+                "NaN/Inf in log probs — model producing corrupt logits"
+            );
 
             // Denormalize values if PopArt is active
             // After rescaling, model outputs normalized values - convert back to raw for GAE
@@ -1588,16 +1596,12 @@ where
 /// When normalization statistics change, we rescale the value head to preserve
 /// output semantics. This ensures value predictions when denormalized remain
 /// consistent, preventing catastrophic forgetting when normalization statistics shift.
-///
-/// With single value output, the value head outputs a scalar per sample, so we
-/// use player 0's statistics (unified across all players).
 pub fn rescale_value_head_for_popart<B: Backend>(
     model: ActorCritic<B>,
-    old_means: &[f64],
-    old_stds: &[f64],
-    new_means: &[f64],
-    new_stds: &[f64],
-    _num_players: usize, // Kept for API compatibility but not used (single value output)
+    old_mean: f64,
+    old_std: f64,
+    new_mean: f64,
+    new_std: f64,
 ) -> ActorCritic<B> {
     let value_head = model.value_head();
     let device = value_head.weight.device();
@@ -1610,8 +1614,8 @@ pub fn rescale_value_head_for_popart<B: Backend>(
     let output_dim = weight_shape.dims[1]; // Should be 1 for single value output
     let weight_data: Vec<f32> = weight.into_data().to_vec().expect("weight data");
 
-    // Compute scale factor using player 0's stats (unified for single value output)
-    let scale = old_stds[0] / new_stds[0];
+    // Compute scale factor
+    let scale = old_std / new_std;
 
     // Rescale weights: W_new = W_old * scale
     let new_weight_data: Vec<f32> = weight_data
@@ -1627,9 +1631,7 @@ pub fn rescale_value_head_for_popart<B: Backend>(
 
     let new_bias_data: Vec<f32> = bias_data
         .iter()
-        .map(|&b_old| {
-            ((f64::from(b_old) * old_stds[0] + old_means[0] - new_means[0]) / new_stds[0]) as f32
-        })
+        .map(|&b_old| ((f64::from(b_old) * old_std + old_mean - new_mean) / new_std) as f32)
         .collect();
 
     // Create fresh tensors from the computed data (these are leaf tensors)
@@ -1783,45 +1785,25 @@ where
     let mut value_norm_target_count = 0usize;
 
     if let Some(popart_norm) = popart.as_mut() {
-        // Extract returns and acting players from flattened buffer
+        // Extract returns from flattened buffer
         let returns_data: Vec<f32> = returns_inner
             .clone()
             .into_data()
             .to_vec()
             .expect("returns data");
-        let acting_players_data: Vec<usize> = acting_players_inner
-            .clone()
-            .into_data()
-            .to_vec::<i64>()
-            .expect("acting_players data")
-            .into_iter()
-            .map(|x| usize::try_from(x).expect("non-negative player index"))
-            .collect();
 
         // Update statistics (returns old values for rescaling)
-        let (old_means, old_stds) = popart_norm.update(&returns_data, &acting_players_data);
+        let (old_mean, old_std) = popart_norm.update(&returns_data);
 
         // Rescale value head if initialized
         if popart_norm.is_initialized() {
-            let new_means: Vec<f64> = (0..num_players).map(|p| popart_norm.mean(p)).collect();
-            let new_stds: Vec<f64> = (0..num_players).map(|p| popart_norm.std(p)).collect();
+            let new_mean = popart_norm.mean();
+            let new_std = popart_norm.std();
 
-            // Compute rescale magnitude (max ratio of old_std/new_std)
-            let max_rescale = old_stds
-                .iter()
-                .zip(new_stds.iter())
-                .map(|(&old, &new)| (old / new).abs())
-                .fold(0.0f64, f64::max);
+            let max_rescale = (old_std / new_std).abs();
             value_norm_rescale_mag = Some(max_rescale as f32);
 
-            model = rescale_value_head_for_popart(
-                model,
-                &old_means,
-                &old_stds,
-                &new_means,
-                &new_stds,
-                num_players,
-            );
+            model = rescale_value_head_for_popart(model, old_mean, old_std, new_mean, new_std);
         }
     }
 
@@ -1888,17 +1870,9 @@ where
                     .into_data()
                     .to_vec()
                     .expect("old_values data");
-                let players_vec: Vec<usize> = mb_acting_players_inner
-                    .clone()
-                    .into_data()
-                    .to_vec::<i64>()
-                    .expect("players data")
-                    .into_iter()
-                    .map(|x| usize::try_from(x).expect("non-negative player index"))
-                    .collect();
 
-                let normalized_returns = popart_norm.normalize(&returns_vec, &players_vec);
-                let normalized_old_values = popart_norm.normalize(&old_values_vec, &players_vec);
+                let normalized_returns = popart_norm.normalize(&returns_vec);
+                let normalized_old_values = popart_norm.normalize(&old_values_vec);
 
                 // Track normalized target statistics
                 for &v in &normalized_returns {
