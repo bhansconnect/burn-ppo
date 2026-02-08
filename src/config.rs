@@ -681,9 +681,12 @@ impl PlayerCountMode {
     }
 
     /// Sample a player count based on the mode and current training step
-    #[expect(
-        dead_code,
-        reason = "Will be used when ppo.rs adds dynamic player count support"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Will be used when ppo.rs adds dynamic player count support"
+        )
     )]
     pub fn sample(&self, rng: &mut impl rand::Rng, current_step: usize) -> usize {
         use rand::distributions::{Distribution, WeightedIndex};
@@ -1674,6 +1677,7 @@ fn generate_run_name(base_dir: &std::path::Path, env: &str, forked_from: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     #[test]
     fn test_default_config() {
@@ -1803,5 +1807,392 @@ mod tests {
         std::fs::create_dir(dir.path().join("cartpole_003")).unwrap();
         let name = generate_run_name(dir.path(), "cartpole", Some("cartpole_003"));
         assert_eq!(name, "cartpole_003_child_001");
+    }
+
+    // --- parse_duration tests ---
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        let d = parse_duration("30s").unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        let d = parse_duration("5m").unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        let d = parse_duration("2h").unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_parse_duration_no_suffix_defaults_to_seconds() {
+        let d = parse_duration("60").unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_parse_duration_empty_string() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("  ").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_number() {
+        assert!(parse_duration("abcs").is_err());
+        assert!(parse_duration("12.5s").is_err());
+    }
+
+    // --- Config::validate() tests ---
+
+    #[test]
+    fn test_validate_bad_clip_epsilon() {
+        let config = Config {
+            clip_epsilon: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = Config {
+            clip_epsilon: -0.1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_entropy_coef() {
+        let config = Config {
+            entropy_coef: Schedule::constant(-0.01),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_reward_shaping_coef() {
+        let config = Config {
+            reward_shaping_coef: Schedule::constant(-1.0),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_adaptive_entropy_bad_min_coef() {
+        let config = Config {
+            adaptive_entropy: Some(Schedule::constant(0.01)),
+            adaptive_entropy_min_coef: -0.1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_adaptive_entropy_bad_max_coef() {
+        let config = Config {
+            adaptive_entropy: Some(Schedule::constant(0.01)),
+            adaptive_entropy_min_coef: 0.5,
+            adaptive_entropy_max_coef: 0.5, // equal, not greater
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_adaptive_entropy_bad_delta() {
+        let config = Config {
+            adaptive_entropy: Some(Schedule::constant(0.01)),
+            adaptive_entropy_delta: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_adaptive_entropy_valid() {
+        let config = Config {
+            adaptive_entropy: Some(Schedule::constant(0.01)),
+            adaptive_entropy_min_coef: 0.001,
+            adaptive_entropy_max_coef: 0.1,
+            adaptive_entropy_delta: 0.001,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_num_epochs_zero() {
+        let config = Config {
+            num_epochs: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_num_minibatches_zero() {
+        let config = Config {
+            num_minibatches: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_minibatch_too_small() {
+        let config = Config {
+            num_envs: NumEnvs::Explicit(1),
+            num_steps: 4,
+            num_minibatches: 4, // minibatch_size = 4/4 = 1
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_activation() {
+        let config = Config {
+            activation: "gelu".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_network_type() {
+        let config = Config {
+            network_type: "transformer".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_num_conv_layers() {
+        let config = Config {
+            num_conv_layers: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_kernel_size() {
+        let config = Config {
+            kernel_size: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_empty_conv_channels() {
+        let config = Config {
+            conv_channels: vec![],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_opponent_pool_fraction() {
+        let config = Config {
+            opponent_pool_fraction: -0.1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = Config {
+            opponent_pool_fraction: 1.1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_opponent_select_alpha() {
+        let config = Config {
+            opponent_pool_fraction: 0.5,
+            opponent_select_alpha: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config = Config {
+            opponent_pool_fraction: 0.5,
+            opponent_select_alpha: 1.1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_bad_opponent_select_exponent() {
+        let config = Config {
+            opponent_pool_fraction: 0.5,
+            opponent_select_exponent: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_unknown_env() {
+        let config = Config {
+            env: "chess".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_all_supported_envs() {
+        for env in &["cartpole", "connect_four", "liars_dice", "skull"] {
+            let config = Config {
+                env: env.to_string(),
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok(), "env '{env}' should be valid");
+        }
+    }
+
+    #[test]
+    fn test_validate_opponent_pool_disabled_skips_sub_checks() {
+        // When opponent_pool_fraction is 0, alpha/exponent are not validated
+        let config = Config {
+            opponent_pool_fraction: 0.0,
+            opponent_select_alpha: 0.0, // would be invalid if pool was enabled
+            opponent_select_exponent: 0.0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    // --- PlayerCountMode tests ---
+
+    #[test]
+    fn test_player_count_fixed() {
+        let mode = PlayerCountMode::Fixed { count: 3 };
+        assert_eq!(mode.get_fixed_count(), 3);
+
+        let mut rng = rand::thread_rng();
+        assert_eq!(mode.sample(&mut rng, 0), 3);
+        assert_eq!(mode.sample(&mut rng, 1_000_000), 3);
+    }
+
+    #[test]
+    fn test_player_count_uniform_random() {
+        let mode = PlayerCountMode::UniformRandom { min: 2, max: 6 };
+        assert_eq!(mode.get_fixed_count(), 2); // returns min
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..100 {
+            let count = mode.sample(&mut rng, 0);
+            assert!((2..=6).contains(&count));
+        }
+    }
+
+    #[test]
+    fn test_player_count_weighted_random() {
+        // All weight on 4 players (index 2 = 4 players)
+        let mode = PlayerCountMode::WeightedRandom {
+            weights: [0.0, 0.0, 1.0, 0.0, 0.0],
+        };
+        assert_eq!(mode.get_fixed_count(), 4); // returns default 4
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        for _ in 0..10 {
+            assert_eq!(mode.sample(&mut rng, 0), 4);
+        }
+    }
+
+    #[test]
+    fn test_player_count_curriculum() {
+        let mode = PlayerCountMode::Curriculum {
+            min: 2,
+            max: 6,
+            warmup_steps: 1000,
+        };
+        assert_eq!(mode.get_fixed_count(), 2); // returns min
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        // At step 0 → min
+        assert_eq!(mode.sample(&mut rng, 0), 2);
+        // At half warmup → mid
+        let mid = mode.sample(&mut rng, 500);
+        assert!((3..=5).contains(&mid));
+        // Past warmup → max
+        assert_eq!(mode.sample(&mut rng, 1000), 6);
+        assert_eq!(mode.sample(&mut rng, 5000), 6);
+    }
+
+    #[test]
+    fn test_validate_gamma_negative() {
+        let config = Config {
+            gamma: -0.1,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_max_training_duration_none() {
+        let config = Config::default();
+        assert!(config.max_training_duration().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_max_training_duration_valid() {
+        let config = Config {
+            max_training_time: Some("2h".to_string()),
+            ..Default::default()
+        };
+        let d = config.max_training_duration().unwrap().unwrap();
+        assert_eq!(d, std::time::Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_max_training_duration_invalid() {
+        let config = Config {
+            max_training_time: Some("abc".to_string()),
+            ..Default::default()
+        };
+        assert!(config.max_training_duration().is_err());
+    }
+
+    #[test]
+    fn test_config_from_toml_minimal() {
+        let toml_str = r#"
+            env = "cartpole"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.env, "cartpole");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_from_toml_with_schedules() {
+        let toml_str = r#"
+            env = "skull"
+            learning_rate = [[0.001, 0], [0.0001, 1000000]]
+            entropy_coef = 0.05
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.env, "skull");
+        assert!((config.learning_rate.initial_value() - 0.001).abs() < 1e-10);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_player_count_mode_toml_roundtrip() {
+        let fixed = PlayerCountMode::Fixed { count: 4 };
+        let toml_str = toml::to_string(&fixed).unwrap();
+        let parsed: PlayerCountMode = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.get_fixed_count(), 4);
     }
 }

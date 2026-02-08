@@ -2452,4 +2452,102 @@ mod tests {
         let model_1_avg = model_reward_sums[1] / model_reward_counts[1] as f64;
         assert!((model_1_avg - 1.5).abs() < 0.001);
     }
+
+    // --- TempSchedule::describe() tests ---
+
+    #[test]
+    fn test_temp_schedule_describe_constant() {
+        let schedule = TempSchedule::new(0.50, 0.0, None, false);
+        assert_eq!(schedule.describe(), "temp=0.50 (constant)");
+    }
+
+    #[test]
+    fn test_temp_schedule_describe_hard_cutoff() {
+        let schedule = TempSchedule::new(1.00, 0.30, Some(10), false);
+        assert_eq!(
+            schedule.describe(),
+            "temp=1.00\u{2192}0.30 (cutoff at move 10)"
+        );
+    }
+
+    #[test]
+    fn test_temp_schedule_describe_decay() {
+        let schedule = TempSchedule::new(1.00, 0.00, Some(20), true);
+        assert_eq!(
+            schedule.describe(),
+            "temp=1.00\u{2192}0.00 (decay over 20 moves)"
+        );
+    }
+
+    // --- print_summary exercises for N-player ---
+
+    #[test]
+    fn test_print_summary_multiplayer() {
+        // Exercise the 4-player print_summary code path
+        let mut stats = EvalStats::new(4);
+
+        for _ in 0..10 {
+            stats.record_with_rewards(
+                &GameOutcome(vec![1, 2, 3, 4]),
+                &[1.0, 0.5, 0.2, 0.0],
+                20,
+            );
+        }
+        for _ in 0..5 {
+            stats.record_with_rewards(
+                &GameOutcome(vec![2, 1, 4, 3]),
+                &[0.5, 1.0, 0.0, 0.2],
+                15,
+            );
+        }
+
+        let names = vec![
+            "model_a".to_string(),
+            "model_b".to_string(),
+            "model_c".to_string(),
+            "model_d".to_string(),
+        ];
+        // Should not panic
+        stats.print_summary(&names, None);
+    }
+
+    #[test]
+    fn test_print_summary_multiplayer_with_slot_mapping() {
+        let mut stats = EvalStats::new(4);
+
+        for _ in 0..10 {
+            stats.record_with_rewards(
+                &GameOutcome(vec![1, 3, 2, 4]),
+                &[1.0, 0.2, 0.5, 0.0],
+                20,
+            );
+        }
+
+        let names = vec![
+            "best".to_string(),
+            "best".to_string(),
+            "best".to_string(),
+            "opponent".to_string(),
+        ];
+        let slot_to_model = [0, 0, 0, 1];
+        // Should not panic
+        stats.print_summary(&names, Some(&slot_to_model));
+    }
+
+    #[test]
+    fn test_print_summary_single_player() {
+        let mut stats = EvalStats::new(1);
+
+        for i in 0..20 {
+            stats.record_with_rewards(
+                &GameOutcome(vec![1]),
+                &[100.0 + i as f32 * 10.0],
+                50 + i,
+            );
+        }
+
+        let names = vec!["cartpole_model".to_string()];
+        // Should not panic - exercises single player path
+        stats.print_summary(&names, None);
+    }
 }
