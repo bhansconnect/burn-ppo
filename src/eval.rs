@@ -2487,18 +2487,10 @@ mod tests {
         let mut stats = EvalStats::new(4);
 
         for _ in 0..10 {
-            stats.record_with_rewards(
-                &GameOutcome(vec![1, 2, 3, 4]),
-                &[1.0, 0.5, 0.2, 0.0],
-                20,
-            );
+            stats.record_with_rewards(&GameOutcome(vec![1, 2, 3, 4]), &[1.0, 0.5, 0.2, 0.0], 20);
         }
         for _ in 0..5 {
-            stats.record_with_rewards(
-                &GameOutcome(vec![2, 1, 4, 3]),
-                &[0.5, 1.0, 0.0, 0.2],
-                15,
-            );
+            stats.record_with_rewards(&GameOutcome(vec![2, 1, 4, 3]), &[0.5, 1.0, 0.0, 0.2], 15);
         }
 
         let names = vec![
@@ -2516,11 +2508,7 @@ mod tests {
         let mut stats = EvalStats::new(4);
 
         for _ in 0..10 {
-            stats.record_with_rewards(
-                &GameOutcome(vec![1, 3, 2, 4]),
-                &[1.0, 0.2, 0.5, 0.0],
-                20,
-            );
+            stats.record_with_rewards(&GameOutcome(vec![1, 3, 2, 4]), &[1.0, 0.2, 0.5, 0.0], 20);
         }
 
         let names = vec![
@@ -2539,11 +2527,7 @@ mod tests {
         let mut stats = EvalStats::new(1);
 
         for i in 0..20 {
-            stats.record_with_rewards(
-                &GameOutcome(vec![1]),
-                &[100.0 + i as f32 * 10.0],
-                50 + i,
-            );
+            stats.record_with_rewards(&GameOutcome(vec![1]), &[100.0 + i as f32 * 10.0], 50 + i);
         }
 
         let names = vec!["cartpole_model".to_string()];
