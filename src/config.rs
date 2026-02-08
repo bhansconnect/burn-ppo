@@ -1016,7 +1016,8 @@ const fn default_log_freq() -> usize {
     1_000
 }
 fn default_seed() -> u64 {
-    rand::random()
+    // Constrain to i64::MAX so the seed can round-trip through TOML (which only supports i64)
+    rand::random::<u64>() & (i64::MAX as u64)
 }
 
 // Opponent pool defaults
