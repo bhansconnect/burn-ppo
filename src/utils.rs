@@ -92,7 +92,7 @@ where
 ///
 /// mask: flattened [batch * `num_actions`] where true = valid action
 /// logits: [batch, `num_actions`]
-/// Returns logits with invalid actions set to -1e9 (effectively zero probability after softmax)
+/// Returns logits with invalid actions set to -inf (effectively zero probability after softmax)
 pub fn apply_action_mask<B: Backend>(
     logits: Tensor<B, 2>,
     mask: Option<Vec<bool>>,
@@ -122,10 +122,10 @@ pub fn apply_action_mask<B: Backend>(
         );
     }
 
-    // Convert bool mask to f32: true -> 0.0, false -> -1e9
+    // Convert bool mask to f32: true -> 0.0, false -> -inf
     let mask_values: Vec<f32> = mask
         .iter()
-        .map(|&valid| if valid { 0.0 } else { -1e9 })
+        .map(|&valid| if valid { 0.0 } else { f32::NEG_INFINITY })
         .collect();
 
     let mask_tensor =
@@ -238,9 +238,9 @@ mod tests {
 
         let result: Vec<f32> = masked.into_data().to_vec().unwrap();
         assert_eq!(result[0], 1.0); // Valid, unchanged
-        assert!(result[1] < -1e8); // Invalid, very negative
+        assert_eq!(result[1], f32::NEG_INFINITY); // Invalid, masked to -inf
         assert_eq!(result[2], 3.0); // Valid, unchanged
-        assert!(result[3] < -1e8); // Invalid, very negative
+        assert_eq!(result[3], f32::NEG_INFINITY); // Invalid, masked to -inf
     }
 
     #[test]
